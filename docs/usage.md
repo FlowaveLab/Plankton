@@ -8,10 +8,11 @@ The default install path is the project-owned tap and desktop cask:
 
 ```bash
 brew install --cask flowavelab/tap/plankton
-plankton
+open -a Plankton
+plankton --version
 ```
 
-This is a tap-owned cask, not a `homebrew-core` formula. The cask installs both `Plankton.app` and the `plankton` command. An internal helper formula may still exist inside the tap, but it is not the user-facing entrypoint.
+This is a tap-owned cask, not a `homebrew-core` formula. The cask installs both `Plankton.app` and the `plankton` command. Both are included in the same download; no separate helper formula is required.
 
 ## 2. Install from source for local development
 

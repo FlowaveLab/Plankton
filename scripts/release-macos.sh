@@ -13,6 +13,7 @@ if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
   echo "Release checkout must be clean" >&2
   exit 1
 fi
+source_commit="$(git rev-parse HEAD)"
 version="$(sed -n '/\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
 test -n "$version"
 export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${HOME}=/Users/zqqqqz2000"
@@ -21,6 +22,8 @@ npm --prefix apps/desktop ci
 cargo build --locked --release -p plankton
 env -u APPLE_SIGNING_IDENTITY npm --prefix apps/desktop run tauri build -- --bundles app
 
+test "$(git rev-parse HEAD)" = "$source_commit"
+git diff --exit-code HEAD
 app="target/release/bundle/macos/Plankton.app"
 cli="target/release/plankton"
 # Preserve the upstream KeePassXC signature and the engine's pinned CLI digest.
@@ -47,5 +50,5 @@ git archive --format=tar.gz --prefix="plankton-v${version}/" HEAD > "dist/plankt
 (cd dist && shasum -a 256 "plankton-v${version}"*.tar.gz "plankton-v${version}"*.zip > checksums.txt)
 bash scripts/render-homebrew-formula.sh "$version" FlowaveLab/Plankton dist/checksums.txt > dist/plankton-helper.rb
 bash scripts/render-homebrew-cask.sh "$version" FlowaveLab/Plankton dist/checksums.txt > dist/plankton.rb
-git rev-parse HEAD > dist/source-commit.txt
+printf '%s\n' "$source_commit" > dist/source-commit.txt
 echo "Signed and notarized release files are ready in dist. Review before publishing."

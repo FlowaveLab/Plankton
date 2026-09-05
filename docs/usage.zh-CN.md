@@ -8,10 +8,11 @@
 
 ```bash
 brew install --cask flowavelab/tap/plankton
-plankton
+open -a Plankton
+plankton --version
 ```
 
-这是一条 tap 自有 cask 路径，不是 `homebrew-core` formula。这个 cask 会一起安装 `Plankton.app` 和 `plankton` 命令；tap 里即使仍存在内部 helper formula，它也不是面向用户的主入口。
+这是一条 tap 自有 cask 路径，不是 `homebrew-core` formula。这个 cask 会一起安装 `Plankton.app` 和 `plankton` 命令；应用和命令包含在同一个下载包中，无需单独安装 helper formula。
 
 ## 2. 通过源码安装并准备本地开发环境
 

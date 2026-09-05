@@ -21,5 +21,12 @@ archive_name="plankton-v${version}-macos-aarch64.zip"
 staging_dir="$(mktemp -d)"
 trap 'rm -rf "$staging_dir"' EXIT
 
-cp -R "$app_path" "$staging_dir/Plankton.app"
-ditto -c -k --sequesterRsrc --keepParent "$staging_dir/Plankton.app" "$output_dir/$archive_name"
+cli_path="$(dirname "$(dirname "$(dirname "$app_path")")")/plankton"
+if [ ! -f "$cli_path" ]; then
+  echo "CLI binary not found: $cli_path" >&2
+  exit 1
+fi
+ditto "$app_path" "$staging_dir/Plankton.app"
+cp "$cli_path" "$staging_dir/plankton"
+chmod 0755 "$staging_dir/plankton"
+ditto -c -k --sequesterRsrc "$staging_dir" "$output_dir/$archive_name"

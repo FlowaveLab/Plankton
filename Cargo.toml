@@ -12,7 +12,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.2.0"
+version = "0.2.1"
 rust-version = "1.97"
 license = "MIT"
 homepage = "https://github.com/FlowaveLab/Plankton"

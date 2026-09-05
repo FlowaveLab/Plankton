@@ -36,8 +36,7 @@ cask "plankton" do
 
   depends_on arch: :arm64
 
-  depends_on formula: "flowavelab/tap/plankton-helper"
-
   app "Plankton.app"
+  binary "plankton"
 end
 EOF

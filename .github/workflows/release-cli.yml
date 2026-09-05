@@ -129,6 +129,10 @@ jobs:
       - name: Build desktop bundle
         run: npm --prefix apps/desktop run tauri build -- --bundles ${{ matrix.bundles }}
 
+      - name: Build the bundled macOS CLI
+        if: runner.os == 'macOS'
+        run: cargo build --locked --release -p plankton
+
       - name: Package macOS desktop archive
         if: runner.os == 'macOS'
         run: |

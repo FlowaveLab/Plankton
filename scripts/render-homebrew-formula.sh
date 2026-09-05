@@ -28,7 +28,7 @@ fi
 
 cat <<EOF
 class ${formula_class} < Formula
-  desc "Command-line companion installed by the Plankton desktop cask"
+  desc "Standalone Plankton command-line companion"
   homepage "${homepage_url}"
   license "MIT"
   version "${version}"
