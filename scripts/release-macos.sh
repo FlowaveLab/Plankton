@@ -44,9 +44,11 @@ python3 -c 'import json; assert json.load(open("dist/notarization.json"))["statu
 xcrun stapler staple "$app"
 xcrun stapler validate "$app"
 spctl --assess --type execute --verbose=2 "$app"
+test "$(git rev-parse HEAD)" = "$source_commit"
+git diff --exit-code HEAD
 bash scripts/package-cli-release.sh "$version" aarch64-apple-darwin "$cli" dist
 bash scripts/package-desktop-release.sh "$version" "$app" dist
-git archive --format=tar.gz --prefix="plankton-v${version}/" HEAD > "dist/plankton-v${version}-source.tar.gz"
+git archive --format=tar.gz --prefix="plankton-v${version}/" "$source_commit" > "dist/plankton-v${version}-source.tar.gz"
 (cd dist && shasum -a 256 "plankton-v${version}"*.tar.gz "plankton-v${version}"*.zip > checksums.txt)
 bash scripts/render-homebrew-formula.sh "$version" FlowaveLab/Plankton dist/checksums.txt > dist/plankton-helper.rb
 bash scripts/render-homebrew-cask.sh "$version" FlowaveLab/Plankton dist/checksums.txt > dist/plankton.rb

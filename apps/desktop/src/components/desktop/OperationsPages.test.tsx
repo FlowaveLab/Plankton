@@ -1067,7 +1067,7 @@ describe("RequestsPage", () => {
     unselected.unmount();
   });
 
-  it("filters status groups, resets pagination, and only paginates beyond one page", () => {
+  it("filters status groups, resets pagination, and only paginates beyond one page", async () => {
     const requests = Array.from({ length: 18 }, (_, index) => ({
       ...evaluationRequest(index === 0 ? "running" : "completed", "assisted"),
       id: `request-${index}`,
@@ -1103,6 +1103,18 @@ describe("RequestsPage", () => {
     ).toBeNull();
     expect(view.container.textContent).toContain("item-0");
     expect(view.container.textContent).not.toContain("item-10");
+
+    await act(async () => chooseRadio(filter!, "awaiting"));
+    expect(filter?.querySelector('input[value="all"]')).not.toBeNull();
+    await act(async () => chooseRadio(filter!, "all"));
+    expect(
+      filter?.querySelector<HTMLInputElement>("input:checked")?.value,
+    ).toBe("all");
+    expect(
+      view.container.querySelector('[aria-label="Request pagination"]')
+        ?.textContent,
+    ).toContain("1 / 3");
+    expect(view.container.textContent).toContain("Generating AI advice");
     view.unmount();
   });
 

@@ -190,15 +190,11 @@ function RequestToolbar(props: {
         onChange={props.onStatusChange}
         value={props.statusFilter}
         options={[
-          ...(props.statusFilter === "all"
-            ? [
-                {
-                  value: "all",
-                  icon: Inbox,
-                  label: props.zh ? "活动请求" : "Active requests",
-                },
-              ]
-            : []),
+          {
+            value: "all",
+            icon: Inbox,
+            label: props.zh ? "活动请求" : "Active requests",
+          },
           {
             value: "awaiting",
             icon: UserRoundCheck,
@@ -2698,9 +2694,13 @@ function RequestsPage({
             ? zh
               ? "正在自动审批或生成 AI 建议，完成后实时更新。"
               : "Automatic approval and AI advice in progress. Results update live."
-            : zh
-              ? "需要你决定的请求，自动评估失败的请求也会在这里。"
-              : "Requests needing your decision, including failed evaluations."}
+            : statusFilter === "all"
+              ? zh
+                ? "所有未完成请求，包括待人工审批和进行中的请求。"
+                : "All unfinished requests, including those needing review and those in progress."
+              : zh
+                ? "需要你决定的请求，自动评估失败的请求也会在这里。"
+                : "Requests needing your decision, including failed evaluations."}
       </p>
     </>
   );
