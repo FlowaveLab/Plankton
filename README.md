@@ -87,9 +87,9 @@ These commands install the Skill. App and CLI installation, provider setup, and 
 
 - [x] Local vaults, call-chain evidence, three review modes, and exposure policy.
 - [x] Agent Skill, optional backends, encrypted sync, and audit records.
-- [] **Remote Server support** — server deployment and remote requests from developer machines, SSH hosts, and CI.
-- [] **Remote approval & policy** — authenticated pairing, encrypted transport, human handoff, server-side scope validation, and audit.
-- [] **Self-hosting & operations** — deployment guides, client revocation, recovery, and end-to-end verification.
+- [ ] **Remote Server support** — server deployment and remote requests from developer machines, SSH hosts, and CI.
+- [ ] **Remote approval & policy** — authenticated pairing, encrypted transport, human handoff, server-side scope validation, and audit.
+- [ ] **Self-hosting & operations** — deployment guides, client revocation, recovery, and end-to-end verification.
 
 Unchecked items are planned. Existing encrypted vault sync does not provide remote-server access. [Share your use case](https://github.com/FlowaveLab/Plankton/issues).
 
