@@ -3,6 +3,13 @@
 </p>
 
 <h1 align="center">Plankton</h1>
+
+<p align="center"><strong>立即安装 Agent Skill</strong></p>
+
+```bash
+npx skills add FlowaveLab/Plankton --skill secret-access
+```
+
 <p align="center"><strong>让 Agent 使用密码，由你设定边界。</strong></p>
 <p align="center">面向 Code Agent、LLM 和自动化工作流的本地优先密码保险库与审批控制台。</p>
 <p align="center">

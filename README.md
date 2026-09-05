@@ -3,6 +3,13 @@
 </p>
 
 <h1 align="center">Plankton</h1>
+
+<p align="center"><strong>Install the agent skill</strong></p>
+
+```bash
+npx skills add FlowaveLab/Plankton --skill secret-access
+```
+
 <p align="center"><strong>Secrets for agents. Boundaries set by you.</strong></p>
 <p align="center">A local-first password vault and approval console for code agents, LLMs, and automated workflows.</p>
 <p align="center">
