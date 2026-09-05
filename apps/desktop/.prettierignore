@@ -1,0 +1,4 @@
+dist/
+.engine-cache/
+src-tauri/gen/
+src-tauri/engines/

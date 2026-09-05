@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "engine": "KeePassXC",
+  "version": "2.7.12",
+  "license": "GPL-2.0-or-later",
+  "source": "https://github.com/keepassxreboot/keepassxc/releases/tag/2.7.12",
+  "artifacts": {
+    "aarch64-apple-darwin": {
+      "archive": "KeePassXC-2.7.12-arm64.dmg",
+      "sha256": "65f4f63607180c0a15794b4a4068f85e99ed5391c87c1fb9312648f1b36fed40"
+    },
+    "x86_64-apple-darwin": {
+      "archive": "KeePassXC-2.7.12-x86_64.dmg",
+      "sha256": "f55737bf759b7ea622967ae979e8fd0ef06a8133104124c24861fd11a3fe14b5"
+    },
+    "x86_64-pc-windows-msvc": {
+      "archive": "KeePassXC-2.7.12-Win64.zip",
+      "sha256": "958234b0669d757b53eacf42bdd5de0fa1cc1ab7527709ddf4f7e29c06a8305f"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "archive": "KeePassXC-2.7.12-x86_64.AppImage",
+      "sha256": "564fe8b751b9ef7aa057e4d3d0b2878db24eaa0f6b1c855c82e699ab0913ae49"
+    }
+  }
+}

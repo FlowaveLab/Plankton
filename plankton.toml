@@ -1,0 +1,19 @@
+recent_audit_limit = 20
+
+request_template = """
+Manual review request
+Reply in language: {{ i18n.current_language }}
+Resource: {{ context.resource }}
+Resource tags:
+{% for tag in context.resource_tags %}
+- {{ tag }}
+{% else %}
+- n/a
+{% endfor %}
+Metadata:
+{% for key, value in context.metadata|items %}
+- {{ key }}={{ value }}
+{% else %}
+- n/a
+{% endfor %}
+"""

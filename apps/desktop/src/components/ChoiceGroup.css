@@ -1,0 +1,83 @@
+.choice-group.choice-group {
+  display: block;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font: inherit;
+}
+
+.choice-group > legend {
+  width: 100%;
+  margin-bottom: 7px;
+  padding: 0;
+  color: var(--ink, #171716);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.choice-group > .choice-group-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.choice-group.choice-group .choice-group-option {
+  display: flex;
+  flex: 1 1 110px;
+  min-width: 0;
+  min-height: 38px;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--rule, #cfcac1);
+  background: var(--surface, #fffefb);
+  color: var(--ink, #171716);
+  font-family: var(--font-ui, sans-serif);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.choice-group.choice-group .choice-group-option[data-selected="true"] {
+  border-color: var(--red, #f2381e);
+  background: var(--paper, #f4f1ea);
+}
+
+.choice-group.choice-group .choice-group-option > input[type="radio"] {
+  flex: 0 0 14px;
+  width: 14px;
+  height: 14px;
+  min-width: 14px;
+  min-height: 14px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--red, #f2381e);
+}
+
+.choice-group.choice-group .choice-group-option > span {
+  min-width: 0;
+  color: inherit;
+  font: inherit;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.choice-group-option:focus-within {
+  outline: 2px solid var(--ink, #171716);
+  outline-offset: 2px;
+}
+
+.choice-group:disabled .choice-group-option {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.choice-group-option > svg {
+  flex: 0 0 16px;
+  color: var(--muted-ink, #706d67);
+}
+.choice-group-option[data-selected="true"] > svg {
+  color: var(--red, #f2381e);
+}

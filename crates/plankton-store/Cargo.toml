@@ -1,0 +1,23 @@
+[package]
+name = "plankton-store"
+description = "SQLite persistence and read models for Plankton requests and audits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+plankton-core = { path = "../plankton-core" }
+plankton-protocol = { path = "../plankton-protocol" }
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.13"

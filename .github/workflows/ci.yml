@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust Crates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --locked --workspace --all-targets
+
+      - name: Lint workspace
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --locked --workspace --all-features -- --nocapture
+
+  desktop:
+    name: Desktop Frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install desktop dependencies
+        run: npm --prefix apps/desktop ci
+
+      - name: Check desktop formatting
+        run: npm --prefix apps/desktop run format
+
+      - name: Check desktop types
+        run: npm --prefix apps/desktop run typecheck
+
+      - name: Run desktop tests
+        run: npm --prefix apps/desktop run test
+
+      - name: Build desktop frontend
+        run: npm --prefix apps/desktop run build
+
+  desktop-native:
+    name: Desktop Native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - windows-2022
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check native desktop target
+        run: cargo check --locked -p plankton-desktop --all-targets

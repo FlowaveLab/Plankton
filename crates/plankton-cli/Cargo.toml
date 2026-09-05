@@ -1,0 +1,23 @@
+[package]
+name = "plankton"
+description = "Command-line companion for listing, searching, and requesting Plankton resources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+plankton-client = { path = "../plankton-client" }
+plankton-core = { path = "../plankton-core" }
+plankton-protocol = { path = "../plankton-protocol" }
+anyhow.workspace = true
+clap.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3.13"
+tokio.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

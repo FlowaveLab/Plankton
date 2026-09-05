@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Plankton responsive review</title>
+    <style>
+      body {
+        margin: 0;
+        background: #e7e7e7;
+      }
+      iframe {
+        display: block;
+        margin: auto;
+        border: 0;
+        background: white;
+        max-width: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <script>
+      const q = new URLSearchParams(location.search);
+      const f = document.createElement("iframe");
+      f.width = q.get("width") || "1440";
+      f.height = q.get("height") || "840";
+      f.src = "./dialog.html?locale=" + (q.get("locale") || "en");
+      document.body.append(f);
+    </script>
+  </body>
+</html>

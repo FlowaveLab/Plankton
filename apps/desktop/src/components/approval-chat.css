@@ -1,0 +1,690 @@
+/* Portaled AI Elements controls inherit the same palette outside the chat panel. */
+:root {
+  --background: var(--color-surface);
+  --foreground: var(--color-text);
+  --muted-foreground: var(--color-text-muted);
+  --primary: var(--color-accent);
+  --secondary: var(--color-surface-muted);
+  --border: var(--color-line);
+  --ring: var(--color-accent);
+}
+/* AI Elements adapted to Plankton's paper, ink and vermilion palette. */
+.desktop-workspace .approval-chat {
+  --background: var(--surface);
+  --foreground: var(--ink);
+  --muted-foreground: var(--muted-ink);
+  --primary: var(--vermilion);
+  --primary-foreground: var(--surface);
+  --secondary: var(--paper);
+  --secondary-foreground: var(--ink);
+  --border: var(--rule);
+  --ring: var(--vermilion);
+  container-type: inline-size;
+  margin: var(--space-4) 0;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+}
+.desktop-workspace .approval-chat > summary {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.desktop-workspace .approval-chat > summary::-webkit-details-marker {
+  display: none;
+}
+.desktop-workspace .approval-chat > summary > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+.desktop-workspace .approval-chat > summary > span:first-child > svg {
+  color: var(--vermilion);
+}
+.desktop-workspace .approval-chat__status {
+  color: var(--muted-ink);
+  font: 11px/1.4 var(--font-ui);
+}
+.desktop-workspace .approval-chat[open] > summary {
+  border-bottom: 1px solid var(--ink);
+}
+.desktop-workspace .approval-chat[open] .approval-chat__chevron {
+  transform: rotate(180deg);
+}
+.desktop-workspace .approval-chat .approval-chat__body {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  height: clamp(420px, 68vh, 720px);
+  min-height: 0;
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.desktop-workspace .approval-chat__history {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  border-right: 1px solid var(--rule);
+  background: var(--paper);
+}
+.desktop-workspace .approval-chat__history > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 12px 12px;
+  color: var(--muted-ink);
+  font: 11px/1.4 var(--font-ui);
+}
+.desktop-workspace .approval-chat__history > header > span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.desktop-workspace .approval-chat .approval-chat__new {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 0 12px 10px;
+  min-height: 34px;
+  padding: 7px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  color: var(--ink);
+  font-size: 12px;
+}
+.desktop-workspace .approval-chat .approval-chat__search {
+  width: calc(100% - 24px);
+  min-height: 30px;
+  padding: 6px 8px;
+  margin: 0 12px 10px;
+  border: 1px solid var(--rule);
+  background: transparent;
+  font-size: 11px;
+}
+.desktop-workspace .approval-chat__sessions {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 0 6px;
+}
+.desktop-workspace .approval-chat__sessions > button {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 12px 9px;
+  text-align: left;
+  border: 1px solid transparent;
+  border-left: 2px solid transparent;
+  background: transparent;
+  color: var(--ink);
+}
+.desktop-workspace .approval-chat__sessions > button[aria-current="true"] {
+  border-color: var(--rule);
+  border-left-color: var(--vermilion);
+  background: var(--surface);
+}
+.desktop-workspace .approval-chat__session-title {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  min-width: 0;
+}
+.desktop-workspace .approval-chat__session-title > svg {
+  flex-shrink: 0;
+  color: var(--muted-ink);
+}
+.desktop-workspace .approval-chat__session-title strong {
+  font-size: 12px;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.desktop-workspace .approval-chat__sessions > button > small {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  color: var(--muted-ink);
+  font: 10px/1.4 var(--font-ui);
+  padding-left: 20px;
+}
+.desktop-workspace .approval-chat__live {
+  color: var(--vermilion);
+}
+.desktop-workspace .approval-chat__history-note,
+.desktop-workspace .approval-chat__history-empty {
+  margin: 0;
+  padding: 12px;
+  color: var(--muted-ink);
+  font-size: 10px;
+  line-height: 1.6;
+}
+.desktop-workspace .approval-chat__history-note {
+  border-top: 1px solid var(--rule);
+}
+.desktop-workspace .approval-chat__main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.desktop-workspace .approval-chat__toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--rule);
+}
+.desktop-workspace .approval-chat__current-title {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.desktop-workspace .approval-chat__current-title > strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.desktop-workspace .approval-chat__current-title > span {
+  color: var(--muted-ink);
+  font-size: 10px;
+}
+.desktop-workspace .approval-chat__current-title > span[data-state="running"],
+.desktop-workspace .approval-chat__current-title > span[data-state="failed"] {
+  color: var(--vermilion);
+}
+.desktop-workspace .approval-chat__toolbar-actions {
+  display: flex;
+  gap: 6px;
+}
+.desktop-workspace .approval-chat__toolbar-actions > button {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  min-height: 30px;
+  padding: 0;
+  border-color: var(--rule);
+  color: var(--muted-ink);
+  background: transparent;
+}
+.desktop-workspace .approval-chat .approval-chat__mobile-select,
+.desktop-workspace .approval-chat .approval-chat__mobile-new {
+  display: none;
+}
+.desktop-workspace .approval-chat__rename {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--rule);
+}
+.desktop-workspace .approval-chat__rename > input {
+  min-width: 0;
+  flex: 1;
+  padding: 6px;
+}
+.desktop-workspace .approval-chat__rename > button {
+  min-height: 30px;
+  padding: 5px 9px;
+  font-size: 12px;
+}
+.desktop-workspace .approval-chat .ai-conversation {
+  position: relative;
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  border: 0;
+  background: var(--surface);
+}
+.desktop-workspace .approval-chat .ai-conversation__scroll {
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule) transparent;
+}
+.desktop-workspace .approval-chat .ai-conversation__content {
+  min-height: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 24px 20px 36px;
+}
+.desktop-workspace .approval-chat .ai-conversation__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 18px;
+  margin: auto;
+  width: min(100%, 420px);
+  padding: 24px 12px;
+  color: var(--vermilion);
+}
+.desktop-workspace .approval-chat .ai-conversation__empty > span {
+  display: grid;
+  gap: 10px;
+}
+.desktop-workspace .approval-chat .ai-conversation__empty strong {
+  color: var(--ink);
+  font-size: 20px;
+  font-weight: 550;
+  line-height: 1.4;
+}
+.desktop-workspace .approval-chat .ai-conversation__empty small {
+  max-width: 340px;
+  color: var(--muted-ink);
+  font-size: 12px;
+  line-height: 1.8;
+}
+.desktop-workspace .approval-chat .ai-message {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+}
+.desktop-workspace .approval-chat .ai-message__content {
+  display: grid;
+  gap: 9px;
+  width: 100%;
+  min-width: 0;
+}
+.desktop-workspace .approval-chat .ai-message--user {
+  width: auto;
+  max-width: 88%;
+  align-self: flex-end;
+}
+.desktop-workspace .approval-chat .ai-message--user .ai-message__content {
+  padding: 12px 14px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  color: var(--ink);
+}
+.desktop-workspace .approval-chat__message-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--muted-ink);
+  font: 10px/1.3 var(--font-mono);
+}
+.desktop-workspace
+  .approval-chat
+  .ai-message--assistant
+  .approval-chat__message-meta
+  > span {
+  color: var(--vermilion);
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+.desktop-workspace .approval-chat__message-meta time {
+  margin-left: auto;
+  font-size: 9px;
+}
+.desktop-workspace .approval-chat__user-text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.75;
+}
+.desktop-workspace .approval-chat .ai-message__response {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  font-size: 13px;
+  line-height: 1.8;
+}
+.desktop-workspace .approval-chat .ai-message__response > :first-child {
+  margin-top: 0;
+}
+.desktop-workspace .approval-chat .ai-message__response > :last-child {
+  margin-bottom: 0;
+}
+.desktop-workspace .approval-chat .ai-message__response p {
+  margin: 0.65em 0;
+}
+.desktop-workspace .approval-chat .ai-message__response h1,
+.desktop-workspace .approval-chat .ai-message__response h2,
+.desktop-workspace .approval-chat .ai-message__response h3,
+.desktop-workspace .approval-chat .ai-message__response h4 {
+  margin: 1em 0 0.5em;
+  line-height: 1.5;
+  font-family: var(--font-ui);
+  letter-spacing: normal;
+}
+.desktop-workspace .approval-chat .ai-message__response h1 {
+  font-size: 19px;
+}
+.desktop-workspace .approval-chat .ai-message__response h2 {
+  font-size: 17px;
+}
+.desktop-workspace .approval-chat .ai-message__response h3,
+.desktop-workspace .approval-chat .ai-message__response h4 {
+  font-size: 14px;
+}
+.desktop-workspace .approval-chat .ai-message__response ul,
+.desktop-workspace .approval-chat .ai-message__response ol {
+  padding-left: 1.5em;
+  margin: 0.65em 0;
+}
+.desktop-workspace .approval-chat .ai-message__response a {
+  color: var(--vermilion);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.desktop-workspace .approval-chat .ai-message__response blockquote {
+  margin: 1em 0;
+  border-left: 2px solid var(--vermilion);
+  padding-left: 14px;
+  color: var(--muted-ink);
+}
+.desktop-workspace .approval-chat .ai-message__response pre {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre;
+  background: var(--paper);
+  font: 12px/1.7 var(--font-mono);
+}
+.desktop-workspace .approval-chat .ai-message__response code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+.desktop-workspace .approval-chat .ai-message__response :not(pre) > code {
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--rule);
+  padding: 1px 4px;
+}
+.desktop-workspace .approval-chat .ai-message__response table {
+  width: 100%;
+  font-size: 12px;
+  border-collapse: collapse;
+}
+.desktop-workspace .approval-chat .ai-message__response th,
+.desktop-workspace .approval-chat .ai-message__response td {
+  border: 1px solid var(--rule);
+  padding: 7px 10px;
+  text-align: left;
+}
+.desktop-workspace .approval-chat .ai-message__response th {
+  background: var(--paper);
+}
+.desktop-workspace .approval-chat .ai-message__response button {
+  min-height: 26px;
+  padding: 4px 7px;
+  background: var(--surface);
+  border-color: var(--rule);
+  color: var(--muted-ink);
+}
+.desktop-workspace .approval-chat__message-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  color: var(--muted-ink);
+  font-size: 10px;
+}
+.desktop-workspace .approval-chat__message-actions > button {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 0;
+  min-height: 24px;
+  border: 0;
+  background: transparent;
+  color: var(--muted-ink);
+  font-size: 10px;
+}
+.desktop-workspace .approval-chat__thinking {
+  min-width: 0;
+  width: 100%;
+  border-left: 2px solid var(--rule);
+  padding-left: 12px;
+  color: var(--muted-ink);
+}
+.desktop-workspace .approval-chat__thinking > summary,
+.desktop-workspace .approval-chat__tool-call > header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  font-size: 11px;
+}
+.desktop-workspace .approval-chat__thinking > summary {
+  cursor: pointer;
+}
+.desktop-workspace .approval-chat__thinking summary small,
+.desktop-workspace .approval-chat__tool-call header small {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--muted-ink);
+}
+.desktop-workspace .approval-chat__thinking .ai-message__response {
+  padding-top: 8px;
+  font-size: 12px;
+}
+.desktop-workspace .approval-chat__tool-call {
+  min-width: 0;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+}
+.desktop-workspace .approval-chat__tool-call > header {
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  overflow-wrap: anywhere;
+}
+.desktop-workspace .approval-chat__tool-call > header > svg {
+  flex-shrink: 0;
+}
+.desktop-workspace .approval-chat__tool-call > header > span {
+  color: var(--muted-ink);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.desktop-workspace .approval-chat__tool-call[data-status="failed"] {
+  border-color: var(--vermilion);
+}
+.desktop-workspace .approval-chat__tool-call > details > summary {
+  padding: 8px 10px;
+  cursor: pointer;
+  color: var(--muted-ink);
+  font-size: 11px;
+  border-top: 1px solid var(--rule);
+}
+.desktop-workspace .approval-chat__tool-call pre {
+  max-height: 180px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 11px/1.6 var(--font-mono);
+}
+.desktop-workspace .approval-chat .ai-conversation__scroll-button {
+  position: absolute;
+  right: 18px;
+  bottom: 12px;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  min-height: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--vermilion);
+  color: var(--vermilion);
+  background: var(--surface);
+  box-shadow: none;
+}
+.desktop-workspace .approval-chat__composer {
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 10px 14px 14px;
+  border-top: 1px solid var(--rule);
+  background: var(--surface);
+}
+.desktop-workspace .approval-chat .ai-suggestions {
+  display: flex;
+  gap: 6px;
+  overflow: auto;
+  padding: 0 0 10px;
+  scrollbar-width: thin;
+}
+.desktop-workspace .approval-chat .ai-suggestion {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 4px 9px;
+  color: var(--muted-ink);
+  border: 1px solid var(--rule);
+  background: transparent;
+  font-size: 11px;
+}
+.desktop-workspace .approval-chat .ai-prompt-input {
+  border: 1px solid var(--rule);
+  background: var(--paper);
+}
+.desktop-workspace .approval-chat .ai-prompt-input:focus-within {
+  border-color: var(--vermilion);
+  outline: 1px solid var(--vermilion);
+  outline-offset: -1px;
+}
+.desktop-workspace .approval-chat .ai-prompt-input__textarea {
+  display: block;
+  width: 100%;
+  min-height: 72px;
+  max-height: 140px;
+  padding: 12px;
+  border: 0;
+  resize: none;
+  background: transparent;
+  font-size: 13px;
+  line-height: 1.6;
+  box-shadow: none;
+}
+.desktop-workspace .approval-chat .ai-prompt-input__textarea:focus {
+  outline: none;
+}
+.desktop-workspace .approval-chat .ai-prompt-input__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 8px 8px 12px;
+}
+.desktop-workspace .approval-chat .ai-prompt-input__footer > span {
+  min-width: 0;
+  color: var(--muted-ink);
+  font-size: 10px;
+}
+.desktop-workspace .approval-chat .ai-prompt-input__submit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  gap: 6px;
+  min-height: 32px;
+  padding: 7px 12px;
+  background: var(--vermilion);
+  border: 1px solid var(--vermilion);
+  color: var(--surface);
+  font-size: 12px;
+}
+.desktop-workspace
+  .approval-chat
+  .ai-prompt-input__submit:hover:not(:disabled) {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--surface);
+}
+.desktop-workspace .approval-chat__error {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-height: 72px;
+  overflow: auto;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--vermilion);
+  background: var(--paper);
+  color: var(--vermilion);
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.desktop-workspace .approval-chat__error > span {
+  flex: 1;
+  min-width: 0;
+}
+.desktop-workspace .approval-chat__error > button {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 4px 7px;
+  font-size: 11px;
+}
+.desktop-workspace .approval-chat__loading,
+.desktop-workspace .approval-chat__message-note {
+  margin: 0;
+  color: var(--muted-ink);
+  font-size: 12px;
+}
+.desktop-workspace
+  .approval-chat
+  .ai-conversation__content
+  > .approval-chat__loading:only-child {
+  margin: auto;
+}
+@container (max-width: 680px) {
+  .desktop-workspace .approval-chat .approval-chat__body {
+    grid-template-columns: minmax(0, 1fr);
+    height: clamp(420px, 66vh, 640px);
+  }
+  .desktop-workspace .approval-chat__history {
+    display: none;
+  }
+  .desktop-workspace .approval-chat .approval-chat__mobile-select {
+    display: block;
+    flex: 0 0 auto;
+    width: calc(100% - 28px);
+    margin: 8px 14px;
+    min-height: 30px;
+    padding: 5px 24px 5px 8px;
+    font-size: 12px;
+  }
+  .desktop-workspace .approval-chat .approval-chat__mobile-new {
+    display: grid;
+  }
+  .desktop-workspace .approval-chat__toolbar {
+    padding: 10px 14px;
+  }
+  .desktop-workspace .approval-chat .ai-conversation__content {
+    padding: 16px 12px 32px;
+  }
+  .desktop-workspace .approval-chat__composer {
+    padding: 8px 10px 10px;
+  }
+}
+@container (max-width: 400px) {
+  .desktop-workspace .approval-chat > summary {
+    padding: 10px;
+    font-size: 12px;
+  }
+  .desktop-workspace .approval-chat__status {
+    font-size: 10px;
+  }
+  .desktop-workspace .approval-chat .ai-prompt-input__footer > span {
+    max-width: 160px;
+  }
+}

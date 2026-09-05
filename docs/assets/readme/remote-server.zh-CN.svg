@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="637" viewBox="0 0 1200 637" role="img" aria-labelledby="title description" xml:lang="zh-CN">
+  <title id="title">下一步：让 Plankton 运行在远端 Server。</title>
+  <desc id="description">规划中的远端架构：开发机、SSH 主机与 CI Worker 上的 Agent 向 Plankton Server 发送认证请求，服务端策略与 LLM 审查按需转交桌面人工审批，并记录审计。尚未实现。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0 0 L8 4 L0 8" fill="#706d67" />
+    </marker>
+  </defs>
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">
+    <rect x="0" y="0" width="1200" height="637" fill="#f4f1ea" stroke="#f4f1ea" />
+    <rect x="0" y="0" width="1200" height="6" fill="#f2381e" stroke="#f2381e" />
+    <text x="48" y="57" font-size="17" fill="#f2381e" font-weight="700">04 / ROADMAP · PLANNED</text>
+    <text x="48" y="108" font-size="36" fill="#171716" font-weight="700">下一步：让 Plankton 运行在远端 Server。</text>
+    <text x="48" y="148" font-size="23" fill="#706d67" font-weight="400">目标架构示意 · 远程访问能力尚未实现。</text>
+    <rect x="48" y="198" width="300" height="82" fill="#fffefb" stroke="#cfcac1" />
+    <svg width="27.52" height="27.52" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="67.0" y="221.88" color="#171716">
+      <path d="M18 5a2 2 0 0 1 2 2v8.526a2 2 0 0 0 .212.897l1.068 2.127a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45l1.068-2.127A2 2 0 0 0 4 15.526V7a2 2 0 0 1 2-2z" />
+      <path d="M20.054 15.987H3.946" />
+    </svg>
+    <text x="119" y="248" font-size="23" fill="#171716" font-weight="550">开发者电脑</text>
+    <rect x="48" y="304" width="300" height="82" fill="#fffefb" stroke="#cfcac1" />
+    <svg width="27.52" height="27.52" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="67.0" y="327.88" color="#171716">
+      <path d="M12 19h8" />
+      <path d="m4 17 6-6-6-6" />
+    </svg>
+    <text x="119" y="354" font-size="23" fill="#171716" font-weight="550">SSH 远程主机</text>
+    <rect x="48" y="410" width="300" height="82" fill="#fffefb" stroke="#cfcac1" />
+    <svg width="27.52" height="27.52" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="67.0" y="433.88" color="#171716">
+      <rect width="8" height="8" x="3" y="3" rx="2" />
+      <path d="M7 11v4a2 2 0 0 0 2 2h4" />
+      <rect width="8" height="8" x="13" y="13" rx="2" />
+    </svg>
+    <text x="119" y="460" font-size="23" fill="#171716" font-weight="550">CI 工作节点</text>
+    <path d="M348 239 H377 V451 H348 M348 345 H420" stroke="#706d67" stroke-width="2" fill="none" marker-end="url(#arrow)" />
+    <rect x="432" y="198" width="342" height="294" fill="#fffefb" stroke="#f2381e" />
+    <svg width="36.12" height="36.12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="458.0" y="214.78" color="#171716">
+      <rect width="20" height="8" x="2" y="2" rx="2" ry="2" />
+      <rect width="20" height="8" x="2" y="14" rx="2" ry="2" />
+      <line x1="6" x2="6.01" y1="6" y2="6" />
+      <line x1="6" x2="6.01" y1="18" y2="18" />
+    </svg>
+    <text x="517" y="249" font-size="26" fill="#171716" font-weight="650">Plankton Server</text>
+    <text x="458" y="305" font-size="21" fill="#171716" font-weight="400">经过认证的远程密码请求</text>
+    <text x="458" y="334" font-size="21" fill="#171716" font-weight="400">服务端执行人工暴露面策略</text>
+    <text x="458" y="363" font-size="21" fill="#171716" font-weight="400">密码读取与审计记录</text>
+    <text x="458" y="392" font-size="21" fill="#171716" font-weight="400">可撤销的客户端访问</text>
+    <path d="M775 345 L829 345" stroke="#706d67" stroke-width="2" fill="none" marker-end="url(#arrow)" />
+    <rect x="842" y="198" width="310" height="294" fill="#fffefb" stroke="#cfcac1" />
+    <svg width="36.12" height="36.12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="866.0" y="214.78" color="#171716">
+      <path d="M2 21a8 8 0 0 1 13.292-6" />
+      <circle cx="10" cy="8" r="5" />
+      <path d="m16 19 2 2 4-4" />
+    </svg>
+    <text x="866" y="303" font-size="26" fill="#171716" font-weight="650">审查与批准</text>
+    <text x="866" y="348" font-size="20" fill="#706d67" font-weight="400">LLM 与服务端策略校验</text>
+    <text x="866" y="377" font-size="20" fill="#706d67" font-weight="400">需要时转交桌面人工审批</text>
+    <text x="866" y="406" font-size="20" fill="#706d67" font-weight="400">查看同一份请求历史</text>
+    <rect x="48" y="525" width="1104" height="83" fill="#171716" stroke="#171716" />
+    <svg width="19.32" height="19.32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="72.0" y="542.06" color="#fffefb">
+      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+    </svg>
+    <text x="100.32" y="560" font-size="23" fill="#fffefb" font-weight="550">配对客户端   →    加密传输   →    执行范围策略   →    审计访问</text>
+    <text x="72" y="590" font-size="18" fill="#b5b0a7" font-weight="400">以上均为待办；现有的加密保险库同步是另一项能力。</text>
+  </g>
+</svg>

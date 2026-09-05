@@ -1,0 +1,29 @@
+[package]
+name = "plankton-daemon"
+description = "Persistent local daemon for Plankton approvals and credential access"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+plankton-core = { path = "../plankton-core" }
+plankton-protocol = { path = "../plankton-protocol" }
+plankton-store = { path = "../plankton-store" }
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+plankton-client = { path = "../plankton-client" }
+reqwest.workspace = true
+tempfile = "3.13"

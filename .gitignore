@@ -1,0 +1,27 @@
+target/
+dist/
+node_modules/
+.plankton/
+.artifacts/
+.openaquarium/
+.playwright-mcp/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+p2-ui-*.png
+p3-desktop-*.png
+apps/desktop/.engine-cache/
+apps/desktop/src-tauri/engines/keepassxc/*
+!apps/desktop/src-tauri/engines/keepassxc/.gitkeep
+
+# Local credentials and private runtime evidence
+.env
+.env.*
+*.p12
+*.pfx
+*.pem
+*.key
+*.kdbx
+docs/debug/
+docs/ui-review-*/

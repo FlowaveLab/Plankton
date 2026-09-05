@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="650" viewBox="0 0 1200 650" role="img" aria-labelledby="title description" xml:lang="en">
+  <title id="title">What is this credential allowed to reach?</title>
+  <desc id="description">A human defines five credential exposure surfaces. The LLM compares the saved policy with runtime evidence and intended use. Plankton locally validates levels, destinations and uncertainty before automatic release.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0 0 L8 4 L0 8" fill="#706d67" />
+    </marker>
+  </defs>
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">
+    <rect x="0" y="0" width="1200" height="650" fill="#f4f1ea" stroke="#f4f1ea" />
+    <rect x="0" y="0" width="1200" height="6" fill="#f2381e" stroke="#f2381e" />
+    <text x="48" y="57" font-size="17" fill="#f2381e" font-weight="700">02 / EXPOSURE POLICY</text>
+    <text x="48" y="108" font-size="37" fill="#171716" font-weight="700">What is this credential allowed to reach?</text>
+    <text x="48" y="148" font-size="23" fill="#706d67" font-weight="400">Humans configure five surfaces; fields inherit defaults or use their own rules.</text>
+    <rect x="48" y="185" width="674" height="58" fill="#171716" stroke="#171716" />
+    <text x="68" y="222" font-size="17" fill="#fffefb" font-weight="600">EXPOSURE SURFACE</text>
+    <text x="360" y="222" font-size="17" fill="#fffefb" font-weight="600">HUMAN-DEFINED SCOPE</text>
+    <rect x="48" y="243" width="674" height="58" fill="#fffefb" stroke="#cfcac1" />
+    <svg width="18.48" height="18.48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="68.0" y="262.84" color="#171716">
+      <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
+      <path d="M9 13a4.5 4.5 0 0 0 3-4" />
+      <path d="M6.003 5.125A3 3 0 0 0 6.401 6.5" />
+      <path d="M3.477 10.896a4 4 0 0 1 .585-.396" />
+      <path d="M6 18a4 4 0 0 1-1.967-.516" />
+      <path d="M12 13h4" />
+      <path d="M12 18h6a2 2 0 0 1 2 2v1" />
+      <path d="M12 8h8" />
+      <path d="M16 8V5a2 2 0 0 1 2-2" />
+      <circle cx="16" cy="13" r=".5" />
+      <circle cx="18" cy="3" r=".5" />
+      <circle cx="20" cy="21" r=".5" />
+      <circle cx="20" cy="8" r=".5" />
+    </svg>
+    <text x="95.48" y="280" font-size="22" fill="#171716" font-weight="550">LLM context</text>
+    <text x="360" y="280" font-size="21" fill="#706d67" font-weight="400">Off / within configured scope</text>
+    <rect x="48" y="301" width="674" height="58" fill="#f4f1ea" stroke="#cfcac1" />
+    <svg width="18.48" height="18.48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="68.0" y="320.84" color="#171716">
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" />
+      <path d="M2 12h20" />
+    </svg>
+    <text x="95.48" y="338" font-size="22" fill="#171716" font-weight="550">Network</text>
+    <text x="360" y="338" font-size="21" fill="#706d67" font-weight="400">Off / allowed hosts / on</text>
+    <rect x="48" y="359" width="674" height="58" fill="#fffefb" stroke="#cfcac1" />
+    <svg width="18.48" height="18.48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="68.0" y="378.84" color="#171716">
+      <path d="M10 16h.01" />
+      <path d="M2.212 11.577a2 2 0 0 0-.212.896V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.527a2 2 0 0 0-.212-.896L18.55 5.11A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+      <path d="M21.946 12.013H2.054" />
+      <path d="M6 16h.01" />
+    </svg>
+    <text x="95.48" y="396" font-size="22" fill="#171716" font-weight="550">Files</text>
+    <text x="360" y="396" font-size="21" fill="#706d67" font-weight="400">Off / within configured scope</text>
+    <rect x="48" y="417" width="674" height="58" fill="#f4f1ea" stroke="#cfcac1" />
+    <svg width="18.48" height="18.48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="68.0" y="436.84" color="#171716">
+      <path d="M12 19h8" />
+      <path d="m4 17 6-6-6-6" />
+    </svg>
+    <text x="95.48" y="454" font-size="22" fill="#171716" font-weight="550">Logs</text>
+    <text x="360" y="454" font-size="21" fill="#706d67" font-weight="400">Off / within configured scope</text>
+    <rect x="48" y="475" width="674" height="58" fill="#fffefb" stroke="#cfcac1" />
+    <svg width="18.48" height="18.48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="68.0" y="494.84" color="#171716">
+      <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+      <path d="M21 3v5h-5" />
+      <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
+      <path d="M8 16H3v5" />
+    </svg>
+    <text x="95.48" y="512" font-size="22" fill="#171716" font-weight="550">Processes</text>
+    <text x="360" y="512" font-size="21" fill="#706d67" font-weight="400">Off / declared consumer</text>
+    <path d="M727 352 L769 352" stroke="#706d67" stroke-width="2" fill="none" marker-end="url(#arrow)" />
+    <rect x="779" y="185" width="373" height="348" fill="#fffefb" stroke="#f2381e" />
+    <text x="801" y="221" font-size="17" fill="#f2381e" font-weight="700">THE REVIEWER COMPARES</text>
+    <text x="801" y="264" font-size="22" fill="#171716" font-weight="400">Saved exposure profile</text>
+    <text x="801" y="293" font-size="22" fill="#171716" font-weight="400">+ runtime call-chain evidence</text>
+    <text x="801" y="322" font-size="22" fill="#171716" font-weight="400">+ intended credential use</text>
+    <path d="M961 344 L961 379" stroke="#706d67" stroke-width="2" fill="none" marker-end="url(#arrow)" />
+    <text x="801" y="417" font-size="24" fill="#171716" font-weight="650">Plankton validates locally</text>
+    <text x="801" y="456" font-size="19" fill="#706d67" font-weight="400">Check scope and destinations.</text>
+    <text x="801" y="485" font-size="19" fill="#706d67" font-weight="400">Unknown evidence cannot allow.</text>
+    <text x="48" y="580" font-size="22" fill="#171716" font-weight="550">Within scope + valid allow decision → release. Otherwise → deny or human review.</text>
+    <text x="48" y="617" font-size="19" fill="#706d67" font-weight="400">Configurable scope is shown. Protected defaults disable network exposure.</text>
+  </g>
+</svg>

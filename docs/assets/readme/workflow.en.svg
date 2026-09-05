@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title description" xml:lang="en">
+  <title id="title">A secret request. A visible decision.</title>
+  <desc id="description">An agent requests a credential through a Skill. Plankton captures the runtime call chain. A human or LLM reviews it under human-defined exposure policy. An allowed value is resolved from the vault and handed to the consumer.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0 0 L8 4 L0 8" fill="#706d67" />
+    </marker>
+  </defs>
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">
+    <rect x="0" y="0" width="1200" height="630" fill="#f4f1ea" stroke="#f4f1ea" />
+    <rect x="0" y="0" width="1200" height="6" fill="#f2381e" stroke="#f2381e" />
+    <g transform="translate(48 35) scale(.85)">
+      <path fill="#f2381e" fill-rule="evenodd" d="M32 3 C32.7 3 33 17 34.2 28 C39 20 43 15 51.5 11 C54.5 9.5 55 11.5 52.5 13 C43 18.5 39 24 38.5 30 C38.2 32 39.5 36 40.5 40 L45.5 42.5 C49 44.3 48 46.5 45 45.6 L41 44 C42.5 54.5 39.5 60 32 60 C24.5 60 21.5 54.5 23 44 L19 45.6 C16 46.5 15 44.3 18.5 42.5 L23.5 40 C24.5 36 25.8 32 25.5 30 C25 24 21 18.5 11.5 13 C9 11.5 9.5 9.5 12.5 11 C21 15 25 20 29.8 28 C31 17 31.3 3 32 3 Z M32 40 C27.2 40 27.2 50 32 50 C36.8 50 36.8 40 32 40 Z" />
+    </g>
+    <text x="124" y="72" font-size="23" fill="#f2381e" font-weight="700">PLANKTON</text>
+    <text x="48" y="143" font-size="42" fill="#171716" font-weight="700">A secret request. A visible decision.</text>
+    <text x="48" y="183" font-size="24" fill="#706d67" font-weight="400">The agent requests. You set the boundaries. Plankton checks the use.</text>
+    <rect x="48" y="230" width="204" height="209" fill="#fffefb" stroke="#cfcac1" />
+    <svg width="36.12" height="36.12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="64.0" y="251.78" color="#171716">
+      <path d="M12 8V4H8" />
+      <rect width="16" height="12" x="4" y="8" rx="2" />
+      <path d="M2 14h2" />
+      <path d="M20 14h2" />
+      <path d="M15 13v2" />
+      <path d="M9 13v2" />
+    </svg>
+    <text x="64" y="319" font-size="15" fill="#f2381e" font-weight="700">01  REQUEST</text>
+    <text x="64" y="353" font-size="24" fill="#171716" font-weight="650">Agent + Skill</text>
+    <text x="64" y="389" font-size="17" fill="#706d67" font-weight="400">Request a credential</text>
+    <text x="64" y="418" font-size="17" fill="#706d67" font-weight="400">Explain the purpose</text>
+    <path d="M253 350 L267 350" stroke="#706d67" stroke-width="2" fill="none" marker-end="url(#arrow)" />
+    <rect x="273" y="230" width="204" height="209" fill="#fffefb" stroke="#cfcac1" />
+    <svg width="36.12" height="36.12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="289.0" y="251.78" color="#171716">
+      <path d="m21 21-4.34-4.34" />
+      <circle cx="11" cy="11" r="8" />
+    </svg>
+    <text x="289" y="319" font-size="15" fill="#f2381e" font-weight="700">02  CAPTURE</text>
+    <text x="289" y="353" font-size="24" fill="#171716" font-weight="650">Plankton</text>
+    <text x="289" y="389" font-size="17" fill="#706d67" font-weight="400">Runtime call chain</text>
+    <text x="289" y="418" font-size="17" fill="#706d67" font-weight="400">Arguments + sources</text>
+    <path d="M478 350 L492 350" stroke="#706d67" stroke-width="2" fill="none" marker-end="url(#arrow)" />
+    <rect x="498" y="230" width="204" height="209" fill="#fffefb" stroke="#f2381e" />
+    <svg width="36.12" height="36.12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="514.0" y="251.78" color="#171716">
+      <path d="M2 21a8 8 0 0 1 13.292-6" />
+      <circle cx="10" cy="8" r="5" />
+      <path d="m16 19 2 2 4-4" />
+    </svg>
+    <text x="514" y="319" font-size="15" fill="#f2381e" font-weight="700">03  REVIEW</text>
+    <text x="514" y="353" font-size="24" fill="#171716" font-weight="650">Human / LLM</text>
+    <text x="514" y="389" font-size="17" fill="#706d67" font-weight="400">Human-set scope</text>
+    <text x="514" y="418" font-size="17" fill="#706d67" font-weight="400">Local policy checks</text>
+    <path d="M703 350 L717 350" stroke="#706d67" stroke-width="2" fill="none" marker-end="url(#arrow)" />
+    <rect x="723" y="230" width="204" height="209" fill="#fffefb" stroke="#cfcac1" />
+    <svg width="36.12" height="36.12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="739.0" y="251.78" color="#171716">
+      <path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z" />
+      <circle cx="16.5" cy="7.5" r=".5" fill="currentColor" />
+    </svg>
+    <text x="739" y="319" font-size="15" fill="#f2381e" font-weight="700">04  RELEASE</text>
+    <text x="739" y="353" font-size="24" fill="#171716" font-weight="650">Approved value</text>
+    <text x="739" y="389" font-size="17" fill="#706d67" font-weight="400">Hand to the consumer</text>
+    <text x="739" y="418" font-size="17" fill="#706d67" font-weight="400">After approval only</text>
+    <path d="M928 350 L942 350" stroke="#706d67" stroke-width="2" fill="none" marker-end="url(#arrow)" />
+    <rect x="948" y="230" width="204" height="209" fill="#fffefb" stroke="#cfcac1" />
+    <svg width="36.12" height="36.12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" x="964.0" y="251.78" color="#171716">
+      <path d="M14 17H5" />
+      <path d="M19 7h-9" />
+      <circle cx="17" cy="17" r="3" />
+      <circle cx="7" cy="7" r="3" />
+    </svg>
+    <text x="964" y="319" font-size="15" fill="#f2381e" font-weight="700">05  USE</text>
+    <text x="964" y="353" font-size="24" fill="#171716" font-weight="650">Consumer</text>
+    <text x="964" y="389" font-size="17" fill="#706d67" font-weight="400">Direct process handoff</text>
+    <text x="964" y="418" font-size="17" fill="#706d67" font-weight="400">Follow approved use</text>
+    <rect x="48" y="462" width="1104" height="100" fill="#171716" stroke="#171716" />
+    <text x="72" y="501" font-size="17" fill="#f8a494" font-weight="700">YOUR POLICY, BEFORE THE READ</text>
+    <text x="72" y="538" font-size="24" fill="#fffefb" font-weight="500">Model context  ·  Network  ·  Files  ·  Logs  ·  Other processes</text>
+    <text x="48" y="598" font-size="17" fill="#706d67" font-weight="400">Protected access flow · Decisions and evidence remain available in the desktop app.</text>
+  </g>
+</svg>

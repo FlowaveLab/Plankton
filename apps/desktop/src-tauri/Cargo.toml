@@ -1,0 +1,41 @@
+[package]
+name = "plankton-desktop"
+description = "Desktop approval console for Plankton"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
+sha2.workspace = true
+
+[dependencies]
+plankton-client = { path = "../../../crates/plankton-client" }
+plankton-core = { path = "../../../crates/plankton-core" }
+plankton-daemon = { path = "../../../crates/plankton-daemon" }
+plankton-protocol = { path = "../../../crates/plankton-protocol" }
+plankton-store = { path = "../../../crates/plankton-store" }
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+directories.workspace = true
+dotenvy.workspace = true
+rfd = "0.15"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sysinfo.workspace = true
+tauri.workspace = true
+tauri-plugin-deep-link = "2.4.8"
+tauri-plugin-log.workspace = true
+tauri-plugin-single-instance = { version = "2.4.1", features = ["deep-link"] }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url = "2.5"
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.13"
