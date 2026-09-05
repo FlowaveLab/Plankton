@@ -6209,6 +6209,17 @@ fn safe_identifier(value: &str) -> String {
 fn main() {
     if let Err(error) = run() {
         eprintln!("plankton-desktop failed: {error:#}");
+        // Startup can fail before Tauri creates a window. Finder launches do not
+        // expose stderr, so report the failure through a native system dialog.
+        rfd::MessageDialog::new()
+            .set_title("Plankton 无法启动 / Unable to start")
+            .set_description(format!(
+                "Plankton 启动失败，请根据以下错误检查配置或联系支持。\n\
+                 Plankton could not start. Check the error below or contact support.\n\n{error:#}"
+            ))
+            .set_level(rfd::MessageLevel::Error)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
         std::process::exit(1);
     }
 }

@@ -30,3 +30,4 @@ CREATE INDEX IF NOT EXISTS idx_access_requests_status_created_at
 
 CREATE INDEX IF NOT EXISTS idx_audit_records_request_id_created_at
     ON audit_records(request_id, created_at);
+

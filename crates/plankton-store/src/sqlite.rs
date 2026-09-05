@@ -238,7 +238,7 @@ impl SqliteStore {
             .await?;
 
         // Migrations are embedded so packaged clients never depend on loose SQL files.
-        sqlx::migrate!("./migrations").run(&pool).await?;
+        crate::migration_compatibility::run(&pool).await?;
         Ok(Self { pool })
     }
 
