@@ -43,8 +43,9 @@ class ${formula_class} < Formula
   end
 
   test do
-    help = shell_output("#{bin}/${binary_name} --help")
-    assert_match "read-only", help
+    assert_equal "plankton ${version}", shell_output("#{bin}/${binary_name} --version").strip
+    skill = shell_output("#{bin}/${binary_name} skill")
+    assert_match "brew install --cask flowavelab/tap/plankton", skill
   end
 end
 EOF
