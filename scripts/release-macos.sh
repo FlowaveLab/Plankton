@@ -19,7 +19,7 @@ export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${HOME}=/Users/zqqqqz2000"
 export CARGO_PROFILE_RELEASE_STRIP=symbols
 npm --prefix apps/desktop ci
 cargo build --locked --release -p plankton
-npm --prefix apps/desktop run tauri build -- --bundles app
+env -u APPLE_SIGNING_IDENTITY npm --prefix apps/desktop run tauri build -- --bundles app
 
 app="target/release/bundle/macos/Plankton.app"
 cli="target/release/plankton"
