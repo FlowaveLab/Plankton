@@ -1,4 +1,5 @@
 mod diagnostics;
+mod migration_compatibility;
 mod password_changes;
 mod read;
 mod resources;

@@ -3854,7 +3854,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plankton"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3872,7 +3872,7 @@ dependencies = [
 
 [[package]]
 name = "plankton-client"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "directories",
@@ -3888,7 +3888,7 @@ dependencies = [
 
 [[package]]
 name = "plankton-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "agent-client-protocol",
  "async-openai",
@@ -3927,7 +3927,7 @@ dependencies = [
 
 [[package]]
 name = "plankton-daemon"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -3950,7 +3950,7 @@ dependencies = [
 
 [[package]]
 name = "plankton-desktop"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3982,7 +3982,7 @@ dependencies = [
 
 [[package]]
 name = "plankton-protocol"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "regex",
@@ -3996,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "plankton-store"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "plankton-core",
