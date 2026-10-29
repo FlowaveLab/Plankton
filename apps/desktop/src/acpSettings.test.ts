@@ -3,6 +3,18 @@ import { describe, expect, it } from "vitest";
 import { ACP_DEFAULT_PROGRAM, buildAcpProgramSummary } from "./acpSettings";
 
 describe("acpSettings", () => {
+  it("builds a pinned Pi command alongside the other agent presets", () => {
+    const summary = buildAcpProgramSummary({
+      acp_profile: {
+        agent_kind: "pi",
+        version_mode: "pinned",
+        version: "0.0.34",
+      },
+    });
+    expect(summary.currentCommand).toBe("npx -y pi-acp@0.0.34");
+    expect(summary.usesDefaultStarter).toBe(false);
+  });
+
   it("reports the default Codex starter when ACP settings match defaults", () => {
     const summary = buildAcpProgramSummary({
       acp_profile: {

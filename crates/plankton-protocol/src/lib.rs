@@ -6,4 +6,5 @@ pub mod password_changes;
 pub mod passwords;
 pub mod resources;
 
-pub const PROTOCOL_VERSION: u16 = 5;
+// Version 6 replaces raw credential delivery with daemon-owned consumer execution.
+pub const PROTOCOL_VERSION: u16 = 6;

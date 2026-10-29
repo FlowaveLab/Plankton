@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -14,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
+
+const BACKEND_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const BACKEND_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
 
 const LOCAL_SECRET_CATALOG_RESOLVER_KIND: &str = "local_secret_catalog";
 pub const ONEPASSWORD_CLI_PROVIDER_KIND: &str = "1password_cli";
@@ -1880,47 +1882,26 @@ fn resolve_keepassxc_reference(
     {
         command.arg("cli");
     }
-    let mut child = command
+    command
         .args(["show", "--quiet", "--show-protected", "--attributes", field])
         .arg(database)
-        .arg(entry)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| ValueResolverError::ToolUnavailable {
-            provider_kind: KEEPASSXC_CLI_PROVIDER_KIND.to_string(),
-            resource: resource.to_string(),
-            message: error.to_string(),
-        })?;
-    let stdin = child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| ValueResolverError::SourceReadFailed {
-            provider_kind: KEEPASSXC_CLI_PROVIDER_KIND.to_string(),
-            resource: resource.to_string(),
-            message: "KeePassXC stdin was unavailable".to_string(),
-        })?;
-    stdin
-        .write_all(format!("{}\n", unlock_secret.trim_end()).as_bytes())
-        .map_err(|error| ValueResolverError::SourceReadFailed {
-            provider_kind: KEEPASSXC_CLI_PROVIDER_KIND.to_string(),
-            resource: resource.to_string(),
-            message: error.to_string(),
-        })?;
-    let output =
-        child
-            .wait_with_output()
-            .map_err(|error| ValueResolverError::SourceReadFailed {
-                provider_kind: KEEPASSXC_CLI_PROVIDER_KIND.to_string(),
-                resource: resource.to_string(),
-                message: error.to_string(),
-            })?;
+        .arg(entry);
+    let output = run_bounded_backend_command(
+        command,
+        Some(format!("{}\n", unlock_secret.trim_end()).into_bytes()),
+        BACKEND_COMMAND_TIMEOUT,
+        BACKEND_OUTPUT_LIMIT,
+    )
+    .map_err(|error| ValueResolverError::SourceReadFailed {
+        provider_kind: KEEPASSXC_CLI_PROVIDER_KIND.to_string(),
+        resource: resource.to_string(),
+        message: error.to_string(),
+    })?;
     if !output.status.success() {
         return Err(ValueResolverError::SourceReadFailed {
             provider_kind: KEEPASSXC_CLI_PROVIDER_KIND.to_string(),
             resource: resource.to_string(),
-            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            message: compact_process_message(&output),
         });
     }
     let value = String::from_utf8(output.stdout).map_err(|error| {
@@ -2328,18 +2309,22 @@ fn run_command_capture_stdout(
     provider_kind: &str,
     resource: &str,
 ) -> Result<Vec<u8>, ValueResolverError> {
-    let output = Command::new(program).args(args).output().map_err(|error| {
-        let message = if error.kind() == std::io::ErrorKind::NotFound {
-            format!("{} was not found in PATH", program.display())
-        } else {
-            error.to_string()
-        };
-        ValueResolverError::ToolUnavailable {
-            provider_kind: provider_kind.to_string(),
-            resource: resource.to_string(),
-            message,
-        }
-    })?;
+    let mut command = Command::new(program);
+    command.args(args);
+    let output =
+        run_bounded_backend_command(command, None, BACKEND_COMMAND_TIMEOUT, BACKEND_OUTPUT_LIMIT)
+            .map_err(|error| {
+            let message = if error.kind() == std::io::ErrorKind::NotFound {
+                format!("{} was not found in PATH", program.display())
+            } else {
+                error.to_string()
+            };
+            ValueResolverError::ToolUnavailable {
+                provider_kind: provider_kind.to_string(),
+                resource: resource.to_string(),
+                message,
+            }
+        })?;
 
     if !output.status.success() {
         return Err(ValueResolverError::SourceReadFailed {
@@ -2353,15 +2338,276 @@ fn run_command_capture_stdout(
 }
 
 fn compact_process_message(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned);
+    // Vendor output can contain the requested value or unlock material.
+    format!("credential backend exited with status {}", output.status)
+}
 
-    stderr.unwrap_or_else(|| format!("process exited with status {}", output.status))
+/// A synchronous bridge with an isolated async runtime. Both readers and the
+/// input writer share one deadline, so full pipes or inherited descendant pipe
+/// handles cannot leave detached blocking reader/writer threads behind.
+fn run_bounded_backend_command(
+    command: Command,
+    input: Option<Vec<u8>>,
+    deadline: std::time::Duration,
+    output_limit: usize,
+) -> std::io::Result<std::process::Output> {
+    std::thread::Builder::new()
+        .name("plankton-credential-backend".into())
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(capture_backend_command(
+                    command,
+                    input,
+                    deadline,
+                    output_limit,
+                ))
+        })?
+        .join()
+        .map_err(|_| std::io::Error::other("credential backend worker failed"))?
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct BackendCommandRegistry {
+    closing: bool,
+    groups: BTreeSet<u32>,
+}
+
+#[cfg(unix)]
+type SharedBackendCommands = std::sync::Arc<std::sync::Mutex<BackendCommandRegistry>>;
+
+#[cfg(unix)]
+static BACKEND_COMMANDS: std::sync::LazyLock<SharedBackendCommands> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Stop only credential-backend process groups created by this process, and
+/// prevent queued blocking work from starting another backend during shutdown.
+pub fn cancel_backend_commands() {
+    #[cfg(unix)]
+    cancel_registered_backend_commands(&BACKEND_COMMANDS);
+}
+
+/// A newly started daemon can accept backend work after an earlier shutdown in
+/// the same process. Existing registrations remain owned by their original guards.
+pub fn resume_backend_commands() {
+    #[cfg(unix)]
+    {
+        BACKEND_COMMANDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closing = false;
+    }
+}
+
+#[cfg(unix)]
+fn cancel_registered_backend_commands(registry: &SharedBackendCommands) {
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.closing = true;
+    for pid in &registry.groups {
+        // The group leader is not reaped until its registration is removed.
+        unsafe {
+            libc::kill(-(*pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(unix)]
+struct BackendProcessGroup {
+    pid: u32,
+    registry: SharedBackendCommands,
+}
+
+#[cfg(unix)]
+impl BackendProcessGroup {
+    fn spawn(
+        command: &mut tokio::process::Command,
+        registry: SharedBackendCommands,
+    ) -> std::io::Result<(tokio::process::Child, Self)> {
+        let mut state = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closing {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "credential backend execution is shutting down",
+            ));
+        }
+        // Spawn and registration share the cancellation lock: shutdown cannot
+        // miss a child between its creation and insertion into the registry.
+        let child = command.spawn()?;
+        let pid = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("credential backend pid is unavailable"))?;
+        state.groups.insert(pid);
+        drop(state);
+        Ok((child, Self { pid, registry }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BackendProcessGroup {
+    fn drop(&mut self) {
+        let mut state = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.groups.remove(&self.pid) {
+            // Kill descendants and remove registration before reaping the leader,
+            // so a stale numeric PID can never be applied to a later process.
+            unsafe {
+                libc::kill(-(self.pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
+async fn capture_backend_command(
+    command: Command,
+    input: Option<Vec<u8>>,
+    deadline: std::time::Duration,
+    output_limit: usize,
+) -> std::io::Result<std::process::Output> {
+    capture_backend_command_inner(
+        command,
+        input,
+        deadline,
+        output_limit,
+        #[cfg(unix)]
+        BACKEND_COMMANDS.clone(),
+    )
+    .await
+}
+
+async fn capture_backend_command_inner(
+    command: Command,
+    input: Option<Vec<u8>>,
+    deadline: std::time::Duration,
+    output_limit: usize,
+    #[cfg(unix)] registry: SharedBackendCommands,
+) -> std::io::Result<std::process::Output> {
+    use tokio::io::AsyncWriteExt;
+    let mut command = tokio::process::Command::from(command);
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(unix)]
+    let (mut child, group) = BackendProcessGroup::spawn(&mut command, registry)?;
+    #[cfg(not(unix))]
+    let mut child = command.spawn()?;
+    let stdin = child.stdin.take();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("credential backend stdout is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("credential backend stderr is unavailable"))?;
+    let run = async {
+        tokio::try_join!(
+            async {
+                if let (Some(mut stdin), Some(input)) = (stdin, input) {
+                    stdin.write_all(&input).await?;
+                    stdin.shutdown().await?;
+                }
+                Ok::<_, std::io::Error>(())
+            },
+            read_backend_output(stdout, output_limit),
+            read_backend_output(stderr, output_limit),
+            async {
+                #[cfg(unix)]
+                {
+                    wait_backend_exit_without_reaping(group.pid).await
+                }
+                #[cfg(not(unix))]
+                {
+                    child.wait().await.map(|_| ())
+                }
+            }
+        )
+    };
+    let result = tokio::time::timeout(deadline, run).await;
+    #[cfg(unix)]
+    drop(group);
+    if !matches!(&result, Ok(Ok(_))) {
+        let _ = child.start_kill();
+    }
+    // After termination, only this owner reaps the leader. No registered PID
+    // remains while it is eligible for reuse by the operating system.
+    let status = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
+    match result {
+        Ok(Ok(((), stdout, stderr, ()))) => Ok(std::process::Output {
+            status: status.map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "credential backend cleanup timed out",
+                )
+            })??,
+            stdout,
+            stderr,
+        }),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "credential backend timed out",
+        )),
+    }
+}
+
+#[cfg(unix)]
+async fn wait_backend_exit_without_reaping(pid: u32) -> std::io::Result<()> {
+    loop {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if unsafe { info.si_pid() } != 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn read_backend_output(
+    stream: impl tokio::io::AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    stream
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::other(
+            "credential backend output limit exceeded",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn normalize_match(left: &str, right: &str) -> bool {
@@ -2398,6 +2644,197 @@ mod tests {
         ValueResolverError, VendorCliPrograms, BITWARDEN_CLI_PROVIDER_KIND,
         DOTENV_FILE_PROVIDER_KIND, ONEPASSWORD_CLI_PROVIDER_KIND,
     };
+
+    #[cfg(unix)]
+    fn fixture_command(source: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", source]);
+        command
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_backend_bridge_works_inside_an_async_runtime_and_closes_stdin() {
+        let output = super::run_bounded_backend_command(
+            fixture_command("cat; printf 'diagnostic' >&2"),
+            Some(b"synthetic credential\n".to_vec()),
+            std::time::Duration::from_secs(2),
+            1024,
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"synthetic credential\n");
+        assert_eq!(output.stderr, b"diagnostic");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_backend_timeout_closes_inherited_pipes_and_kills_descendants() {
+        let temp = tempdir().unwrap();
+        let marker = temp.path().join("must-not-be-written");
+        let mut command = fixture_command("(sleep 1; printf 'leaked' > \"$1\") & exit 0");
+        command.arg("fixture").arg(&marker);
+        let error = super::run_bounded_backend_command(
+            command,
+            None,
+            std::time::Duration::from_millis(80),
+            1024,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(
+            !marker.exists(),
+            "the timed-out backend descendant must be killed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_backend_shutdown_kills_owned_groups_and_rejects_late_spawns() {
+        let temp = tempdir().unwrap();
+        let marker = temp.path().join("must-not-be-written-after-shutdown");
+        let ready = temp.path().join("ready");
+        let registry: super::SharedBackendCommands = Default::default();
+        let worker_registry = registry.clone();
+        let mut command =
+            fixture_command("(sleep 1; printf leaked > \"$2\") & printf ready > \"$1\"; wait");
+        command.arg("fixture").arg(&ready).arg(&marker);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let output = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(super::capture_backend_command_inner(
+                    command,
+                    None,
+                    std::time::Duration::from_secs(60),
+                    1024,
+                    worker_registry,
+                ));
+            sender.send(output).unwrap();
+        });
+        let start = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "fixture must start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let cancelled = std::time::Instant::now();
+        super::cancel_registered_backend_commands(&registry);
+        let output = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("shutdown must not wait for the backend's 60 second timeout")
+            .unwrap();
+        assert!(!output.status.success());
+        worker.join().unwrap();
+        assert!(cancelled.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            registry.lock().unwrap().groups.is_empty(),
+            "reaped children must not remain registered"
+        );
+
+        let rejected = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::capture_backend_command_inner(
+                fixture_command("true"),
+                None,
+                std::time::Duration::from_secs(1),
+                1024,
+                registry.clone(),
+            ))
+            .unwrap_err();
+        assert_eq!(rejected.kind(), std::io::ErrorKind::Interrupted);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(
+            !marker.exists(),
+            "shutdown must also kill backend descendants"
+        );
+
+        registry.lock().unwrap().closing = false;
+        let resumed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::capture_backend_command_inner(
+                fixture_command("true"),
+                None,
+                std::time::Duration::from_secs(1),
+                1024,
+                registry.clone(),
+            ))
+            .unwrap();
+        assert!(resumed.status.success());
+        assert!(registry.lock().unwrap().groups.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_backend_limits_each_stream_and_times_out_blocked_input() {
+        for source in [
+            "printf '%04096d' 0; sleep 30",
+            "printf '%04096d' 0 >&2; sleep 30",
+        ] {
+            let error = super::run_bounded_backend_command(
+                fixture_command(source),
+                None,
+                std::time::Duration::from_secs(2),
+                32,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("output limit exceeded"));
+        }
+        let error = super::run_bounded_backend_command(
+            fixture_command("exec sleep 30"),
+            Some(vec![b'x'; 3 * 1024 * 1024]),
+            std::time::Duration::from_millis(80),
+            1024,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backend_failures_never_include_backend_output_or_unlock_input() {
+        let temp = tempdir().unwrap();
+        let program = temp.path().join("fixture-backend");
+        write_executable(
+            &program,
+            "#!/bin/sh\necho SYNTHETIC_PRIVATE_STDERR >&2\necho SYNTHETIC_PRIVATE_STDOUT\nexit 7\n",
+        );
+        let error = super::run_command_capture_stdout(&program, &[], "fixture", "secret/fixture")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("7"));
+        assert!(!error.contains("SYNTHETIC_PRIVATE"));
+        let unlock = temp.path().join("unlock");
+        fs::write(&unlock, "SYNTHETIC_UNLOCK").unwrap();
+        write_executable(
+            &program,
+            "#!/bin/sh\ncat >&2\necho SYNTHETIC_PRIVATE_STDOUT\nexit 7\n",
+        );
+        use sha2::Digest;
+        let digest = format!("{:x}", sha2::Sha256::digest(fs::read(&program).unwrap()));
+        let error = super::resolve_keepassxc_reference(
+            &program,
+            &digest,
+            &temp.path().join("vault.kdbx"),
+            &unlock,
+            "entry",
+            "field",
+            "secret/fixture",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("7"));
+        assert!(!error.contains("SYNTHETIC_"));
+    }
 
     #[test]
     fn resolves_value_from_secrets_table() {

@@ -6,18 +6,18 @@ use plankton_protocol::acp::AgentKind;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut settings = PlanktonSettings::default();
-    settings.acp_profile.agent_kind = match args.first().map(String::as_str) {
-        Some("claude_code") => AgentKind::ClaudeCode,
-        Some("open_code") => AgentKind::OpenCode,
-        Some("codex") => AgentKind::Codex,
-        _ => {
-            return Err(
-                "usage: acp_options_probe codex|claude_code|open_code [--ready] [id=value ...]"
+    settings.acp_profile.agent_kind =
+        match args.first().map(String::as_str) {
+            Some("claude_code") => AgentKind::ClaudeCode,
+            Some("open_code") => AgentKind::OpenCode,
+            Some("codex") => AgentKind::Codex,
+            Some("pi") => AgentKind::Pi,
+            _ => return Err(
+                "usage: acp_options_probe codex|claude_code|open_code|pi [--ready] [id=value ...]"
                     .into(),
-            )
-        }
-    };
-    settings.acp_timeout_secs = 60;
+            ),
+        };
+    settings.acp_timeout_secs = 180;
     for arg in args.iter().skip(1).filter(|arg| !arg.starts_with("--")) {
         let (id, value) = arg.split_once('=').ok_or("expected id=value")?;
         settings
@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!(
             "{}",
-            serde_json::json!({"different_configurations_completed":true,"first_session":first.trace.session_id,"second_session":second.trace.session_id})
+            serde_json::json!({"parallel_requests_completed":true,"first_session":first.trace.session_id,"second_session":second.trace.session_id})
         );
         return Ok(());
     }

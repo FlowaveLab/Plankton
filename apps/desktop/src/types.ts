@@ -270,7 +270,7 @@ export type DecisionCommand = "approve_request" | "reject_request";
 
 export type AcpProfile = {
   session_options?: Record<string, string>;
-  agent_kind: "codex" | "claude_code" | "open_code" | "custom";
+  agent_kind: "codex" | "claude_code" | "open_code" | "pi" | "custom";
   version_mode: "latest" | "pinned" | "custom";
   version?: string | null;
   program?: string | null;

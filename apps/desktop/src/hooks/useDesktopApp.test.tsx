@@ -335,6 +335,108 @@ afterEach(() => {
 });
 
 describe("useDesktopApp runtime wiring", () => {
+  it("syncs notification preference events without reloading or replacing unsaved settings", async () => {
+    let controller!: ReturnType<typeof useDesktopApp>;
+    let notificationListener:
+      | ((event: { payload: boolean }) => void)
+      | undefined;
+    const notificationUnlisten = vi.fn();
+    function Harness() {
+      controller = useDesktopApp();
+      return null;
+    }
+    tauri.listen.mockImplementation(
+      async (event: string, handler: (event: { payload: boolean }) => void) => {
+        if (event === "plankton://approval-notifications-changed") {
+          notificationListener = handler;
+          return notificationUnlisten;
+        }
+        return tauri.unlisten;
+      },
+    );
+    tauri.invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_settings") return SETTINGS;
+      if (command === "dashboard") return DASHBOARD;
+      if (command === "consume_handoff_request") return null;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+    const view = render(<Harness />);
+    await flushReact();
+    act(() => {
+      controller.updateSettingsField(
+        "llm_advice_template",
+        "Keep this unsaved review template",
+      );
+      controller.updateSettingsField("openai_model", "unsaved-model");
+    });
+    const savedBefore = controller.state.settings;
+    const draftBefore = controller.state.settingsDraft;
+    act(() => notificationListener?.({ payload: false }));
+    expect(controller.state.settings).toEqual({
+      ...savedBefore,
+      approval_popup_enabled: false,
+    });
+    expect(controller.state.settingsDraft).toEqual({
+      ...draftBefore,
+      approval_popup_enabled: false,
+    });
+    expect(controller.hasUnsavedSettings).toBe(true);
+    expect(
+      tauri.invoke.mock.calls.filter(
+        ([command]) => command === "desktop_settings",
+      ),
+    ).toHaveLength(1);
+    act(() => notificationListener?.({ payload: true }));
+    expect(controller.state.settingsDraft).toEqual({
+      ...draftBefore,
+      approval_popup_enabled: true,
+    });
+    view.unmount();
+    expect(notificationUnlisten).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a notification toggle newer than an in-flight initial settings read", async () => {
+    let controller!: ReturnType<typeof useDesktopApp>;
+    let notificationListener:
+      | ((event: { payload: boolean }) => void)
+      | undefined;
+    let resolveSettings!: (settings: DesktopSettings) => void;
+    function Harness() {
+      controller = useDesktopApp();
+      return null;
+    }
+    tauri.listen.mockImplementation(
+      async (event: string, handler: (event: { payload: boolean }) => void) => {
+        if (event === "plankton://approval-notifications-changed")
+          notificationListener = handler;
+        return tauri.unlisten;
+      },
+    );
+    tauri.invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_settings")
+        return new Promise<DesktopSettings>((resolve) => {
+          resolveSettings = resolve;
+        });
+      if (command === "dashboard") return DASHBOARD;
+      if (command === "consume_handoff_request") return null;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+    const view = render(<Harness />);
+    await flushReact();
+    act(() => notificationListener?.({ payload: false }));
+    await act(async () => {
+      resolveSettings(SETTINGS);
+      await Promise.resolve();
+    });
+    await flushReact();
+    expect(controller.state.settings?.approval_popup_enabled).toBe(false);
+    expect(controller.state.settingsDraft?.approval_popup_enabled).toBe(false);
+    expect(controller.state.settingsDraft?.openai_model).toBe(
+      SETTINGS.openai_model,
+    );
+    view.unmount();
+  });
+
   it("refreshes faster while automatic approval is active", async () => {
     let dashboardCalls = 0;
     const activeDashboard: DashboardData = {
@@ -580,7 +682,7 @@ describe("useDesktopApp runtime wiring", () => {
     expect(commandCounts.get("dashboard")).toBe(1);
     expect(commandCounts.get("desktop_settings")).toBe(1);
     expect(commandCounts.get("consume_handoff_request")).toBe(1);
-    expect(commandCounts.get("listen")).toBe(1);
+    expect(commandCounts.get("listen")).toBe(2);
 
     expect(view.container.querySelectorAll(".request-row")).toHaveLength(0);
     expect(
@@ -603,7 +705,7 @@ describe("useDesktopApp runtime wiring", () => {
     );
     expect(commandCounts.get("desktop_settings")).toBe(1);
     expect(commandCounts.get("consume_handoff_request")).toBe(1);
-    expect(commandCounts.get("listen")).toBe(1);
+    expect(commandCounts.get("listen")).toBe(2);
 
     await act(async () => {
       vi.advanceTimersByTime(5_000);
@@ -614,7 +716,7 @@ describe("useDesktopApp runtime wiring", () => {
     expect(commandCounts.get("dashboard")).toBe(2);
     expect(commandCounts.get("desktop_settings")).toBe(1);
     expect(commandCounts.get("consume_handoff_request")).toBe(1);
-    expect(commandCounts.get("listen")).toBe(1);
+    expect(commandCounts.get("listen")).toBe(2);
 
     const maximumDepthErrors = consoleError.mock.calls
       .flat()
@@ -2372,10 +2474,12 @@ describe("useDesktopApp runtime wiring", () => {
       | ((event: { payload: { request_id: string } }) => void)
       | null = null;
 
-    tauri.listen.mockImplementation(async (_event: string, handler) => {
-      handoffListener = handler as (event: {
-        payload: { request_id: string };
-      }) => void;
+    tauri.listen.mockImplementation(async (event: string, handler) => {
+      if (event === "plankton://handoff-request") {
+        handoffListener = handler as (event: {
+          payload: { request_id: string };
+        }) => void;
+      }
       return tauri.unlisten;
     });
     tauri.invoke.mockImplementation(async (command: string) => {

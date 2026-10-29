@@ -122,7 +122,7 @@ const MESSAGES = {
     settingsEnvOverrideDetected:
       "These fields are currently overridden by runtime environment variables: {fields}",
     settingsInterfaceLocale: "Interface Locale",
-    settingsApprovalPopup: "Approval popups",
+    settingsApprovalPopup: "Automatic review and result notifications",
     settingsRequestTemplate: "Review Template",
     settingsLlmAdviceTemplate: "LLM Advice Template",
     settingsTemplateVariables:
@@ -419,7 +419,7 @@ const MESSAGES = {
     settingsSavedSuccess: "桌面设置已保存",
     settingsEnvOverrideDetected: "这些字段当前被运行时环境变量覆盖：{fields}",
     settingsInterfaceLocale: "界面语言",
-    settingsApprovalPopup: "审批提醒弹窗",
+    settingsApprovalPopup: "自动审批与结果提示",
     settingsRequestTemplate: "审批模板",
     settingsLlmAdviceTemplate: "LLM 建议模板",
     settingsTemplateVariables:

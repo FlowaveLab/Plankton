@@ -7,6 +7,7 @@ pub enum AgentKind {
     Codex,
     ClaudeCode,
     OpenCode,
+    Pi,
     Custom,
 }
 

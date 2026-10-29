@@ -100,7 +100,7 @@ Unchecked items are planned. Existing encrypted vault sync does not provide remo
 <details>
 <summary>Understand the data boundaries</summary>
 
-- Successful `plankton get` output is the raw secret. The Skill directs it to a consumer that does not echo or log it, keeping it out of model-visible terminal output.
+- `plankton run` inspects and executes a bound consumer command with a daemon-injected credential through stdin or an explicitly named environment variable. It returns consumer results; raw-value `get` is disabled in the breaking 0.2.4 migration; upgrade the app and CLI together. [Supported execution mode](./docs/usage.md#5-use-the-provider-neutral-cli).
 - Current review evidence retains unredacted arguments, supplied environment values, metadata, and source evidence. Keep credentials out of those fields.
 - Review LLMs can use tools to inspect files and run commands. Plankton assumes a trusted local machine and is not an execution sandbox; local-first does not mean every review is offline.
 

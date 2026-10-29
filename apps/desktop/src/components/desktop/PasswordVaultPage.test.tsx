@@ -238,9 +238,8 @@ function styleRule(
     .find(
       (rule) =>
         "selectorText" in rule &&
-        (rule as CSSStyleRule).selectorText
-          .split(",")
-          .map((entry) => entry.trim())
+        splitSelectorList((rule as CSSStyleRule).selectorText)
+          .map((entry) => entry.replace(/\s+/g, " "))
           .includes(selector),
     ) as CSSStyleRule | undefined;
 }
@@ -720,14 +719,14 @@ describe("PasswordVaultPage pagination and filtering", () => {
     if (!levelLabel) throw new Error("Missing exposure level label");
     const radioRule = styleRule(
       sheet,
-      '.desktop-workspace .exposure-axis-editor fieldset input[type="radio"]',
+      ':is(.desktop-workspace, .compact-approval) .exposure-axis-editor fieldset input[type="radio"]',
     );
     expect(radioRule?.style.width).toBe("14px");
     expect(radioRule?.style.minHeight).toBe("14px");
     expect(
       styleRule(
         sheet,
-        ".desktop-workspace .exposure-axis-editor fieldset label",
+        ":is(.desktop-workspace, .compact-approval) .exposure-axis-editor fieldset label",
       )?.style.display,
     ).toBe("flex");
     const allowlist = view.container.querySelector<HTMLTextAreaElement>(

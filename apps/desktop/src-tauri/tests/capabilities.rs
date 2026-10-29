@@ -60,3 +60,22 @@ fn password_change_window_can_only_hide_itself() {
         .collect::<BTreeSet<_>>();
     assert_eq!(permissions, BTreeSet::from(["core:window:allow-hide"]));
 }
+
+#[test]
+fn approval_notification_only_subscribes_to_events() {
+    let notification = capability("approval-notification.json");
+    assert_eq!(
+        notification["windows"],
+        serde_json::json!(["approval-notification"])
+    );
+    let permissions = notification["permissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|permission| permission.as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        permissions,
+        BTreeSet::from(["core:event:allow-listen", "core:event:allow-unlisten"])
+    );
+}

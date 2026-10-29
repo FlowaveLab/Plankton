@@ -130,6 +130,9 @@ async fn start_with_runtime_settings(
     let store = SqliteStore::new(&initial_settings)
         .await
         .map_err(DaemonStartError::Store)?;
+    crate::routes::execution::recover_abandoned_plans(&store, &initial_settings)
+        .await
+        .map_err(DaemonStartError::Store)?;
     let evaluations = EvaluationWorker::new(runtime_settings.clone(), store.clone());
     evaluations
         .recover_stale()
@@ -156,12 +159,15 @@ async fn start_with_runtime_settings(
     let confirmations = Arc::new(Mutex::new(ConfirmationLedger::new(
         std::time::Duration::from_secs(15 * 60),
     )));
+    let executions = crate::routes::execution::ExecutionRegistry::default();
+    plankton_core::value_resolver::resume_backend_commands();
     let app = server::router(
         state.clone(),
         confirmations.clone(),
         runtime_settings,
         store,
         evaluations.clone(),
+        executions.clone(),
     );
     let task = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -177,6 +183,7 @@ async fn start_with_runtime_settings(
         shutdown_tx: Some(shutdown_tx),
         task: Some(task),
         evaluations: Some(evaluations),
+        executions: Some(executions),
     })
 }
 
@@ -188,6 +195,7 @@ pub struct RunningDaemon {
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<std::io::Result<()>>>,
     evaluations: Option<EvaluationWorker>,
+    executions: Option<crate::routes::execution::ExecutionRegistry>,
 }
 
 impl RunningDaemon {
@@ -205,6 +213,14 @@ impl RunningDaemon {
                 .send(())
                 .map_err(|()| DaemonStartError::ShutdownChannel)
         });
+        // Stop credential consumers before waiting for slow HTTP connections to drain.
+        if let Some(executions) = self.executions.as_ref() {
+            executions.abort_now();
+        }
+        plankton_core::value_resolver::cancel_backend_commands();
+        if let Some(executions) = self.executions.take() {
+            executions.shutdown().await;
+        }
         let serve_result = if let Some(task) = self.task.take() {
             match task.await {
                 Ok(result) => result.map_err(DaemonStartError::Serve),
@@ -236,6 +252,10 @@ impl RunningDaemon {
 
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
+        if let Some(executions) = self.executions.take() {
+            executions.abort_now();
+        }
+        plankton_core::value_resolver::cancel_backend_commands();
         if let Some(evaluations) = self.evaluations.take() {
             evaluations.abort_now();
         }

@@ -38,8 +38,9 @@ const dashboard: DashboardData = {
 };
 
 describe("handoff selection", () => {
-  it("routes only the approval window to the compact surface", () => {
+  it("keeps manual approval and automatic notification surfaces separate", () => {
     expect(surfaceForWindowLabel("approval")).toBe("compact");
+    expect(surfaceForWindowLabel("approval-notification")).toBe("notification");
     expect(surfaceForWindowLabel("password-change")).toBe("password-change");
     expect(surfaceForWindowLabel("main")).toBe("main");
     expect(surfaceForWindowLabel("unexpected")).toBe("main");

@@ -24,6 +24,7 @@ pub(crate) struct ServerState {
     pub store: SqliteStore,
     pub evaluations: EvaluationWorker,
     pub password_changes: PasswordChangeCoordinator,
+    pub executions: crate::routes::execution::ExecutionRegistry,
 }
 
 pub(crate) fn router(
@@ -32,6 +33,7 @@ pub(crate) fn router(
     settings: RuntimeSettings,
     store: SqliteStore,
     evaluations: EvaluationWorker,
+    executions: crate::routes::execution::ExecutionRegistry,
 ) -> Router {
     let server_state = ServerState {
         daemon: state.clone(),
@@ -40,7 +42,9 @@ pub(crate) fn router(
         store,
         evaluations,
         password_changes: PasswordChangeCoordinator::default(),
+        executions,
     };
+    crate::routes::execution::start_cleanup(server_state.clone());
     Router::new()
         .route("/v1/health", post(routes::health))
         .route("/v1/passwords/drafts", post(routes::create_draft))
@@ -64,6 +68,11 @@ pub(crate) fn router(
         .route("/v1/resources/search", post(routes::search_resources))
         .route("/v1/resources/access", post(routes::access_resource))
         .route("/v1/resources/access/status", post(routes::access_status))
+        .route("/v1/resources/execute", post(routes::execute_resource))
+        .route(
+            "/v1/resources/execute/status",
+            post(routes::execution_status),
+        )
         .with_state(server_state)
         .layer(middleware::from_fn_with_state(state, authenticate))
 }

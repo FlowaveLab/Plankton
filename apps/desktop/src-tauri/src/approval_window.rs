@@ -1,9 +1,6 @@
 use std::{
     collections::{HashSet, VecDeque},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex,
-    },
+    sync::Mutex,
 };
 
 use anyhow::{Context, Result};
@@ -18,25 +15,20 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuild
 
 pub const APPROVAL_LABEL: &str = "approval";
 pub const APPROVAL_QUEUE_EVENT: &str = "plankton://approval-queue";
-const APPROVAL_DEFAULT_WIDTH: f64 = 380.0;
-const APPROVAL_DEFAULT_HEIGHT: f64 = 250.0;
-const APPROVAL_EDGE_INSET: f64 = 16.0;
+const APPROVAL_DEFAULT_WIDTH: f64 = 900.0;
+const APPROVAL_DEFAULT_HEIGHT: f64 = 860.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalSurface {
-    FullMain,
     Compact,
     None,
 }
 
-pub fn select_surface(popup_enabled: bool, human_review_required: bool) -> ApprovalSurface {
-    if !human_review_required {
-        ApprovalSurface::None
-    } else if popup_enabled {
+pub fn select_surface(human_review_required: bool) -> ApprovalSurface {
+    if human_review_required {
         ApprovalSurface::Compact
     } else {
-        // Keep the request in the main queue without interrupting its current page.
-        ApprovalSurface::FullMain
+        ApprovalSurface::None
     }
 }
 
@@ -75,7 +67,7 @@ impl ApprovalQueue {
     }
 
     pub fn current_compact_request_id(&self) -> Option<&str> {
-        self.compact.back().map(String::as_str)
+        self.compact.front().map(String::as_str)
     }
 
     pub fn resolve(&mut self, request_id: &str) -> QueueTransition {
@@ -103,12 +95,8 @@ impl ApprovalQueue {
     }
 
     fn dismiss_popup(&mut self) {
-        // Retain `presented`: polling must not reopen a dismissed notification.
+        // Retain `presented`: polling must not reopen a dismissed human approval.
         self.compact.clear();
-    }
-
-    fn seed_existing(&mut self, request_ids: impl IntoIterator<Item = String>) {
-        self.presented.extend(request_ids);
     }
 
     fn forget_failed_presentation(&mut self, request_id: &str) {
@@ -132,14 +120,12 @@ impl ApprovalQueue {
 #[derive(Debug)]
 pub struct ApprovalRuntime {
     queue: Mutex<ApprovalQueue>,
-    popup_enabled: AtomicBool,
 }
 
 impl Default for ApprovalRuntime {
     fn default() -> Self {
         Self {
             queue: Mutex::new(ApprovalQueue::default()),
-            popup_enabled: AtomicBool::new(true),
         }
     }
 }
@@ -214,10 +200,7 @@ pub fn present_request<R: Runtime>(
     let runtime = app
         .try_state::<ApprovalRuntime>()
         .context("approval presentation runtime is unavailable")?;
-    let surface = select_surface(
-        runtime.popup_enabled.load(Ordering::SeqCst),
-        human_review_required,
-    );
+    let surface = select_surface(human_review_required);
     if surface == ApprovalSurface::None {
         return Ok(PresentationResult::None);
     }
@@ -226,7 +209,6 @@ pub fn present_request<R: Runtime>(
     }
 
     match surface {
-        ApprovalSurface::FullMain => Ok(PresentationResult::None),
         ApprovalSurface::Compact => {
             if let Err(error) = show_compact_window(app) {
                 runtime.forget_failed_presentation(request_id)?;
@@ -276,8 +258,9 @@ pub fn open_full_details<R: Runtime>(app: &AppHandle<R>, request_id: &str) -> Re
     let runtime = app
         .try_state::<ApprovalRuntime>()
         .context("approval presentation runtime is unavailable")?;
-    let _ = runtime.open_full_details(request_id)?;
-    hide_compact_window(app)?;
+    if runtime.open_full_details(request_id)? != QueueTransition::Unchanged {
+        hide_compact_window(app)?;
+    }
     emit_queue_changed(app)?;
     Ok(())
 }
@@ -319,30 +302,6 @@ fn apply_resolution_transition<R: Runtime>(
     Ok(())
 }
 
-pub fn set_popup_enabled<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> Result<()> {
-    let runtime = app
-        .try_state::<ApprovalRuntime>()
-        .context("approval presentation runtime is unavailable")?;
-    runtime.popup_enabled.store(enabled, Ordering::SeqCst);
-    if !enabled {
-        dismiss_popup(app)?;
-    }
-    Ok(())
-}
-
-pub fn seed_existing_requests<R: Runtime>(
-    app: &AppHandle<R>,
-    request_ids: impl IntoIterator<Item = String>,
-) -> Result<()> {
-    app.try_state::<ApprovalRuntime>()
-        .context("approval presentation runtime is unavailable")?
-        .queue
-        .lock()
-        .map_err(|_| anyhow::anyhow!("failed to lock approval presentation state"))?
-        .seed_existing(request_ids);
-    Ok(())
-}
-
 pub fn dismiss_popup<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
     app.try_state::<ApprovalRuntime>()
         .context("approval presentation runtime is unavailable")?
@@ -354,69 +313,36 @@ pub fn dismiss_popup<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
     emit_queue_changed(app)
 }
 
-fn notification_position(
-    work_position: tauri::PhysicalPosition<i32>,
-    work_size: tauri::PhysicalSize<u32>,
-    scale: f64,
-) -> tauri::PhysicalPosition<i32> {
-    let width = (APPROVAL_DEFAULT_WIDTH * scale).round() as i32;
-    let inset = (APPROVAL_EDGE_INSET * scale).round() as i32;
-    tauri::PhysicalPosition::new(
-        work_position.x + (work_size.width as i32 - width - inset).max(0),
-        work_position.y + inset,
-    )
-}
-
 fn show_compact_window<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
-    let runtime = app
-        .try_state::<ApprovalRuntime>()
-        .context("approval presentation runtime is unavailable")?;
-    if !runtime.popup_enabled.load(Ordering::SeqCst) {
-        return Ok(());
-    }
     let window = match app.get_webview_window(APPROVAL_LABEL) {
         Some(window) => window,
         None => {
             WebviewWindowBuilder::new(app, APPROVAL_LABEL, WebviewUrl::App("index.html".into()))
                 .title("Plankton")
                 .inner_size(APPROVAL_DEFAULT_WIDTH, APPROVAL_DEFAULT_HEIGHT)
-                .resizable(false)
-                .maximizable(false)
-                .minimizable(false)
-                .decorations(false)
+                .min_inner_size(640.0, 520.0)
+                .resizable(true)
                 .always_on_top(true)
-                .skip_taskbar(true)
-                .focused(false)
                 .visible(false)
                 .build()
-                .context("failed to create approval notification")?
+                .context("failed to create human approval window")?
         }
     };
-    let monitor = match app.get_webview_window("main") {
-        Some(main) => main.current_monitor()?,
-        None => None,
-    }
-    .or(window.primary_monitor()?);
-    if let Some(monitor) = monitor {
-        let work = monitor.work_area();
-        window.set_position(notification_position(
-            work.position,
-            work.size,
-            monitor.scale_factor(),
-        ))?;
-    }
     if !window.is_visible()? {
-        // tao's macOS `show` uses makeKeyAndOrderFront, even for a builder with
-        // focused(false). Temporarily disallow key-window status while showing;
-        // restore focusability so an intentional click can use the controls.
-        window.set_focusable(false)?;
-        let shown = window.show();
-        let focusability_restored = window.set_focusable(true);
-        shown.context("failed to show approval notification")?;
-        focusability_restored.context("failed to restore notification interaction")?;
+        if let Some(monitor) = window.current_monitor()?.or(window.primary_monitor()?) {
+            let area = monitor.work_area();
+            let scale = monitor.scale_factor();
+            window.set_size(tauri::LogicalSize::new(
+                APPROVAL_DEFAULT_WIDTH.min(f64::from(area.size.width) / scale - 32.0),
+                APPROVAL_DEFAULT_HEIGHT.min(f64::from(area.size.height) / scale - 32.0),
+            ))?;
+        }
+        window.center()?;
+        window.show()?;
     }
-    // A notification should neither activate Plankton nor add a Dock icon.
+    window.unminimize()?;
     crate::background::synchronize_dock_visibility(app)?;
+    window.set_focus()?;
     Ok(())
 }
 
@@ -438,6 +364,7 @@ fn emit_queue_changed<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactApprovalRequest {
     pub locale: String,
+    pub policy_mode: plankton_core::PolicyMode,
     created_at: chrono::DateTime<chrono::Utc>,
     resource_metadata: std::collections::BTreeMap<String, String>,
     id: String,
@@ -451,6 +378,7 @@ pub struct CompactApprovalRequest {
     risk_score: Option<u8>,
     exposure_report: Option<CredentialExposureReport>,
     inline_sources: Vec<SanitizedInlineSource>,
+    execution_sources: Option<String>,
     exposure_policy: CredentialExposurePolicy,
     approval_status: ApprovalStatus,
     evaluation_state: EvaluationState,
@@ -507,6 +435,7 @@ impl From<&AccessRequest> for CompactApprovalRequest {
             });
         Self {
             locale: "en".into(),
+            policy_mode: request.policy_mode,
             created_at: request.created_at,
             resource_metadata: request.context.resource_metadata.clone(),
             id: request.id.clone(),
@@ -527,6 +456,7 @@ impl From<&AccessRequest> for CompactApprovalRequest {
                 .as_ref()
                 .map(|input| input.sanitized_context.inline_sources.clone())
                 .unwrap_or_default(),
+            execution_sources: request.context.metadata.get("execution_sources").cloned(),
             exposure_policy: exposure_policy_from_metadata(&request.context.resource_metadata),
             approval_status: request.approval_status,
             evaluation_state: request.evaluation_state,
@@ -549,25 +479,9 @@ mod tests {
     };
 
     use super::{
-        notification_position, select_surface, ApprovalQueue, ApprovalRuntime, ApprovalSurface,
-        CompactApprovalRequest, QueueTransition, APPROVAL_DEFAULT_HEIGHT, APPROVAL_DEFAULT_WIDTH,
+        select_surface, ApprovalQueue, ApprovalRuntime, ApprovalSurface, CompactApprovalRequest,
+        QueueTransition,
     };
-
-    #[test]
-    fn notification_is_small_and_uses_the_monitor_work_area() {
-        assert_eq!(
-            (APPROVAL_DEFAULT_WIDTH, APPROVAL_DEFAULT_HEIGHT),
-            (380.0, 250.0)
-        );
-        assert_eq!(
-            notification_position(
-                tauri::PhysicalPosition::new(-2880, 50),
-                tauri::PhysicalSize::new(2880, 1750),
-                2.0
-            ),
-            tauri::PhysicalPosition::new(-792, 82)
-        );
-    }
 
     #[test]
     fn compact_request_preserves_sanitized_inline_sources_for_evidence_references() {
@@ -623,24 +537,19 @@ mod tests {
     }
 
     #[test]
-    fn notification_setting_controls_only_the_notification_surface() {
-        assert_eq!(select_surface(true, true), ApprovalSurface::Compact);
-        assert_eq!(select_surface(false, true), ApprovalSurface::FullMain);
-        assert_eq!(select_surface(true, false), ApprovalSurface::None);
-        assert_eq!(select_surface(false, false), ApprovalSurface::None);
+    fn human_review_has_its_own_surface_independent_of_notifications() {
+        assert_eq!(select_surface(true), ApprovalSurface::Compact);
+        assert_eq!(select_surface(false), ApprovalSurface::None);
     }
 
     #[test]
-    fn dismiss_and_startup_seed_do_not_replay_pending_requests() {
+    fn dismissed_human_request_does_not_reopen_on_every_poll() {
         let mut queue = ApprovalQueue::default();
-        queue.seed_existing(["old".to_string()]);
-        assert!(!queue.register_presentation("old", ApprovalSurface::Compact));
         assert!(queue.register_presentation("new", ApprovalSurface::Compact));
         queue.dismiss_popup();
         assert!(queue.compact_request_ids().is_empty());
         assert!(!queue.register_presentation("new", ApprovalSurface::Compact));
         assert!(queue.register_presentation("next", ApprovalSurface::Compact));
-        assert_eq!(queue.compact_request_ids(), vec!["next"]);
     }
 
     #[test]
@@ -649,7 +558,7 @@ mod tests {
 
         assert!(queue.register_presentation("request-1", ApprovalSurface::Compact));
         assert!(!queue.register_presentation("request-1", ApprovalSurface::Compact));
-        assert!(!queue.register_presentation("request-1", ApprovalSurface::FullMain));
+        assert!(!queue.register_presentation("request-1", ApprovalSurface::Compact));
         assert_eq!(queue.compact_request_ids(), vec!["request-1"]);
     }
 
@@ -661,7 +570,7 @@ mod tests {
         assert!(queue.register_presentation("request-2", ApprovalSurface::Compact));
 
         assert_eq!(queue.compact_request_ids(), vec!["request-1", "request-2"]);
-        assert_eq!(queue.current_compact_request_id(), Some("request-2"));
+        assert_eq!(queue.current_compact_request_id(), Some("request-1"));
     }
 
     #[test]
@@ -671,22 +580,22 @@ mod tests {
         queue.register_presentation("request-2", ApprovalSurface::Compact);
 
         assert_eq!(
-            queue.resolve("request-2"),
-            QueueTransition::ShowCurrent("request-1".to_string())
+            queue.resolve("request-1"),
+            QueueTransition::ShowCurrent("request-2".to_string())
         );
-        assert_eq!(queue.current_compact_request_id(), Some("request-1"));
-        assert_eq!(queue.resolve("request-1"), QueueTransition::CloseCompact);
+        assert_eq!(queue.current_compact_request_id(), Some("request-2"));
+        assert_eq!(queue.resolve("request-2"), QueueTransition::CloseCompact);
         assert!(queue.compact_request_ids().is_empty());
     }
 
     #[test]
-    fn resolving_an_older_notification_updates_the_visible_queue_count() {
+    fn resolving_a_later_request_preserves_the_current_request() {
         let mut queue = ApprovalQueue::default();
         queue.register_presentation("old", ApprovalSurface::Compact);
         queue.register_presentation("latest", ApprovalSurface::Compact);
-        assert_eq!(queue.resolve("old"), QueueTransition::QueueUpdated);
-        assert_eq!(queue.current_compact_request_id(), Some("latest"));
-        assert_eq!(queue.compact_request_ids(), vec!["latest"]);
+        assert_eq!(queue.resolve("latest"), QueueTransition::QueueUpdated);
+        assert_eq!(queue.current_compact_request_id(), Some("old"));
+        assert_eq!(queue.compact_request_ids(), vec!["old"]);
     }
 
     #[test]
@@ -697,20 +606,21 @@ mod tests {
 
         assert_eq!(
             queue.open_full_details("request-1"),
-            QueueTransition::QueueUpdated
+            QueueTransition::ShowCurrent("request-2".to_string())
         );
         assert!(!queue.register_presentation("request-1", ApprovalSurface::Compact));
         assert_eq!(queue.compact_request_ids(), vec!["request-2"]);
     }
 
     #[test]
-    fn resolving_a_request_presented_in_main_does_not_change_the_compact_queue() {
+    fn opening_unrelated_details_does_not_close_human_approval() {
         let mut queue = ApprovalQueue::default();
-        queue.register_presentation("request-main", ApprovalSurface::FullMain);
-        queue.register_presentation("request-compact", ApprovalSurface::Compact);
-
-        assert_eq!(queue.resolve("request-main"), QueueTransition::Unchanged);
-        assert_eq!(queue.compact_request_ids(), vec!["request-compact"]);
+        queue.register_presentation("human", ApprovalSurface::Compact);
+        assert_eq!(
+            queue.open_full_details("automatic"),
+            QueueTransition::Unchanged
+        );
+        assert_eq!(queue.compact_request_ids(), vec!["human"]);
     }
 
     #[test]

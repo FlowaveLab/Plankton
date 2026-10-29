@@ -100,7 +100,7 @@ plankton skill install --agent codex --agent claude-code
 <details>
 <summary>使用前了解数据边界</summary>
 
-- `plankton get` 成功时输出原始密码；Skill 要求直接交给不会回显或记录的程序，避免进入模型可见的终端输出。
+- `plankton run` 识别并执行绑定的消费命令，由守护进程经 stdin 或指定环境变量注入凭据，返回消费结果；0.2.4 已禁用旧的原始值 `get`，属于破坏性变更，应用和 CLI 需一起升级。[支持的执行模式](./docs/usage.zh-CN.md)。
 - 当前审批证据保留未脱敏的参数、传入环境值、元数据和源码；不要把密码放进这些字段。
 - 审批 LLM 可用工具读文件、执行命令。Plankton 面向可信本机，不是执行沙箱；本地优先也不代表所有审批离线进行。
 

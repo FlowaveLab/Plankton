@@ -141,7 +141,7 @@ describe("flat visual contract", () => {
     expect(
       declarationsFor(
         exposurePath,
-        ".desktop-workspace .exposure-axis-editor fieldset",
+        ":is(.desktop-workspace, .compact-approval) .exposure-axis-editor fieldset",
       ),
     ).toMatchObject({ border: "0", padding: "0" });
   });

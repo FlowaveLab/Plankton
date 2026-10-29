@@ -50,6 +50,10 @@ import { buildAcpProgramSummary } from "../../acpSettings";
 import { codeAgentBoundaryIndex } from "../../callChainPresentation";
 import { getPreviewHighlightResult } from "../../codePreview";
 import {
+  executionEvidenceSources,
+  type EvidenceSource,
+} from "../../executionEvidence";
+import {
   auditResultFor,
   buildAuditApprovalGroups,
   type AuditDecisionPath,
@@ -976,9 +980,7 @@ export function PreciseEvidencePanel({
   zh,
 }: {
   annotations: DisplayEvidenceAnnotation[];
-  inlineSources: NonNullable<
-    AccessRequest["provider_input"]
-  >["sanitized_context"]["inline_sources"];
+  inlineSources: EvidenceSource[];
   node: StructuredCallChainNode;
   nodeIndex: number;
   zh: boolean;
@@ -1028,7 +1030,11 @@ export function PreciseEvidencePanel({
                 sourceId={group.sourceId ?? ""}
                 sourceText={
                   inlineSources
-                    .find((source) => source.source_id === group.sourceId)
+                    .find(
+                      (source) =>
+                        source.source_id === group.sourceId &&
+                        source.node_index === nodeIndex,
+                    )
                     ?.lines.map((line) => line.text)
                     .join("\n") ??
                   (group.sourceId === `file:${node.resolved_file_path}`
@@ -1123,9 +1129,7 @@ function StructuredCallChainEntry({
   zh: boolean;
   assessment?: CredentialExposureReport["node_assessments"][number];
   annotations: DisplayEvidenceAnnotation[];
-  inlineSources: NonNullable<
-    AccessRequest["provider_input"]
-  >["sanitized_context"]["inline_sources"];
+  inlineSources: EvidenceSource[];
 }): JSX.Element {
   const path = callChainPath(node);
   const previewText = node.preview_text ?? null;
@@ -1202,9 +1206,13 @@ function StructuredCallChainEntry({
                 ? zh
                   ? "系统进程探测"
                   : "OS process probe"
-                : zh
-                  ? "请求方提供 / 尽力识别"
-                  : "Requester / best-effort detection"}
+                : node.source === "controlled_execution"
+                  ? zh
+                    ? "Plankton 绑定的消费脚本"
+                    : "Plankton-bound consumer"
+                  : zh
+                    ? "请求方提供 / 尽力识别"
+                    : "Requester / best-effort detection"}
             </dd>
           </div>
           <div>
@@ -1319,9 +1327,7 @@ function RequestCallChain({
   report,
 }: {
   callChain: AccessRequest["context"]["call_chain"];
-  inlineSources?: NonNullable<
-    AccessRequest["provider_input"]
-  >["sanitized_context"]["inline_sources"];
+  inlineSources?: EvidenceSource[];
   zh: boolean;
   report?: CredentialExposureReport | null;
 }): JSX.Element {
@@ -3009,16 +3015,22 @@ function RequestsPage({
                       <h3>{zh ? "调用证据" : "Execution evidence"}</h3>
                       <p>
                         {zh
-                          ? "按实际进程顺序核对调用链、完整参数与识别到的脚本。"
-                          : "Review the actual process order, full arguments, and recognized scripts."}
+                          ? "核对已识别的消费步骤、完整参数与采集到的源码。"
+                          : "Review recognized consumer steps, full arguments and captured source."}
                       </p>
                     </div>
                     <span>{`${displayedCallChain.length} ${zh ? "层" : displayedCallChain.length === 1 ? "step" : "steps"}`}</span>
                   </div>
                   <p className="request-capture-summary">
-                    {zh
-                      ? "进程链来自系统采集；stdin 内容和管道的其他消费进程不一定包含在其中。"
-                      : "The process chain comes from system collection; stdin content and other pipe consumers may not be included."}
+                    {["daemon_command_v1", "daemon_python_file_v1"].includes(
+                      detail.request.context.metadata.execution_admission ?? "",
+                    )
+                      ? zh
+                        ? "Plankton 已采集命令、消费源码及 env/stdin 注入方式。批准后执行已绑定的计划；文件在执行前复核。此处不是已运行的祖先进程。"
+                        : "Plankton captured the command, consumer sources and env/stdin injection. Approval runs the bound plan; files are rechecked before launch. These are planned steps, not observed ancestors."
+                      : zh
+                        ? "历史进程链来自系统采集，可能不含 stdin 和管道消费内容。新请求必须使用受控执行入口。"
+                        : "Historical process evidence may omit stdin and pipe consumers. New requests require controlled execution."}
                     {detail.request.context.metadata.script_path_source ===
                     "declared_consumer"
                       ? (zh
@@ -3029,10 +3041,11 @@ function RequestsPage({
                   </p>
                   <RequestCallChain
                     callChain={displayedCallChain}
-                    inlineSources={
+                    inlineSources={executionEvidenceSources(
+                      detail.request.context.metadata.execution_sources,
                       detail.request.provider_input?.sanitized_context
-                        .inline_sources ?? []
-                    }
+                        .inline_sources,
+                    )}
                     report={detail.request.llm_suggestion?.exposure_report}
                     zh={zh}
                   />
@@ -5682,11 +5695,12 @@ function AuditPage({
                                       callChain={requestCallChainForDisplay(
                                         requestEvidence,
                                       )}
-                                      inlineSources={
+                                      inlineSources={executionEvidenceSources(
+                                        requestEvidence.context.metadata
+                                          .execution_sources,
                                         requestEvidence.provider_input
-                                          ?.sanitized_context.inline_sources ??
-                                        []
-                                      }
+                                          ?.sanitized_context.inline_sources,
+                                      )}
                                       report={
                                         exposureReport ??
                                         requestEvidence.llm_suggestion
@@ -6820,19 +6834,23 @@ function PolicySettings(props: {
       <SettingsSection
         description={
           locale === "zh-CN"
-            ? "有新的待审批请求时，在屏幕右上角提醒你。关闭提醒后仍可从请求列表处理。"
-            : "Show a small notification in the upper-right corner for new approvals. Requests remain available in the inbox when notifications are off."
+            ? "在右上角显示自动审批进度、资源、申请原因和最终结果。完成后的提示会在 5 秒后消失。"
+            : "Show automatic review progress, the resource, request reason, and final result in the upper-right corner. Results disappear after 5 seconds."
         }
         testId="settings-notifications-section"
-        title={locale === "zh-CN" ? "审批提醒" : "Approval notifications"}
+        title={
+          locale === "zh-CN"
+            ? "自动审批与结果提示"
+            : "Automatic review notifications"
+        }
       >
         <SettingsToggle
           checked={settings.approval_popup_enabled ?? true}
           controller={controller}
           description={
             locale === "zh-CN"
-              ? "不抢占当前窗口焦点；点击查看详情后进入审批。"
-              : "Keeps your current window focused. Open details when you are ready to review."
+              ? "不抢占当前窗口焦点。关闭此提示不影响人工审批的置顶弹窗。"
+              : "Keeps your current window focused. Turning this off does not affect the always-on-top human approval window."
           }
           field="approval_popup_enabled"
           label={t(locale, "settingsApprovalPopup")}
@@ -7098,6 +7116,7 @@ function AcpSettings(props: {
             { value: "codex", icon: Terminal, label: <>Codex</> },
             { value: "claude_code", icon: Sparkles, label: <>Claude Code</> },
             { value: "open_code", icon: Code2, label: <>OpenCode</> },
+            { value: "pi", icon: Terminal, label: <>Pi</> },
             {
               value: "custom",
               icon: Settings2,

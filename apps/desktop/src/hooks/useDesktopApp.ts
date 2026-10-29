@@ -44,6 +44,8 @@ import type {
 const AUTO_REFRESH_MS = 5_000;
 const ACTIVE_EVALUATION_REFRESH_MS = 500;
 const HANDOFF_EVENT = "plankton://handoff-request";
+const APPROVAL_NOTIFICATIONS_CHANGED_EVENT =
+  "plankton://approval-notifications-changed";
 
 const NUMERIC_SETTINGS_FIELDS = new Set<keyof DesktopSettings>([
   "openai_temperature",
@@ -561,6 +563,10 @@ export function useDesktopApp(): UseDesktopAppResult {
   const [state, setState] = useState<DesktopAppState>(INITIAL_STATE);
   const stateRef = useRef(state);
   const dashboardRefreshRef = useRef<Promise<void> | null>(null);
+  const notificationChangeRef = useRef<{ revision: number; enabled: boolean }>({
+    revision: 0,
+    enabled: true,
+  });
   const dashboardRefreshMs = hasRunningReviewDetails(state.dashboard)
     ? ACTIVE_EVALUATION_REFRESH_MS
     : AUTO_REFRESH_MS;
@@ -575,6 +581,7 @@ export function useDesktopApp(): UseDesktopAppResult {
   }, [state.locale]);
 
   const loadDesktopSettings = useEffectEvent(async () => {
+    const notificationRevision = notificationChangeRef.current.revision;
     if (!hasDesktopRuntime()) {
       setState((current) => ({
         ...current,
@@ -595,13 +602,24 @@ export function useDesktopApp(): UseDesktopAppResult {
         await invoke<DesktopSettings>("desktop_settings"),
       );
       startTransition(() => {
-        setState((current) => ({
-          ...current,
-          locale: isLocale(loaded.locale) ? loaded.locale : current.locale,
-          settings: loaded,
-          settingsDraft: current.settingsDraft ?? cloneSettings(loaded),
-          isSettingsLoading: false,
-        }));
+        setState((current) => {
+          const settings =
+            notificationChangeRef.current.revision !== notificationRevision
+              ? {
+                  ...loaded,
+                  approval_popup_enabled: notificationChangeRef.current.enabled,
+                }
+              : loaded;
+          return {
+            ...current,
+            locale: isLocale(settings.locale)
+              ? settings.locale
+              : current.locale,
+            settings,
+            settingsDraft: current.settingsDraft ?? cloneSettings(settings),
+            isSettingsLoading: false,
+          };
+        });
       });
       if (isLocale(loaded.locale)) {
         getBrowserStorage().setItem(LOCALE_STORAGE_KEY, loaded.locale);
@@ -816,6 +834,45 @@ export function useDesktopApp(): UseDesktopAppResult {
   useEffect(() => {
     void loadDesktopSettings();
     void loadDashboard();
+  }, []);
+
+  useEffect(() => {
+    if (!hasDesktopRuntime()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<boolean>(APPROVAL_NOTIFICATIONS_CHANGED_EVENT, (event) => {
+      if (disposed || typeof event.payload !== "boolean") return;
+      notificationChangeRef.current = {
+        revision: notificationChangeRef.current.revision + 1,
+        enabled: event.payload,
+      };
+      // This event contains one saved preference, not a settings snapshot.
+      // Keep every other draft field exactly as the user has edited it.
+      setState((current) => ({
+        ...current,
+        settings: current.settings
+          ? { ...current.settings, approval_popup_enabled: event.payload }
+          : null,
+        settingsDraft: current.settingsDraft
+          ? { ...current.settingsDraft, approval_popup_enabled: event.payload }
+          : null,
+      }));
+    })
+      .then((handle) => {
+        if (disposed) handle();
+        else unlisten = handle;
+      })
+      .catch((error) => {
+        if (!disposed)
+          setState((current) => ({
+            ...current,
+            settingsErrorMessage: getErrorMessage(error),
+          }));
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {

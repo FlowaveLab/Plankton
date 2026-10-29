@@ -33,10 +33,13 @@ pub const ACP_DEFAULT_ARGS: &str = "-y @agentclientprotocol/codex-acp@latest";
 pub const ACP_TRANSPORT_STDIO: &str = "stdio";
 const CODEX_ACP_PACKAGE: &str = "@agentclientprotocol/codex-acp";
 const LEGACY_CODEX_ACP_PACKAGE: &str = "@zed-industries/codex-acp";
-const ACP_READINESS_PROMPT: &str = "Reply with READY.";
+const ACP_READINESS_PROMPT: &str = "Reply with exactly READY (five uppercase letters), without punctuation, markdown, or any other text.";
 const ACP_STDERR_BUFFER_BYTES: usize = 8 * 1024;
 const ACP_STDERR_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const ACP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+const ACP_SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+const ACP_CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+const ACP_SUPERVISOR_STDERR_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 const ACP_ENRICHMENT_TIMEOUT: Duration = Duration::from_secs(120);
 const ACP_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 const ACP_DECISION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -240,6 +243,9 @@ impl AcpSessionConfig {
     pub fn from_settings(settings: &PlanktonSettings) -> Result<Self, ProviderError> {
         let command = resolve_acp_command(&settings.acp_profile)?;
         let cwd = prepare_acp_working_directory()?;
+        if settings.acp_profile.agent_kind == AgentKind::Pi {
+            prepare_pi_workspace(&cwd)?;
+        }
         let codex_home = if settings.acp_profile.agent_kind == AgentKind::Codex {
             Some(prepare_acp_codex_home()?)
         } else {
@@ -331,6 +337,28 @@ fn prepare_acp_working_directory() -> Result<PathBuf, ProviderError> {
     })
 }
 
+// pi-acp emits its startup banner as an assistant chunk. Disable that banner
+// only in Plankton's managed workspace so it cannot pollute strict review JSON.
+fn prepare_pi_workspace(cwd: &Path) -> Result<(), ProviderError> {
+    let directory = cwd.join(".pi");
+    fs::create_dir_all(&directory).map_err(|error| {
+        ProviderError::Transport(format!("failed to prepare Pi workspace: {error}"))
+    })?;
+    set_private_directory_permissions(&directory)?;
+    let temporary = tempfile::NamedTempFile::new_in(&directory).map_err(|error| {
+        ProviderError::Transport(format!("failed to prepare Pi review output: {error}"))
+    })?;
+    fs::write(temporary.path(), "{\"quietStartup\":true}\n").map_err(|error| {
+        ProviderError::Transport(format!("failed to configure Pi review output: {error}"))
+    })?;
+    temporary
+        .persist(directory.join("settings.json"))
+        .map(|_| ())
+        .map_err(|error| {
+            ProviderError::Transport(format!("failed to save Pi review output: {error}"))
+        })
+}
+
 #[cfg(unix)]
 fn set_private_directory_permissions(path: &Path) -> Result<(), ProviderError> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -396,10 +424,11 @@ fn legacy_preset_profile(args: &[String]) -> Option<AcpProfile> {
         });
     }
 
-    const PRESETS: [(AgentKind, &str); 3] = [
+    const PRESETS: [(AgentKind, &str); 4] = [
         (AgentKind::Codex, CODEX_ACP_PACKAGE),
         (AgentKind::ClaudeCode, "@zed-industries/claude-code-acp"),
         (AgentKind::OpenCode, "opencode-ai"),
+        (AgentKind::Pi, "pi-acp"),
     ];
 
     PRESETS.iter().find_map(|(agent_kind, package_name)| {
@@ -472,6 +501,7 @@ fn resolve_preset_command(profile: &AcpProfile) -> Result<ResolvedAcpCommand, Pr
         AgentKind::Codex => (CODEX_ACP_PACKAGE, Vec::new()),
         AgentKind::ClaudeCode => ("@zed-industries/claude-code-acp", Vec::new()),
         AgentKind::OpenCode => ("opencode-ai", vec!["acp".to_string()]),
+        AgentKind::Pi => ("pi-acp", Vec::new()),
         AgentKind::Custom => {
             return Err(ProviderError::Config(
                 "custom ACP agents must use custom version mode".to_string(),
@@ -1122,7 +1152,53 @@ enum AcpSupervisorCommand {
     },
     Prewarmed(Result<acp::NewSessionResponse, ProviderError>),
     IoClosed,
+    TurnFinished,
     Shutdown,
+}
+
+impl AcpSupervisorCommand {
+    fn pending_request_id(&self) -> Option<&str> {
+        match self {
+            Self::Prompt { request_id, .. }
+            | Self::StagedPrompt { request_id, .. }
+            | Self::ChatPrompt { request_id, .. } => Some(request_id),
+            _ => None,
+        }
+    }
+
+    fn receiver_closed(&self) -> bool {
+        match self {
+            Self::Prompt { response, .. } | Self::ChatPrompt { response, .. } => {
+                response.is_closed()
+            }
+            Self::StagedPrompt {
+                decision_response, ..
+            } => decision_response.is_closed(),
+            _ => false,
+        }
+    }
+
+    fn reject_pending(self, message: &str) {
+        let error = ProviderError::Transport(message.into());
+        match self {
+            Self::Prompt { response, .. } | Self::ChatPrompt { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::StagedPrompt {
+                decision_response,
+                enrichment_response,
+                ..
+            } => {
+                let _ = enrichment_response.send(AcpStagedCompletion::without_session());
+                let _ = decision_response.send(Err(error));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn single_session_adapter(config: &AcpSessionConfig, agent_name: Option<&str>) -> bool {
+    config.package_name.as_deref() == Some("pi-acp") || agent_name == Some("pi-acp")
 }
 
 enum PendingAcpReview {
@@ -1173,6 +1249,7 @@ struct AcpSupervisorHandle {
     key: AcpSupervisorKey,
     commands: mpsc::UnboundedSender<AcpSupervisorCommand>,
     thread: Option<thread::JoinHandle<()>>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl AcpSupervisorHandle {
@@ -1180,9 +1257,12 @@ impl AcpSupervisorHandle {
         let key = AcpSupervisorKey::from(&config);
         let (commands, receiver) = mpsc::unbounded_channel();
         let thread_commands = commands.clone();
+        let (shutdown, shutdown_rx) = watch::channel(false);
         let worker = thread::Builder::new()
             .name("plankton-acp-supervisor".to_string())
-            .spawn(move || run_acp_supervisor_thread(config, receiver, thread_commands))
+            .spawn(move || {
+                run_acp_supervisor_thread(config, receiver, thread_commands, shutdown_rx)
+            })
             .map_err(|error| {
                 ProviderError::Transport(format!("failed to start ACP supervisor: {error}"))
             })?;
@@ -1190,6 +1270,7 @@ impl AcpSupervisorHandle {
             key,
             commands,
             thread: Some(worker),
+            shutdown,
         })
     }
 
@@ -1197,8 +1278,13 @@ impl AcpSupervisorHandle {
         self.commands.is_closed()
     }
 
-    fn shutdown(mut self) {
+    fn request_shutdown(&self) {
+        self.shutdown.send_replace(true);
         let _ = self.commands.send(AcpSupervisorCommand::Shutdown);
+    }
+
+    fn shutdown(mut self) {
+        self.request_shutdown();
         if let Some(worker) = self.thread.take() {
             let _ = worker.join();
         }
@@ -1378,8 +1464,21 @@ pub fn shutdown_acp_supervisor() {
         Ok(mut guard) => std::mem::take(&mut *guard),
         Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
     };
-    for current in current {
-        current.shutdown();
+    // Broadcast first so multiple configured adapters clean up concurrently;
+    // joining them sequentially must not multiply their shutdown deadlines.
+    for handle in &current {
+        handle.request_shutdown();
+    }
+    for handle in current {
+        handle.shutdown();
+    }
+}
+
+async fn wait_for_acp_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow_and_update() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
     }
 }
 
@@ -1387,6 +1486,7 @@ fn run_acp_supervisor_thread(
     config: AcpSessionConfig,
     receiver: mpsc::UnboundedReceiver<AcpSupervisorCommand>,
     commands: mpsc::UnboundedSender<AcpSupervisorCommand>,
+    shutdown: watch::Receiver<bool>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1396,22 +1496,31 @@ fn run_acp_supervisor_thread(
         Err(_) => return,
     };
     let local_set = tokio::task::LocalSet::new();
-    local_set.block_on(&runtime, run_acp_supervisor(config, receiver, commands));
+    local_set.block_on(
+        &runtime,
+        run_acp_supervisor(config, receiver, commands, shutdown),
+    );
 }
 
 async fn run_acp_supervisor(
     config: AcpSessionConfig,
-    mut receiver: mpsc::UnboundedReceiver<AcpSupervisorCommand>,
+    receiver: mpsc::UnboundedReceiver<AcpSupervisorCommand>,
     commands: mpsc::UnboundedSender<AcpSupervisorCommand>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
+    if *shutdown.borrow() {
+        return;
+    }
     let mut child = match acp_command(&config).spawn() {
         Ok(child) => child,
         Err(error) => {
-            reject_acp_supervisor_commands(
-                receiver,
-                format!("failed to spawn ACP agent process: {error}"),
-            )
-            .await;
+            tokio::select! {
+                _ = wait_for_acp_shutdown(&mut shutdown) => {}
+                _ = reject_acp_supervisor_commands(
+                    receiver,
+                    format!("failed to spawn ACP agent process: {error}"),
+                ) => {}
+            }
             return;
         }
     };
@@ -1444,7 +1553,7 @@ async fn run_acp_supervisor(
         let _ = io_commands.send(AcpSupervisorCommand::IoClosed);
     });
 
-    let initialize_response = match timeout(
+    let initialization = timeout(
         config.timeout,
         conn.initialize(
             acp::InitializeRequest::new(acp::ProtocolVersion::V1)
@@ -1458,15 +1567,15 @@ async fn run_acp_supervisor(
                         .write_text_file(true)),
                 ),
         ),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        _ => {
-            let _ = terminate_acp_child(&mut child).await;
-            let _ = finish_acp_stderr_task(stderr_task, ACP_STDERR_CLOSE_TIMEOUT).await;
-            return;
-        }
+    );
+    let initialize_response = tokio::select! {
+        biased;
+        _ = wait_for_acp_shutdown(&mut shutdown) => None,
+        result = initialization => result.ok().and_then(Result::ok),
+    };
+    let Some(initialize_response) = initialize_response else {
+        finish_acp_supervisor_child(&mut child, stderr_task).await;
+        return;
     };
     let initialize_json = serde_json::to_value(&initialize_response).unwrap_or_default();
     let agent_name = read_json_string(&initialize_json, &["/agentInfo/name", "/agent_info/name"]);
@@ -1496,26 +1605,104 @@ async fn run_acp_supervisor(
         decision_attempt_errors: Vec::new(),
     };
 
+    let supervision = supervise_acp_connection(
+        &config,
+        conn,
+        handler,
+        provider_model,
+        trace_template,
+        receiver,
+        commands.clone(),
+    );
+    tokio::pin!(supervision);
+    tokio::select! {
+        biased;
+        _ = wait_for_acp_shutdown(&mut shutdown) => {
+            let _ = commands.send(AcpSupervisorCommand::Shutdown);
+            // Even an in-flight protocol RPC cannot hold the process owner
+            // beyond this grace period. The process group is killed below.
+            let _ = timeout(ACP_SUPERVISOR_SHUTDOWN_GRACE, &mut supervision).await;
+        }
+        _ = &mut supervision => {}
+    }
+    finish_acp_supervisor_child(&mut child, stderr_task).await;
+}
+
+async fn finish_acp_supervisor_child(
+    child: &mut tokio::process::Child,
+    stderr_task: tokio::task::JoinHandle<Result<String, std::io::Error>>,
+) {
+    if let Err(error) = terminate_acp_child(child).await {
+        tracing::warn!(%error, "ACP supervisor process cleanup failed");
+    }
+    let _ = finish_acp_stderr_task(stderr_task, ACP_SUPERVISOR_STDERR_CLOSE_TIMEOUT).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_acp_connection(
+    config: &AcpSessionConfig,
+    conn: Rc<acp::ClientSideConnection>,
+    handler: AcpMultiplexHandler,
+    provider_model: Option<String>,
+    trace_template: ProviderTrace,
+    mut receiver: mpsc::UnboundedReceiver<AcpSupervisorCommand>,
+    commands: mpsc::UnboundedSender<AcpSupervisorCommand>,
+) {
+    let single_session = single_session_adapter(config, trace_template.agent_name.as_deref());
     let active_sessions = Rc::new(RefCell::new(HashMap::<String, acp::SessionId>::new()));
     let cancellations = Rc::new(RefCell::new(HashMap::<String, watch::Sender<bool>>::new()));
     let mut idle_session = None;
-    let mut prewarming = true;
+    let mut prewarming = !single_session;
+    let mut serial_pending = VecDeque::<AcpSupervisorCommand>::new();
     let mut pending_reviews = VecDeque::<PendingAcpReview>::new();
-    schedule_acp_prewarm(&config, Rc::clone(&conn), commands.clone());
+    if !single_session {
+        schedule_acp_prewarm(config, Rc::clone(&conn), commands.clone());
+    }
 
     loop {
-        let command = match timeout(Duration::from_secs(120), receiver.recv()).await {
-            Ok(Some(command)) => command,
-            Ok(None) => break,
-            Err(_)
-                if cancellations.borrow().is_empty()
-                    && pending_reviews.is_empty()
-                    && !prewarming =>
-            {
-                break
+        // Handle already-arrived cancellation/shutdown before starting the next
+        // queued turn. New arrivals are appended below, preserving FIFO order.
+        let ready = receiver
+            .try_recv()
+            .ok()
+            .map(|command| (command, false))
+            .or_else(|| {
+                if single_session && cancellations.borrow().is_empty() {
+                    serial_pending.pop_front().map(|command| (command, true))
+                } else {
+                    None
+                }
+            });
+        let (command, from_serial_queue) = if let Some(ready) = ready {
+            ready
+        } else {
+            match timeout(Duration::from_secs(120), receiver.recv()).await {
+                Ok(Some(command)) => (command, false),
+                Ok(None) => break,
+                Err(_)
+                    if cancellations.borrow().is_empty()
+                        && pending_reviews.is_empty()
+                        && !prewarming =>
+                {
+                    break
+                }
+                Err(_) => continue,
             }
-            Err(_) => continue,
         };
+        // pi-acp closes every previous session during session/new. Queue all
+        // turns and never prewarm it while an approval or chat is using it.
+        if command.receiver_closed() {
+            command.reject_pending("ACP turn was cancelled before it started");
+            continue;
+        }
+        if single_session
+            && !from_serial_queue
+            && command.pending_request_id().is_some()
+            && (!cancellations.borrow().is_empty() || !serial_pending.is_empty())
+        {
+            serial_pending.push_back(command);
+            continue;
+        }
         match command {
             AcpSupervisorCommand::Prompt {
                 request_id,
@@ -1531,26 +1718,28 @@ async fn run_acp_supervisor(
                     review_workspace_enabled,
                     response,
                 };
-                if let Some(prepared) = idle_session.take() {
+                let prepared = idle_session.take();
+                if single_session || prepared.is_some() {
                     spawn_pending_acp_review(
-                        &config,
+                        config,
                         &conn,
                         &handler,
                         provider_model.clone(),
                         trace_template.clone(),
                         &active_sessions,
                         &cancellations,
+                        commands.clone(),
                         prepared,
                         review,
                     );
-                    if !prewarming {
-                        schedule_acp_prewarm(&config, Rc::clone(&conn), commands.clone());
+                    if !prewarming && !single_session {
+                        schedule_acp_prewarm(config, Rc::clone(&conn), commands.clone());
                         prewarming = true;
                     }
                 } else {
                     pending_reviews.push_back(review);
-                    if !prewarming {
-                        schedule_acp_prewarm(&config, Rc::clone(&conn), commands.clone());
+                    if !prewarming && !single_session {
+                        schedule_acp_prewarm(config, Rc::clone(&conn), commands.clone());
                         prewarming = true;
                     }
                 }
@@ -1573,26 +1762,28 @@ async fn run_acp_supervisor(
                     enrichment_chunks,
                     enrichment_response,
                 };
-                if let Some(prepared) = idle_session.take() {
+                let prepared = idle_session.take();
+                if single_session || prepared.is_some() {
                     spawn_pending_acp_review(
-                        &config,
+                        config,
                         &conn,
                         &handler,
                         provider_model.clone(),
                         trace_template.clone(),
                         &active_sessions,
                         &cancellations,
+                        commands.clone(),
                         prepared,
                         review,
                     );
-                    if !prewarming {
-                        schedule_acp_prewarm(&config, Rc::clone(&conn), commands.clone());
+                    if !prewarming && !single_session {
+                        schedule_acp_prewarm(config, Rc::clone(&conn), commands.clone());
                         prewarming = true;
                     }
                 } else {
                     pending_reviews.push_back(review);
-                    if !prewarming {
-                        schedule_acp_prewarm(&config, Rc::clone(&conn), commands.clone());
+                    if !prewarming && !single_session {
+                        schedule_acp_prewarm(config, Rc::clone(&conn), commands.clone());
                         prewarming = true;
                     }
                 }
@@ -1607,13 +1798,14 @@ async fn run_acp_supervisor(
                 response,
             } => {
                 spawn_acp_chat_turn(
-                    &config,
+                    config,
                     &conn,
                     &handler,
                     provider_model.clone(),
                     trace_template.clone(),
                     &active_sessions,
                     &cancellations,
+                    commands.clone(),
                     request_id,
                     kind,
                     session_id,
@@ -1624,6 +1816,17 @@ async fn run_acp_supervisor(
                 );
             }
             AcpSupervisorCommand::Cancel { request_id } => {
+                if let Some(index) = serial_pending
+                    .iter()
+                    .position(|command| command.pending_request_id() == Some(&request_id))
+                {
+                    if let Some(command) = serial_pending.remove(index) {
+                        command.reject_pending(
+                            "ACP turn was cancelled while waiting for the previous Pi session",
+                        );
+                    }
+                    continue;
+                }
                 if let Some(index) = pending_reviews
                     .iter()
                     .position(|review| review.request_id() == request_id)
@@ -1653,23 +1856,24 @@ async fn run_acp_supervisor(
                 match (pending_reviews.pop_front(), result) {
                     (Some(review), Ok(prepared)) => {
                         spawn_pending_acp_review(
-                            &config,
+                            config,
                             &conn,
                             &handler,
                             provider_model.clone(),
                             trace_template.clone(),
                             &active_sessions,
                             &cancellations,
-                            prepared,
+                            commands.clone(),
+                            Some(prepared),
                             review,
                         );
-                        schedule_acp_prewarm(&config, Rc::clone(&conn), commands.clone());
+                        schedule_acp_prewarm(config, Rc::clone(&conn), commands.clone());
                         prewarming = true;
                     }
                     (Some(review), Err(error)) => {
                         review.reject(error);
                         if !pending_reviews.is_empty() {
-                            schedule_acp_prewarm(&config, Rc::clone(&conn), commands.clone());
+                            schedule_acp_prewarm(config, Rc::clone(&conn), commands.clone());
                             prewarming = true;
                         }
                     }
@@ -1682,32 +1886,43 @@ async fn run_acp_supervisor(
                     (None, Err(_)) => {}
                 }
             }
+            AcpSupervisorCommand::TurnFinished => {}
             AcpSupervisorCommand::IoClosed | AcpSupervisorCommand::Shutdown => break,
         }
     }
 
+    for command in serial_pending {
+        command.reject_pending("ACP supervisor stopped while the turn was queued");
+    }
     for review in pending_reviews {
         review.reject(ProviderError::Transport(
             "ACP supervisor stopped while the review was waiting for a clean session".to_string(),
         ));
     }
 
+    for cancellation in cancellations.borrow().values() {
+        let _ = cancellation.send(true);
+    }
+    while let Ok(command) = receiver.try_recv() {
+        command.reject_pending("ACP supervisor stopped before the turn started");
+    }
     let sessions = active_sessions
         .borrow()
         .values()
         .cloned()
         .collect::<Vec<_>>();
-    for session_id in sessions {
-        let _ = conn
-            .cancel(acp::CancelNotification::new(session_id.clone()))
-            .await;
-        close_acp_session(&conn, &handler, &session_id).await;
-    }
-    if let Some(session) = idle_session {
-        close_acp_session(&conn, &handler, &session.session_id).await;
-    }
-    let _ = terminate_acp_child(&mut child).await;
-    let _ = finish_acp_stderr_task(stderr_task, ACP_STDERR_CLOSE_TIMEOUT).await;
+    // Bound the whole cleanup batch, not each session independently. The
+    // process owner terminates the complete adapter process group afterward.
+    let _ = timeout(ACP_SUPERVISOR_SHUTDOWN_GRACE, async {
+        for session_id in sessions {
+            let _ = cancel_acp_prompt(config, &conn, session_id.clone()).await;
+            close_acp_session(&conn, &handler, &session_id).await;
+        }
+        if let Some(session) = idle_session {
+            close_acp_session(&conn, &handler, &session.session_id).await;
+        }
+    })
+    .await;
 }
 
 async fn reject_acp_supervisor_commands(
@@ -1733,7 +1948,8 @@ async fn reject_acp_supervisor_commands(
             AcpSupervisorCommand::Shutdown => break,
             AcpSupervisorCommand::Cancel { .. }
             | AcpSupervisorCommand::Prewarmed(_)
-            | AcpSupervisorCommand::IoClosed => {}
+            | AcpSupervisorCommand::IoClosed
+            | AcpSupervisorCommand::TurnFinished => {}
         }
     }
 }
@@ -1750,6 +1966,11 @@ fn schedule_acp_prewarm(
     });
 }
 
+fn session_acquisition_timed_out(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::Transport(message)
+        if message == "ACP session/new timed out" || message == "ACP session/load timed out")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_pending_acp_review(
     config: &AcpSessionConfig,
@@ -1759,9 +1980,11 @@ fn spawn_pending_acp_review(
     trace: ProviderTrace,
     active_sessions: &Rc<RefCell<HashMap<String, acp::SessionId>>>,
     cancellations: &Rc<RefCell<HashMap<String, watch::Sender<bool>>>>,
-    prepared: acp::NewSessionResponse,
+    commands: mpsc::UnboundedSender<AcpSupervisorCommand>,
+    prepared: Option<acp::NewSessionResponse>,
     review: PendingAcpReview,
 ) {
+    let single_session = single_session_adapter(config, trace.agent_name.as_deref());
     let task_config = config.clone();
     let task_conn = Rc::clone(conn);
     let task_handler = handler.clone();
@@ -1786,7 +2009,7 @@ fn spawn_pending_acp_review(
                     &task_config,
                     &task_conn,
                     &task_handler,
-                    Some(prepared),
+                    prepared,
                     &request_id,
                     prompt,
                     allowed_read_files,
@@ -1799,6 +2022,17 @@ fn spawn_pending_acp_review(
                 .await;
                 task_active.borrow_mut().remove(&request_id);
                 task_cancellations.borrow_mut().remove(&request_id);
+                if single_session
+                    && result
+                        .as_ref()
+                        .err()
+                        .is_some_and(session_acquisition_timed_out)
+                {
+                    // A late Pi session/new could destroy any subsequent turn.
+                    // Retire the subprocess instead of reusing uncertain state.
+                    let _ = commands.send(AcpSupervisorCommand::Shutdown);
+                }
+                let _ = commands.send(AcpSupervisorCommand::TurnFinished);
                 let _ = response.send(result);
             });
         }
@@ -1812,11 +2046,11 @@ fn spawn_pending_acp_review(
             ..
         } => {
             tokio::task::spawn_local(async move {
-                run_supervised_acp_staged_prompt(
+                let retire_connection = run_supervised_acp_staged_prompt(
                     &task_config,
                     &task_conn,
                     &task_handler,
-                    Some(prepared),
+                    prepared,
                     &request_id,
                     decision_prompt,
                     enrichment_prompt,
@@ -1832,6 +2066,10 @@ fn spawn_pending_acp_review(
                 .await;
                 task_active.borrow_mut().remove(&request_id);
                 task_cancellations.borrow_mut().remove(&request_id);
+                if retire_connection {
+                    let _ = commands.send(AcpSupervisorCommand::Shutdown);
+                }
+                let _ = commands.send(AcpSupervisorCommand::TurnFinished);
             });
         }
     }
@@ -1846,6 +2084,7 @@ fn spawn_acp_chat_turn(
     trace: ProviderTrace,
     active_sessions: &Rc<RefCell<HashMap<String, acp::SessionId>>>,
     cancellations: &Rc<RefCell<HashMap<String, watch::Sender<bool>>>>,
+    commands: mpsc::UnboundedSender<AcpSupervisorCommand>,
     request_id: String,
     kind: AcpContinuationKind,
     session_id: Option<String>,
@@ -1854,6 +2093,7 @@ fn spawn_acp_chat_turn(
     events: mpsc::UnboundedSender<AcpChatEvent>,
     response: oneshot::Sender<Result<AcpPromptResult, ProviderError>>,
 ) {
+    let single_session = single_session_adapter(config, trace.agent_name.as_deref());
     let task_config = config.clone();
     let task_conn = Rc::clone(conn);
     let task_handler = handler.clone();
@@ -1883,6 +2123,15 @@ fn spawn_acp_chat_turn(
         .await;
         task_active.borrow_mut().remove(&cleanup_request_id);
         task_cancellations.borrow_mut().remove(&cleanup_request_id);
+        if single_session
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(session_acquisition_timed_out)
+        {
+            let _ = commands.send(AcpSupervisorCommand::Shutdown);
+        }
+        let _ = commands.send(AcpSupervisorCommand::TurnFinished);
         let _ = response.send(result);
     });
 }
@@ -1900,6 +2149,36 @@ async fn create_acp_session(
     .map_err(|error| ProviderError::Transport(format!("ACP session/new failed: {error}")))?;
     configure_review_session(config, conn, &session).await?;
     Ok(session)
+}
+
+async fn acquire_review_session(
+    config: &AcpSessionConfig,
+    conn: &acp::ClientSideConnection,
+    multiplex: &AcpMultiplexHandler,
+    prepared: Option<acp::NewSessionResponse>,
+    cancellation: &mut watch::Receiver<bool>,
+    single_session: bool,
+) -> Result<acp::NewSessionResponse, ProviderError> {
+    if let Some(session) = prepared {
+        return Ok(session);
+    }
+    if single_session {
+        // Pi completes session/new by closing every other session. Dropping
+        // this RPC on cancellation would let it destroy the next queued turn.
+        // Keep the serial slot until its existing bounded call has settled.
+        let session = create_acp_session(config, conn).await?;
+        if *cancellation.borrow() {
+            close_acp_session(conn, multiplex, &session.session_id).await;
+            return Err(ProviderError::Transport(
+                "ACP review was cancelled during session acquisition".into(),
+            ));
+        }
+        return Ok(session);
+    }
+    tokio::select! {
+        _ = cancellation.changed() => Err(ProviderError::Transport("ACP review was cancelled during session acquisition".into())),
+        session = create_acp_session(config, conn) => session,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1925,17 +2204,15 @@ async fn run_supervised_acp_prompt(
             "ACP review was cancelled before session acquisition".to_string(),
         ));
     }
-    let session = match prepared {
-        Some(session) => session,
-        None => tokio::select! {
-            _ = cancellation.changed() => {
-                return Err(ProviderError::Transport(
-                    "ACP review was cancelled during session acquisition".to_string(),
-                ));
-            }
-            session = create_acp_session(config, conn) => session?,
-        },
-    };
+    let session = acquire_review_session(
+        config,
+        conn,
+        multiplex,
+        prepared,
+        &mut cancellation,
+        single_session_adapter(config, trace.agent_name.as_deref()),
+    )
+    .await?;
     let session_id = session.session_id.clone();
     active_sessions
         .borrow_mut()
@@ -2002,22 +2279,24 @@ async fn run_supervised_acp_staged_prompt(
     decision_response: oneshot::Sender<Result<AcpPromptResult, ProviderError>>,
     enrichment_chunks: mpsc::UnboundedSender<String>,
     enrichment_response: oneshot::Sender<AcpStagedCompletion>,
-) {
-    let session = match prepared {
-        Some(session) => Ok(session),
-        None => tokio::select! {
-            _ = cancellation.changed() => Err(ProviderError::Transport(
-                "ACP review was cancelled during session acquisition".to_string(),
-            )),
-            session = create_acp_session(config, conn) => session,
-        },
-    };
+) -> bool {
+    let session = acquire_review_session(
+        config,
+        conn,
+        multiplex,
+        prepared,
+        &mut cancellation,
+        single_session_adapter(config, trace.agent_name.as_deref()),
+    )
+    .await;
     let session = match session {
         Ok(session) => session,
         Err(error) => {
+            let retire_connection = single_session_adapter(config, trace.agent_name.as_deref())
+                && session_acquisition_timed_out(&error);
             let _ = enrichment_response.send(AcpStagedCompletion::without_session());
             let _ = decision_response.send(Err(error));
-            return;
+            return retire_connection;
         }
     };
     let session_id = session.session_id.clone();
@@ -2035,7 +2314,7 @@ async fn run_supervised_acp_staged_prompt(
         )
         .await;
         let _ = decision_response.send(Err(error));
-        return;
+        return false;
     }
     if *cancellation.borrow() {
         let _ = decision_response.send(Err(ProviderError::Transport(
@@ -2049,7 +2328,7 @@ async fn run_supervised_acp_staged_prompt(
             AcpStagedCompletion::without_session().result,
         )
         .await;
-        return;
+        return false;
     }
 
     let decision_result = run_acp_decision_with_repair(
@@ -2074,7 +2353,7 @@ async fn run_supervised_acp_staged_prompt(
         )
         .await;
         let _ = decision_response.send(decision_result);
-        return;
+        return false;
     }
     if decision_response.send(decision_result).is_err() {
         let _ = cancel_acp_prompt(config, conn, session_id.clone()).await;
@@ -2086,7 +2365,7 @@ async fn run_supervised_acp_staged_prompt(
             AcpStagedCompletion::without_session().result,
         )
         .await;
-        return;
+        return false;
     }
 
     if let Err(error) = handler.reset_for_next_turn(Some(enrichment_chunks), None) {
@@ -2098,7 +2377,7 @@ async fn run_supervised_acp_staged_prompt(
             Err(error),
         )
         .await;
-        return;
+        return false;
     }
     let mut enrichment_config = config.clone();
     enrichment_config.timeout = ACP_ENRICHMENT_TIMEOUT;
@@ -2130,6 +2409,7 @@ async fn run_supervised_acp_staged_prompt(
         enrichment_result,
     )
     .await;
+    false
 }
 
 fn decision_evidence_path(config: &AcpSessionConfig, request_id: &str) -> PathBuf {
@@ -2329,20 +2609,27 @@ async fn run_supervised_acp_chat_turn(
     let session_id = if let Some(previous_session_id) = previous_session_id {
         let session_id = acp::SessionId::new(previous_session_id);
         multiplex.register(session_id.to_string(), handler.clone())?;
-        let loaded = tokio::select! {
-            _ = cancellation.changed() => {
-                close_acp_session(conn, multiplex, &session_id).await;
-                return Err(ProviderError::Transport(
-                    "ACP chat was cancelled while loading its session".to_string(),
-                ));
+        let loading = timeout(
+            config.timeout,
+            conn.load_session(acp::LoadSessionRequest::new(
+                session_id.clone(),
+                config.cwd.clone(),
+            )),
+        );
+        let loaded = if single_session_adapter(config, trace.agent_name.as_deref()) {
+            // session/load also ends with closeAllExcept in Pi. Cancellation
+            // must not let that late completion race the next queued review.
+            loading.await
+        } else {
+            tokio::select! {
+                _ = cancellation.changed() => {
+                    close_acp_session(conn, multiplex, &session_id).await;
+                    return Err(ProviderError::Transport(
+                        "ACP chat was cancelled while loading its session".to_string(),
+                    ));
+                }
+                result = loading => result,
             }
-            result = timeout(
-                config.timeout,
-                conn.load_session(acp::LoadSessionRequest::new(
-                    session_id.clone(),
-                    config.cwd.clone(),
-                )),
-            ) => result,
         };
         let loaded = match loaded {
             Ok(Ok(loaded)) => loaded,
@@ -2359,6 +2646,12 @@ async fn run_supervised_acp_chat_turn(
                 ));
             }
         };
+        if *cancellation.borrow() {
+            close_acp_session(conn, multiplex, &session_id).await;
+            return Err(ProviderError::Transport(
+                "ACP chat was cancelled while loading its session".into(),
+            ));
+        }
         if let Err(error) =
             configure_continuation_session(config, conn, &session_id, &loaded, kind).await
         {
@@ -2383,7 +2676,15 @@ async fn run_supervised_acp_chat_turn(
         }
         session_id
     } else {
-        let created = create_acp_session(config, conn).await?;
+        let created = acquire_review_session(
+            config,
+            conn,
+            multiplex,
+            None,
+            &mut cancellation,
+            single_session_adapter(config, trace.agent_name.as_deref()),
+        )
+        .await?;
         let session_id = created.session_id.clone();
         if let Err(error) = multiplex.register(session_id.to_string(), handler.clone()) {
             close_acp_session(conn, multiplex, &session_id).await;
@@ -2404,7 +2705,7 @@ async fn run_supervised_acp_chat_turn(
     let (prompt, turn_label) = continuation_prompt(kind, &user_prompt);
     let turn = tokio::select! {
         _ = cancellation.changed() => {
-            let _ = conn.cancel(acp::CancelNotification::new(session_id.clone())).await;
+            let _ = cancel_acp_prompt(config, conn, session_id.clone()).await;
             Err(ProviderError::Transport("ACP chat was cancelled while running".to_string()))
         }
         result = run_acp_prompt_turn(config, conn, session_id.clone(), prompt, turn_label) => result,
@@ -3114,32 +3415,50 @@ fn acp_command(config: &AcpSessionConfig) -> Command {
 }
 
 async fn terminate_acp_child(child: &mut tokio::process::Child) -> Result<(), ProviderError> {
-    match child.try_wait().map_err(|error| {
+    // Capture the group leader before try_wait reaps it: an adapter can exit
+    // while its grandchildren still hold stdout/stderr open.
+    #[cfg(unix)]
+    let process_group = child.id();
+    let status = child.try_wait().map_err(|error| {
         ProviderError::Transport(format!(
             "failed to inspect ACP agent process status: {error}"
         ))
-    })? {
-        Some(status) if status.success() => Ok(()),
-        Some(status) => Err(ProviderError::Transport(format!(
-            "ACP agent process exited unsuccessfully: {status}"
-        ))),
-        None => {
-            terminate_acp_process_tree(child).await?;
-            child.wait().await.map_err(|error| {
-                ProviderError::Transport(format!("failed to wait for ACP agent process: {error}"))
-            })?;
+    })?;
+    #[cfg(unix)]
+    if let Some(pid) = process_group {
+        terminate_acp_process_group(pid)?;
+    }
+    if let Some(status) = status {
+        return if status.success() {
             Ok(())
+        } else {
+            Err(ProviderError::Transport(format!(
+                "ACP agent process exited unsuccessfully: {status}"
+            )))
+        };
+    }
+    let stopped = timeout(ACP_CHILD_STOP_TIMEOUT, async {
+        #[cfg(not(unix))]
+        terminate_acp_process_tree(child).await?;
+        child.wait().await.map_err(|error| {
+            ProviderError::Transport(format!("failed to wait for ACP agent process: {error}"))
+        })?;
+        Ok(())
+    })
+    .await;
+    match stopped {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = child.start_kill();
+            Err(ProviderError::Transport(
+                "ACP process cleanup exceeded its one second deadline".into(),
+            ))
         }
     }
 }
 
 #[cfg(unix)]
-async fn terminate_acp_process_tree(
-    child: &mut tokio::process::Child,
-) -> Result<(), ProviderError> {
-    let pid = child.id().ok_or_else(|| {
-        ProviderError::Transport("ACP agent process id was unavailable".to_string())
-    })?;
+fn terminate_acp_process_group(pid: u32) -> Result<(), ProviderError> {
     let process_group = i32::try_from(pid).map_err(|_| {
         ProviderError::Transport(format!("ACP agent process id {pid} cannot be terminated"))
     })?;
@@ -3164,6 +3483,7 @@ async fn terminate_acp_process_tree(
         ProviderError::Transport("ACP agent process id was unavailable".to_string())
     })?;
     let status = Command::new("taskkill")
+        .kill_on_drop(true)
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -3941,8 +4261,17 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    enum SupervisorEvent {
+        New(String),
+        Load(String),
+        Prompt(String, String),
+    }
+
     #[derive(Clone)]
     struct MockProbeBehavior {
+        single_session: bool,
+        session_delay: Option<Duration>,
         discovery_only: bool,
         requested_options: BTreeMap<String, String>,
         require_review_config: bool,
@@ -3960,6 +4289,8 @@ mod tests {
     impl Default for MockProbeBehavior {
         fn default() -> Self {
             Self {
+                single_session: false,
+                session_delay: None,
                 discovery_only: false,
                 requested_options: BTreeMap::new(),
                 require_review_config: false,
@@ -3985,6 +4316,8 @@ mod tests {
     }
 
     struct MockAgent {
+        session_events: Rc<RefCell<Vec<SupervisorEvent>>>,
+        live_sessions: RefCell<std::collections::HashSet<String>>,
         configured_options: RefCell<Vec<(String, String)>>,
         client_action_tx: mpsc::UnboundedSender<MockClientAction>,
         next_session_id: Cell<u64>,
@@ -4007,6 +4340,8 @@ mod tests {
             max_in_flight_prompt_count: Rc<Cell<u32>>,
         ) -> Self {
             Self {
+                session_events: Rc::new(RefCell::new(Vec::new())),
+                live_sessions: RefCell::new(std::collections::HashSet::new()),
                 configured_options: RefCell::new(Vec::new()),
                 client_action_tx,
                 next_session_id: Cell::new(0),
@@ -4031,7 +4366,15 @@ mod tests {
             }
             Ok(
                 acp::InitializeResponse::new(acp::ProtocolVersion::V1).agent_info(
-                    acp::Implementation::new("mock-codex-acp", "0.11.1").title("Mock ACP Agent"),
+                    acp::Implementation::new(
+                        if self.behavior.single_session {
+                            "pi-acp"
+                        } else {
+                            "mock-codex-acp"
+                        },
+                        "0.11.1",
+                    )
+                    .title("Mock ACP Agent"),
                 ),
             )
         }
@@ -4051,13 +4394,37 @@ mod tests {
                 .set(self.new_session_count.get().saturating_add(1));
             let session_id = self.next_session_id.get();
             self.next_session_id.set(session_id + 1);
+            self.session_events
+                .borrow_mut()
+                .push(SupervisorEvent::New(session_id.to_string()));
+            if let Some(delay) = self.behavior.session_delay {
+                tokio::time::sleep(delay).await;
+            }
+            if self.behavior.single_session {
+                self.live_sessions.borrow_mut().clear();
+            }
+            self.live_sessions
+                .borrow_mut()
+                .insert(session_id.to_string());
             Ok(serde_json::from_value(serde_json::json!({"sessionId":session_id.to_string(),"configOptions":mock_session_options()})).unwrap())
         }
 
         async fn load_session(
             &self,
-            _arguments: acp::LoadSessionRequest,
+            arguments: acp::LoadSessionRequest,
         ) -> Result<acp::LoadSessionResponse, acp::Error> {
+            self.session_events
+                .borrow_mut()
+                .push(SupervisorEvent::Load(arguments.session_id.to_string()));
+            if let Some(delay) = self.behavior.session_delay {
+                tokio::time::sleep(delay).await;
+            }
+            if self.behavior.single_session {
+                self.live_sessions.borrow_mut().clear();
+            }
+            self.live_sessions
+                .borrow_mut()
+                .insert(arguments.session_id.to_string());
             Ok(
                 serde_json::from_value(serde_json::json!({"configOptions":mock_session_options()}))
                     .unwrap(),
@@ -4074,6 +4441,21 @@ mod tests {
                     vec![("mode".into(), "agent-full-access".into())]
                 );
             }
+            let prompt_text = arguments
+                .prompt
+                .iter()
+                .filter_map(|block| match block {
+                    acp::ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.session_events
+                .borrow_mut()
+                .push(SupervisorEvent::Prompt(
+                    arguments.session_id.to_string(),
+                    prompt_text,
+                ));
             self.prompt_count
                 .set(self.prompt_count.get().saturating_add(1));
             let in_flight = self.in_flight_prompt_count.get().saturating_add(1);
@@ -4082,6 +4464,17 @@ mod tests {
                 .set(self.max_in_flight_prompt_count.get().max(in_flight));
             if let Some(delay) = self.behavior.prompt_delay {
                 tokio::time::sleep(delay).await;
+            }
+            if self.behavior.single_session
+                && !self
+                    .live_sessions
+                    .borrow()
+                    .contains(&arguments.session_id.to_string())
+            {
+                self.in_flight_prompt_count
+                    .set(self.in_flight_prompt_count.get().saturating_sub(1));
+                return Err(acp::Error::invalid_params()
+                    .data("session was destroyed by a competing new/load"));
             }
             if let Some(error) = self.behavior.prompt_error.clone() {
                 self.in_flight_prompt_count
@@ -4400,6 +4793,624 @@ mod tests {
                 (result, chunks, new_session_count.get())
             })
             .await
+    }
+
+    struct SupervisorHarness {
+        commands: mpsc::UnboundedSender<AcpSupervisorCommand>,
+        worker: Option<tokio::task::JoinHandle<()>>,
+        events: Rc<RefCell<Vec<SupervisorEvent>>>,
+        sessions: Rc<Cell<u32>>,
+        prompts: Rc<Cell<u32>>,
+        max_in_flight: Rc<Cell<u32>>,
+        _evidence: tempfile::TempDir,
+    }
+
+    impl SupervisorHarness {
+        async fn start(single_session: bool, session_delay: Option<Duration>) -> Self {
+            Self::start_with_timeout(single_session, session_delay, Duration::from_secs(2)).await
+        }
+
+        async fn start_with_timeout(
+            single_session: bool,
+            session_delay: Option<Duration>,
+            timeout: Duration,
+        ) -> Self {
+            let (client_tx, agent_rx) = tokio::io::duplex(64 * 1024);
+            let (agent_tx, client_rx) = tokio::io::duplex(64 * 1024);
+            let (actions, action_rx) = mpsc::unbounded_channel();
+            let sessions = Rc::new(Cell::new(0));
+            let prompts = Rc::new(Cell::new(0));
+            let max_in_flight = Rc::new(Cell::new(0));
+            let agent = MockAgent::new(
+                actions,
+                "audit or chat response".into(),
+                MockProbeBehavior {
+                    single_session,
+                    session_delay,
+                    prompt_delay: Some(Duration::from_millis(80)),
+                    response_sequence: vec![include_str!(
+                        "../tests/fixtures/acp-mapped-surfaces.json"
+                    )
+                    .into()],
+                    ..Default::default()
+                },
+                Rc::clone(&sessions),
+                Rc::clone(&prompts),
+                Rc::new(Cell::new(0)),
+                Rc::clone(&max_in_flight),
+            );
+            let events = Rc::clone(&agent.session_events);
+            let (agent_connection, agent_io) = acp::AgentSideConnection::new(
+                agent,
+                agent_tx.compat_write(),
+                agent_rx.compat(),
+                |future| {
+                    tokio::task::spawn_local(future);
+                },
+            );
+            tokio::task::spawn_local(forward_mock_client_actions(agent_connection, action_rx));
+            tokio::task::spawn_local(async move {
+                let _ = agent_io.await;
+            });
+            let handler = AcpMultiplexHandler::default();
+            let (connection, client_io) = acp::ClientSideConnection::new(
+                handler.clone(),
+                client_tx.compat_write(),
+                client_rx.compat(),
+                |future| {
+                    tokio::task::spawn_local(future);
+                },
+            );
+            tokio::task::spawn_local(async move {
+                let _ = client_io.await;
+            });
+            let initialized = connection
+                .initialize(acp::InitializeRequest::new(acp::ProtocolVersion::V1))
+                .await
+                .unwrap();
+            let evidence = tempfile::tempdir().unwrap();
+            let config = AcpSessionConfig {
+                profile: None,
+                session_options: Default::default(),
+                program: "in-memory-test".into(),
+                args: Vec::new(),
+                cwd: evidence.path().to_path_buf(),
+                codex_home: None,
+                timeout,
+                client_name: "plankton".into(),
+                client_version: "test".into(),
+                // Discover Pi through the actual handshake, including custom adapters.
+                package_name: None,
+                package_version: None,
+                transport: ACP_TRANSPORT_STDIO.into(),
+            };
+            let trace = ProviderTrace {
+                agent_name: initialized.agent_info.map(|agent| agent.name),
+                ..Default::default()
+            };
+            let (commands, receiver) = mpsc::unbounded_channel();
+            let worker_commands = commands.clone();
+            let worker = tokio::task::spawn_local(async move {
+                supervise_acp_connection(
+                    &config,
+                    Rc::new(connection),
+                    handler,
+                    None,
+                    trace,
+                    receiver,
+                    worker_commands,
+                )
+                .await;
+            });
+            Self {
+                commands,
+                worker: Some(worker),
+                events,
+                sessions,
+                prompts,
+                max_in_flight,
+                _evidence: evidence,
+            }
+        }
+
+        fn prompt(
+            &self,
+            request_id: &str,
+        ) -> oneshot::Receiver<Result<AcpPromptResult, ProviderError>> {
+            let (response, received) = oneshot::channel();
+            self.commands
+                .send(AcpSupervisorCommand::Prompt {
+                    request_id: request_id.into(),
+                    prompt: request_id.into(),
+                    allowed_read_files: Vec::new(),
+                    review_workspace_enabled: false,
+                    response,
+                })
+                .unwrap();
+            received
+        }
+
+        fn staged(
+            &self,
+            request_id: &str,
+        ) -> (
+            oneshot::Receiver<Result<AcpPromptResult, ProviderError>>,
+            oneshot::Receiver<AcpStagedCompletion>,
+        ) {
+            let (decision_response, decision) = oneshot::channel();
+            let (enrichment_response, enrichment) = oneshot::channel();
+            let (enrichment_chunks, _) = mpsc::unbounded_channel();
+            self.commands
+                .send(AcpSupervisorCommand::StagedPrompt {
+                    request_id: request_id.into(),
+                    decision_prompt: "decision".into(),
+                    enrichment_prompt: "audit".into(),
+                    allowed_read_files: Vec::new(),
+                    decision_response,
+                    enrichment_chunks,
+                    enrichment_response,
+                })
+                .unwrap();
+            (decision, enrichment)
+        }
+
+        fn continuation(
+            &self,
+            id: &str,
+            session_id: &str,
+            kind: AcpContinuationKind,
+        ) -> oneshot::Receiver<Result<AcpPromptResult, ProviderError>> {
+            let (response, received) = oneshot::channel();
+            let (events, _) = mpsc::unbounded_channel();
+            self.commands
+                .send(AcpSupervisorCommand::ChatPrompt {
+                    request_id: id.into(),
+                    kind,
+                    session_id: Some(session_id.into()),
+                    prompt: id.into(),
+                    allowed_read_files: Vec::new(),
+                    events,
+                    response,
+                })
+                .unwrap();
+            received
+        }
+
+        fn cancel(&self, request_id: &str) {
+            self.commands
+                .send(AcpSupervisorCommand::Cancel {
+                    request_id: request_id.into(),
+                })
+                .unwrap();
+        }
+
+        async fn until(&self, predicate: impl Fn() -> bool) {
+            timeout(Duration::from_secs(2), async {
+                while !predicate() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("mock ACP reached the expected transport event");
+        }
+
+        async fn stop(&mut self) {
+            let _ = self.commands.send(AcpSupervisorCommand::Shutdown);
+            timeout(Duration::from_secs(2), self.worker.take().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    struct ShutdownProcessFixture {
+        handle: Option<AcpSupervisorHandle>,
+        state_path: PathBuf,
+        _directory: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl ShutdownProcessFixture {
+        fn start(mode: &str) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let script = directory.path().join("unresponsive_acp.py");
+            let state_path = directory.path().join("state.json");
+            fs::write(&script, r#"
+import json, os, pathlib, subprocess, sys
+state_path = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+child = subprocess.Popen(['/bin/sleep', '120'])
+state = {'parent': os.getpid(), 'child': child.pid, 'prompts': 0}
+def save():
+    temporary = state_path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(state))
+    temporary.replace(state_path)
+session = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get('method')
+    if method == 'initialize':
+        save()
+        if mode == 'initialize':
+            continue
+        result = {'protocolVersion': 1, 'agentCapabilities': {}, 'agentInfo': {'name': 'fixture-acp', 'version': '1'}}
+    elif method == 'session/new':
+        session += 1
+        result = {'sessionId': str(session)}
+    elif method == 'session/prompt':
+        state['prompts'] += 1
+        save()
+        continue
+    else:
+        # In particular, never acknowledge session/close during shutdown.
+        continue
+    print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}), flush=True)
+"#).unwrap();
+            let handle = AcpSupervisorHandle::start(AcpSessionConfig {
+                profile: None,
+                session_options: BTreeMap::new(),
+                program: "/usr/bin/python3".into(),
+                args: vec![
+                    "-u".into(),
+                    script.display().to_string(),
+                    state_path.display().to_string(),
+                    mode.into(),
+                ],
+                cwd: directory.path().to_path_buf(),
+                codex_home: None,
+                timeout: Duration::from_secs(120),
+                client_name: "plankton".into(),
+                client_version: "test".into(),
+                package_name: None,
+                package_version: None,
+                transport: ACP_TRANSPORT_STDIO.into(),
+            })
+            .unwrap();
+            Self {
+                handle: Some(handle),
+                state_path,
+                _directory: directory,
+            }
+        }
+
+        fn wait_for_state(&self, prompts: u64) -> serde_json::Value {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(bytes) = fs::read(&self.state_path) {
+                    let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    if state["prompts"].as_u64().unwrap() >= prompts {
+                        return state;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fake ACP did not reach the requested protocol state"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn shutdown(&mut self) -> Duration {
+            let started = std::time::Instant::now();
+            self.handle.take().unwrap().shutdown();
+            started.elapsed()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ShutdownProcessFixture {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                handle.shutdown();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_adapter_tree_stopped(state: &serde_json::Value) {
+        let parent = state["parent"].as_i64().unwrap() as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::kill(parent, 0) },
+            -1,
+            "adapter parent was not reaped"
+        );
+        let child = state["child"].as_i64().unwrap().to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = StdCommand::new("ps")
+                .args(["-p", &child, "-o", "stat="])
+                .output()
+                .unwrap();
+            let status = String::from_utf8_lossy(&status.stdout);
+            // An orphaned zombie is already dead; some CI PID 1 implementations
+            // do not promptly reap it. It cannot retain pipes or execute code.
+            if status.trim().is_empty() || status.trim().starts_with('Z') {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "adapter descendant is still running: {status}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_shutdown_interrupts_unresponsive_initialize_and_kills_descendants() {
+        let mut fixture = ShutdownProcessFixture::start("initialize");
+        let state = fixture.wait_for_state(0);
+        let elapsed = fixture.shutdown();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "shutdown waited for the 120-second initialize timeout: {elapsed:?}"
+        );
+        assert_adapter_tree_stopped(&state);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_shutdown_bounds_the_whole_session_cleanup_batch() {
+        let mut fixture = ShutdownProcessFixture::start("cleanup");
+        fixture.wait_for_state(0);
+        let mut responses = Vec::new();
+        for index in 0..8 {
+            let (response, receiver) = oneshot::channel();
+            fixture
+                .handle
+                .as_ref()
+                .unwrap()
+                .commands
+                .send(AcpSupervisorCommand::Prompt {
+                    request_id: format!("shutdown-{index}"),
+                    prompt: "pending until shutdown".into(),
+                    allowed_read_files: Vec::new(),
+                    review_workspace_enabled: false,
+                    response,
+                })
+                .unwrap();
+            responses.push(receiver);
+        }
+        let state = fixture.wait_for_state(8);
+        let elapsed = fixture.shutdown();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "session count multiplied shutdown delay: {elapsed:?}"
+        );
+        assert_adapter_tree_stopped(&state);
+        assert_eq!(responses.len(), 8);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pi_supervisor_serializes_staged_audit_repair_and_loaded_chat_without_prewarming() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut harness = SupervisorHarness::start(true, None).await;
+                let (decision, audit) = harness.staged("first");
+                let decision = decision.await.unwrap().unwrap();
+                let session = decision.trace.session_id.unwrap();
+                harness.until(|| harness.prompts.get() == 2).await;
+                assert_eq!(
+                    harness.sessions.get(),
+                    1,
+                    "audit must keep its original Pi process"
+                );
+                let second = harness.prompt("second");
+                let repair = harness.continuation(
+                    "repair",
+                    &session,
+                    AcpContinuationKind::ReviewDetailRepair,
+                );
+                let chat = harness.continuation("chat", &session, AcpContinuationKind::Chat);
+                assert!(audit.await.unwrap().result.is_ok());
+                second.await.unwrap().unwrap();
+                assert_eq!(
+                    repair.await.unwrap().unwrap().trace.session_id.as_deref(),
+                    Some(session.as_str())
+                );
+                assert_eq!(
+                    chat.await.unwrap().unwrap().trace.session_id.as_deref(),
+                    Some(session.as_str())
+                );
+                assert_eq!(
+                    harness.sessions.get(),
+                    2,
+                    "continuations load history and no session is prewarmed"
+                );
+                assert_eq!(harness.max_in_flight.get(), 1);
+                let events = harness.events.borrow().clone();
+                let created = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        SupervisorEvent::New(id) => Some(id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(created, vec!["0", "1"]);
+                let loads = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        SupervisorEvent::Load(id) => Some(id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(loads, vec![session.as_str(), session.as_str()]);
+                let prompts = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        SupervisorEvent::Prompt(id, text) => Some((id.as_str(), text.as_str())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(prompts.len(), 5);
+                assert_eq!(prompts[0].0, prompts[1].0);
+                assert!(prompts[3].1.contains("REPAIR REQUEST"));
+                assert!(prompts[4].1.contains("FOLLOW-UP CHAT"));
+                harness.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pi_supervisor_cancels_all_queued_turn_kinds_and_skips_abandoned_receivers() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut harness = SupervisorHarness::start(true, None).await;
+                let active = harness.prompt("active");
+                harness.until(|| harness.prompts.get() == 1).await;
+                let cancelled = harness.prompt("cancel-prompt");
+                let (cancelled_decision, cancelled_audit) = harness.staged("cancel-staged");
+                let cancelled_chat =
+                    harness.continuation("cancel-chat", "0", AcpContinuationKind::Chat);
+                harness.cancel("cancel-prompt");
+                harness.cancel("cancel-staged");
+                harness.cancel("cancel-chat");
+                drop(harness.prompt("abandoned"));
+                let last = harness.prompt("last");
+                assert!(cancelled.await.unwrap().is_err());
+                assert!(cancelled_decision.await.unwrap().is_err());
+                assert!(cancelled_audit.await.unwrap().cleanup.is_ok());
+                assert!(cancelled_chat.await.unwrap().is_err());
+                active.await.unwrap().unwrap();
+                last.await.unwrap().unwrap();
+                assert_eq!(
+                    harness.sessions.get(),
+                    2,
+                    "cancelled queued work must never create or load a session"
+                );
+                assert_eq!(harness.prompts.get(), 2);
+                assert!(!harness
+                    .events
+                    .borrow()
+                    .iter()
+                    .any(|event| matches!(event, SupervisorEvent::Load(_))));
+                harness.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pi_supervisor_cancelled_new_and_load_finish_before_the_next_review() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut harness =
+                    SupervisorHarness::start(true, Some(Duration::from_millis(80))).await;
+                let cancelled_new = harness.prompt("cancel-new");
+                harness.until(|| harness.sessions.get() == 1).await;
+                harness.cancel("cancel-new");
+                let next = harness.prompt("after-new");
+                assert!(cancelled_new.await.unwrap().is_err());
+                let next = next.await.unwrap().unwrap();
+                let session = next.trace.session_id.unwrap();
+                let cancelled_load = harness.continuation(
+                    "cancel-load",
+                    &session,
+                    AcpContinuationKind::ReviewDetailRepair,
+                );
+                harness
+                    .until(|| {
+                        harness
+                            .events
+                            .borrow()
+                            .iter()
+                            .any(|event| matches!(event, SupervisorEvent::Load(_)))
+                    })
+                    .await;
+                harness.cancel("cancel-load");
+                let last = harness.prompt("after-load");
+                assert!(cancelled_load.await.unwrap().is_err());
+                last.await
+                    .unwrap()
+                    .expect("a late Pi load must not destroy the next request");
+                assert_eq!(harness.sessions.get(), 3);
+                assert_eq!(
+                    harness.prompts.get(),
+                    2,
+                    "cancelled acquisition must not send a prompt"
+                );
+                assert_eq!(harness.max_in_flight.get(), 1);
+                harness.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pi_supervisor_shutdown_rejects_queued_decision_and_chat_without_new_sessions() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut harness = SupervisorHarness::start(true, None).await;
+                let active = harness.prompt("active");
+                harness.until(|| harness.prompts.get() == 1).await;
+                let (decision, enrichment) = harness.staged("queued-staged");
+                let chat = harness.continuation("queued-chat", "0", AcpContinuationKind::Chat);
+                harness.stop().await;
+                assert!(decision.await.unwrap().is_err());
+                assert!(enrichment.await.unwrap().cleanup.is_ok());
+                assert!(chat.await.unwrap().is_err());
+                assert!(timeout(Duration::from_secs(1), active)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err());
+                assert_eq!(harness.sessions.get(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pi_supervisor_retires_uncertain_session_after_acquisition_timeout() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut harness = SupervisorHarness::start_with_timeout(
+                    true,
+                    Some(Duration::from_millis(100)),
+                    Duration::from_millis(20),
+                )
+                .await;
+                let (decision, enrichment) = harness.staged("timed-out-new");
+                harness.until(|| harness.sessions.get() == 1).await;
+                let queued = harness.prompt("must-not-start");
+                assert!(decision
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("session/new timed out"));
+                assert!(enrichment.await.unwrap().cleanup.is_ok());
+                assert!(queued
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("supervisor stopped"));
+                harness.stop().await;
+                assert_eq!(harness.sessions.get(), 1);
+                assert_eq!(harness.prompts.get(), 0);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_session_supervisor_preserves_parallel_reviews_and_prewarming() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut harness = SupervisorHarness::start(false, None).await;
+                let first = harness.prompt("first");
+                let second = harness.prompt("second");
+                first.await.unwrap().unwrap();
+                second.await.unwrap().unwrap();
+                assert!(
+                    harness.max_in_flight.get() >= 2,
+                    "other adapters retain parallel independent sessions"
+                );
+                assert!(
+                    harness.sessions.get() >= 3,
+                    "the next clean session remains prewarmed"
+                );
+                harness.stop().await;
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4961,6 +5972,18 @@ mod tests {
             ))
         );
         assert!(matches!(events.get(1), Some(AcpChatEvent::TextDelta(_))));
+    }
+
+    #[test]
+    fn pi_workspace_suppresses_only_the_adapter_banner() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        prepare_pi_workspace(workspace.path()).expect("prepare Pi");
+        let path = workspace.path().join(".pi/settings.json");
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"quietStartup": true}));
+        prepare_pi_workspace(workspace.path()).expect("idempotent refresh");
+        assert!(path.is_file());
     }
 
     #[test]

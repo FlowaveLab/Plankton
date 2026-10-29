@@ -1,32 +1,57 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ArrowUpRight, ShieldCheck, X } from "lucide-react";
+import {
+  ArrowUpRight,
+  CircleCheck,
+  CircleX,
+  LoaderCircle,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type JSX } from "react";
 
 import { getBrowserStorage } from "../browserStorage";
 import { isLocale, LOCALE_STORAGE_KEY, type Locale } from "../i18n";
-import type { CompactApprovalRequest } from "./CompactApproval";
 import "./approval-notification.css";
 
+export type ApprovalNotificationData = {
+  id: string;
+  request_id: string;
+  stage: "evaluating" | "approved" | "rejected" | "failed";
+  resource: string;
+  resource_label: string;
+  requested_by: string;
+  reason: string;
+  decision_reason: string;
+};
+
 export type ApprovalNotificationApi = {
-  loadRequests: () => Promise<CompactApprovalRequest[]>;
+  loadCurrent: () => Promise<ApprovalNotificationData | null>;
   loadLocale: () => Promise<Locale>;
   openFullDetails: (requestId: string) => Promise<void>;
-  dismiss: () => Promise<void>;
-  subscribe: (onQueueChanged: () => void) => Promise<() => void>;
+  dismiss: (notificationId: string) => Promise<void>;
+  disable: () => Promise<void>;
+  subscribe: (
+    onNotification: (notification: ApprovalNotificationData | null) => void,
+  ) => Promise<() => void>;
 };
 
 const defaultApi: ApprovalNotificationApi = {
-  loadRequests: () => invoke("compact_approval_requests"),
+  loadCurrent: () => invoke("approval_notification_current"),
   async loadLocale() {
     const settings = await invoke<{ locale: Locale }>("desktop_settings");
     return settings.locale;
   },
   openFullDetails: (requestId) =>
     invoke("open_full_request_details", { requestId }),
-  dismiss: () => invoke("dismiss_approval_popup"),
-  subscribe: (onQueueChanged) =>
-    listen("plankton://approval-queue", onQueueChanged),
+  dismiss: (notificationId) =>
+    invoke("dismiss_approval_notification", { notificationId }),
+  disable: () => invoke("disable_approval_notifications"),
+  subscribe: (onNotification) =>
+    listen<ApprovalNotificationData | null>(
+      "plankton://approval-notification",
+      (event) => onNotification(event.payload),
+    ),
 };
 
 function initialLocale(): Locale {
@@ -34,42 +59,74 @@ function initialLocale(): Locale {
   return isLocale(stored) ? stored : "en";
 }
 
+const STAGES = {
+  evaluating: { zh: "自动审批中", en: "Reviewing access", icon: LoaderCircle },
+  approved: { zh: "访问已通过", en: "Access approved", icon: CircleCheck },
+  rejected: { zh: "访问已拒绝", en: "Access rejected", icon: CircleX },
+  failed: { zh: "审批未完成", en: "Review failed", icon: TriangleAlert },
+} as const;
+
 export function ApprovalNotification({
   api = defaultApi,
 }: {
   api?: ApprovalNotificationApi;
 }): JSX.Element {
   const [locale, setLocale] = useState<Locale>(initialLocale);
-  const [requests, setRequests] = useState<CompactApprovalRequest[]>([]);
+  const [current, setCurrent] = useState<ApprovalNotificationData | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState<"load" | "action" | null>(null);
+  const currentId = useRef<string | null>(null);
   const loadVersion = useRef(0);
-  const current = requests.at(-1) ?? null;
+  const actionVersion = useRef(0);
+  const actionBusy = useRef(false);
+  const timer = useRef<number | undefined>(undefined);
   const zh = locale === "zh-CN";
+
+  const stopTimer = useCallback(() => {
+    window.clearTimeout(timer.current);
+    timer.current = undefined;
+  }, []);
+
+  const accept = useCallback(
+    (notification: ApprovalNotificationData | null) => {
+      if (notification?.id !== currentId.current) {
+        stopTimer();
+        actionVersion.current += 1;
+        actionBusy.current = false;
+        setBusy(false);
+        setError(null);
+      }
+      currentId.current = notification?.id ?? null;
+      setCurrent(notification);
+      setLoading(false);
+    },
+    [stopTimer],
+  );
 
   const reload = useCallback(async (): Promise<void> => {
     const version = ++loadVersion.current;
     try {
-      const loaded = await api.loadRequests();
+      const notification = await api.loadCurrent();
       if (version !== loadVersion.current) return;
-      setRequests(
-        loaded.filter((request) => request.approval_status === "pending"),
-      );
-      setError(false);
+      accept(notification);
+      setError(null);
     } catch {
-      if (version === loadVersion.current) setError(true);
+      if (version === loadVersion.current) setError("load");
     } finally {
       if (version === loadVersion.current) setLoading(false);
     }
-  }, [api]);
+  }, [api, accept]);
 
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void api
-      .subscribe(() => {
-        void reload();
+      .subscribe((notification) => {
+        if (disposed) return;
+        // A delayed initial read must never replace a newer event.
+        loadVersion.current += 1;
+        accept(notification);
       })
       .then((dispose) => {
         if (disposed) {
@@ -81,7 +138,7 @@ export function ApprovalNotification({
       })
       .catch(() => {
         if (!disposed) {
-          setError(true);
+          setError("load");
           setLoading(false);
         }
       });
@@ -91,154 +148,193 @@ export function ApprovalNotification({
         if (!disposed && isLocale(loaded)) setLocale(loaded);
       })
       .catch(() => {
-        /* The saved browser locale remains a usable fallback. */
+        /* Browser locale remains a usable fallback. */
       });
     function onLocaleChanged(event: StorageEvent): void {
-      if (event.key === LOCALE_STORAGE_KEY && isLocale(event.newValue)) {
+      if (event.key === LOCALE_STORAGE_KEY && isLocale(event.newValue))
         setLocale(event.newValue);
-      }
     }
     window.addEventListener("storage", onLocaleChanged);
     return () => {
       disposed = true;
       loadVersion.current += 1;
+      actionVersion.current += 1;
+      currentId.current = null;
+      stopTimer();
       unlisten?.();
       window.removeEventListener("storage", onLocaleChanged);
     };
-  }, [api, reload]);
+  }, [api, accept, reload, stopTimer]);
 
-  const act = useCallback(
-    async (action: () => Promise<void>): Promise<void> => {
-      if (busy) return;
+  const performAction = useCallback(
+    async (
+      notificationId: string,
+      action: () => Promise<void>,
+    ): Promise<void> => {
+      if (currentId.current !== notificationId || actionBusy.current) return;
+      const version = ++actionVersion.current;
+      actionBusy.current = true;
+      stopTimer();
       setBusy(true);
+      setError(null);
       try {
         await action();
+        if (
+          version === actionVersion.current &&
+          currentId.current === notificationId
+        )
+          accept(null);
       } catch {
-        setError(true);
+        if (
+          version === actionVersion.current &&
+          currentId.current === notificationId
+        )
+          setError("action");
       } finally {
-        setBusy(false);
+        if (version === actionVersion.current) {
+          actionBusy.current = false;
+          setBusy(false);
+        }
       }
     },
-    [busy],
+    [accept, stopTimer],
   );
 
   useEffect(() => {
+    stopTimer();
+    if (!current || current.stage === "evaluating") return;
+    const id = current.id;
+    timer.current = window.setTimeout(() => {
+      if (currentId.current === id)
+        void performAction(id, () => api.dismiss(id));
+    }, 5000);
+    return stopTimer;
+  }, [current?.id, current?.stage, api, performAction, stopTimer]);
+
+  useEffect(() => {
     function onKeyDown(event: KeyboardEvent): void {
-      if (event.key === "Escape") {
+      const id = currentId.current;
+      if (event.key === "Escape" && id) {
         event.preventDefault();
-        void act(api.dismiss);
+        void performAction(id, () => api.dismiss(id));
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [act, api]);
+  }, [api, performAction]);
 
+  const stage = current ? STAGES[current.stage] : null;
+  const Icon = stage?.icon ?? LoaderCircle;
   return (
-    <main className="approval-notification" lang={locale}>
+    <main
+      className="approval-notification"
+      data-stage={current?.stage}
+      lang={locale}
+    >
       <header className="approval-notification__header">
-        <span className="approval-notification__mark">
-          <ShieldCheck size={19} aria-hidden="true" />
-        </span>
-        <strong>PLANKTON</strong>
-        <span className="approval-notification__count" aria-live="polite">
-          {requests.length > 1
+        <Icon
+          className="approval-notification__stage-icon"
+          size={15}
+          aria-hidden="true"
+        />
+        <strong aria-live="polite">
+          {stage
             ? zh
-              ? `${requests.length} 项待审批`
-              : `${requests.length} waiting`
-            : zh
-              ? "凭据访问"
-              : "Credential access"}
-        </span>
+              ? stage.zh
+              : stage.en
+            : loading
+              ? zh
+                ? "正在同步…"
+                : "Loading…"
+              : zh
+                ? "暂无自动审批提示"
+                : "No active notification"}
+        </strong>
+        <span className="approval-notification__brand">PLANKTON</span>
         <button
           className="approval-notification__close"
           type="button"
-          aria-label={zh ? "稍后处理" : "Remind me later"}
-          disabled={busy}
+          aria-label={zh ? "关闭提示" : "Dismiss notification"}
+          disabled={busy || !current}
           onClick={() => {
-            void act(api.dismiss);
+            if (current)
+              void performAction(current.id, () => api.dismiss(current.id));
           }}
         >
-          <X size={16} aria-hidden="true" />
+          <X size={14} aria-hidden="true" />
         </button>
       </header>
       <section className="approval-notification__content" aria-live="polite">
-        <h1>
-          {loading
-            ? zh
-              ? "正在获取审批…"
-              : "Loading request…"
-            : current
-              ? zh
-                ? "需要你审批"
-                : "Your approval is needed"
-              : zh
-                ? "审批已处理"
-                : "All caught up"}
-        </h1>
         {current ? (
           <>
-            <code
-              className="approval-notification__resource"
-              title={current.resource}
-            >
-              {current.resource}
-            </code>
-            <p className="approval-notification__reason" title={current.reason}>
-              {current.reason || (zh ? "未填写申请原因" : "No reason provided")}
-            </p>
-            <p className="approval-notification__requester">
-              <span>{zh ? "申请方" : "From"}</span>
-              <strong title={current.requested_by}>
-                {current.requested_by || (zh ? "未知" : "Unknown")}
+            <div className="approval-notification__identity">
+              <strong
+                className="approval-notification__resource"
+                title={current.resource}
+              >
+                {current.resource_label || current.resource}
               </strong>
+              <span
+                className="approval-notification__requester"
+                title={current.requested_by}
+              >
+                {current.requested_by}
+              </span>
+            </div>
+            <p className="approval-notification__reason" title={current.reason}>
+              <span>{zh ? "申请" : "Request"} · </span>
+              {current.reason || (zh ? "未填写原因" : "No reason provided")}
             </p>
+            {current.stage !== "evaluating" ? (
+              <p
+                className="approval-notification__decision"
+                title={current.decision_reason}
+              >
+                <span>{zh ? "决定" : "Decision"} · </span>
+                {current.decision_reason ||
+                  (zh ? "查看详情了解结果" : "See details for the result")}
+              </p>
+            ) : null}
           </>
-        ) : (
-          <p className="approval-notification__reason">
-            {loading
-              ? zh
-                ? "请稍候"
-                : "One moment"
-              : zh
-                ? "你可以关闭此提醒。"
-                : "You can dismiss this notification."}
-          </p>
-        )}
+        ) : null}
         {error ? (
-          <div className="approval-notification__error" role="alert">
-            {zh ? "操作未完成，请重试。" : "Could not complete this action."}
-            <button
-              type="button"
-              onClick={() => {
-                void reload();
-              }}
-            >
-              {zh ? "重试" : "Retry"}
-            </button>
-          </div>
+          <p className="approval-notification__error" role="alert">
+            {zh ? "操作未完成，请重试。" : "Action failed. Please retry."}
+            {error === "load" ? (
+              <button type="button" onClick={() => void reload()}>
+                {zh ? "重试" : "Retry"}
+              </button>
+            ) : null}
+          </p>
         ) : null}
       </section>
       <footer className="approval-notification__footer">
         <button
-          className="approval-notification__later"
-          disabled={busy}
+          className="approval-notification__mute"
+          disabled={busy || !current}
           type="button"
           onClick={() => {
-            void act(api.dismiss);
+            if (current) void performAction(current.id, api.disable);
           }}
         >
-          {zh ? "稍后处理" : "Later"}
+          {zh ? "不再提示" : "Don't show again"}
         </button>
         <button
           className="approval-notification__open"
           disabled={busy || !current}
           type="button"
           onClick={() => {
-            if (current) void act(() => api.openFullDetails(current.id));
+            if (!current) return;
+            const notification = current;
+            void performAction(notification.id, async () => {
+              await api.openFullDetails(notification.request_id);
+              if (currentId.current === notification.id)
+                await api.dismiss(notification.id);
+            });
           }}
         >
-          {zh ? "查看并审批" : "Review request"}
-          <ArrowUpRight size={15} aria-hidden="true" />
+          {zh ? "查看详情" : "Details"}
+          <ArrowUpRight size={12} aria-hidden="true" />
         </button>
       </footer>
     </main>

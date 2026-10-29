@@ -132,6 +132,76 @@ pub struct ResourceAccessStatusRequest {
     pub request_id: String,
 }
 
+/// A collected command executed by the daemon after review. No caller-provided
+/// metadata can claim that a process or script has been observed or approved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceExecutionRequest {
+    pub resource_id: String,
+    pub reason: String,
+    pub requested_by: String,
+    #[serde(default)]
+    pub script_path: String,
+    #[serde(default)]
+    pub interpreter_path: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub credential_env: Option<String>,
+    #[serde(default)]
+    pub command_stdin: Option<String>,
+    #[serde(default = "default_execution_timeout")]
+    pub timeout_seconds: u16,
+}
+
+impl Default for ResourceExecutionRequest {
+    fn default() -> Self {
+        Self {
+            resource_id: String::new(),
+            reason: String::new(),
+            requested_by: String::new(),
+            script_path: String::new(),
+            interpreter_path: String::new(),
+            cwd: String::new(),
+            arguments: Vec::new(),
+            command: Vec::new(),
+            credential_env: None,
+            command_stdin: None,
+            timeout_seconds: default_execution_timeout(),
+        }
+    }
+}
+
+fn default_execution_timeout() -> u16 {
+    60
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceExecutionState {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceExecutionResponse {
+    pub request_id: String,
+    pub resource_id: String,
+    pub state: ResourceExecutionState,
+    pub human_review_required: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceAccessState {

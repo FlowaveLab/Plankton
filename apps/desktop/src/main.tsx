@@ -21,21 +21,27 @@ const windowLabel = (window as Window & { __TAURI_INTERNALS__?: object })
 const surface = surfaceForWindowLabel(windowLabel);
 const surfaceModule =
   surface === "compact"
-    ? import("./components/ApprovalNotification")
-    : surface === "password-change"
-      ? import("./components/PasswordChangeConfirmation")
-      : import("./App");
+    ? import("./components/CompactApproval")
+    : surface === "notification"
+      ? import("./components/ApprovalNotification")
+      : surface === "password-change"
+        ? import("./components/PasswordChangeConfirmation")
+        : import("./App");
 
 void surfaceModule
   .then((module) => {
     const Surface =
       surface === "compact"
-        ? (module as typeof import("./components/ApprovalNotification"))
-            .ApprovalNotification
-        : surface === "password-change"
-          ? (module as typeof import("./components/PasswordChangeConfirmation"))
-              .PasswordChangeConfirmation
-          : (module as typeof import("./App")).default;
+        ? (module as typeof import("./components/CompactApproval"))
+            .CompactApproval
+        : surface === "notification"
+          ? (module as typeof import("./components/ApprovalNotification"))
+              .ApprovalNotification
+          : surface === "password-change"
+            ? (
+                module as typeof import("./components/PasswordChangeConfirmation")
+              ).PasswordChangeConfirmation
+            : (module as typeof import("./App")).default;
     ReactDOM.createRoot(appRoot).render(<Surface />);
   })
   .catch((error: unknown) => {

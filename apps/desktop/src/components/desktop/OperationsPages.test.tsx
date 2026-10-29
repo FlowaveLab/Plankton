@@ -2122,7 +2122,7 @@ describe("RequestsPage", () => {
 
 describe("PoliciesPage", () => {
   it.each(["manual_only", "assisted", "llm_automatic"])(
-    "keeps approval notifications editable and saves the changed draft in %s mode",
+    "keeps automatic review notifications editable without disabling human review in %s mode",
     (mode) => {
       const settings = { ...SETTINGS, default_policy_mode: mode };
       const controller = buildSettingsController({
@@ -2130,6 +2130,18 @@ describe("PoliciesPage", () => {
         settingsDraft: settings,
       });
       const view = render(policiesPage(controller));
+      const notificationSection = view.container.querySelector(
+        '[data-testid="settings-notifications-section"]',
+      )!;
+      expect(notificationSection.textContent).toContain(
+        "Automatic review notifications",
+      );
+      expect(notificationSection.textContent).toContain(
+        "Results disappear after 5 seconds",
+      );
+      expect(notificationSection.textContent).toContain(
+        "does not affect the always-on-top human approval window",
+      );
       const popup = () =>
         view.container.querySelector<HTMLInputElement>(
           '[data-settings-field="approval_popup_enabled"]',
@@ -2464,6 +2476,25 @@ describe("PoliciesPage", () => {
 });
 
 describe("AgentsPage", () => {
+  it("offers Pi as an ACP agent and forwards its selection", () => {
+    const controller = buildSettingsController();
+    const view = renderPage("agents", controller);
+    const pi = view.container.querySelector<HTMLInputElement>(
+      '#settings-acp-section input[value="pi"]',
+    );
+    expect(pi).not.toBeNull();
+    expect(pi?.closest("label")?.textContent).toContain("Pi");
+    act(() => pi!.click());
+    expect(controller.onAcpProfileChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agent_kind: "pi",
+        version_mode: "latest",
+        session_options: {},
+      }),
+    );
+    view.unmount();
+  });
+
   it("configures an OpenAI-compatible endpoint, token, and model on the runtime page", () => {
     const openAiSettings: DesktopSettings = {
       ...SETTINGS,

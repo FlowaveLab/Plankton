@@ -1,4 +1,4 @@
-mod consumer_script;
+mod command_stdin;
 mod desktop_handoff;
 mod onepassword_import;
 mod skill_install;
@@ -21,10 +21,7 @@ use desktop_handoff::{
     trigger_password_migration_handoff, trigger_request_handoff,
 };
 use plankton_client::{ClientError, DaemonClient};
-use plankton_core::{
-    collect_runtime_call_chain, derive_script_path, passwords::parse_password_source_descriptor,
-    prompt_call_chain_paths, CallChainNode,
-};
+use plankton_core::passwords::parse_password_source_descriptor;
 use plankton_protocol::{
     exposure::{
         CredentialAccessMode, CredentialExposurePolicy, CredentialExposureSurface,
@@ -40,8 +37,8 @@ use plankton_protocol::{
         PasswordSourceDescriptor, SelectedPasswordEntry,
     },
     resources::{
-        ResourceAccessCallChainNode, ResourceAccessRequest, ResourceAccessResponse,
-        ResourceAccessState, ResourceSearchItem, ResourceSearchRequest,
+        ResourceExecutionRequest, ResourceExecutionResponse, ResourceExecutionState,
+        ResourceSearchItem, ResourceSearchRequest,
     },
 };
 use serde::Serialize;
@@ -55,7 +52,7 @@ const STATUS_POLL_RETRY_LIMIT: u8 = 3;
 #[command(
     author,
     version,
-    about = "AI-facing Plankton client for provider-neutral password search and approved reads",
+    about = "Plankton client for password metadata and reviewed consumer execution",
     arg_required_else_help = true,
     after_help = "Password values are never returned by management commands.\n\
                   `password create` opens an empty human-filled batch draft; `password add` \
@@ -295,9 +292,11 @@ fn validate_domain(value: &str) -> Result<()> {
 enum Commands {
     #[command(
         visible_alias = "request",
-        about = "Request one provider-neutral resource; text output prints only its approved value"
+        about = "Disabled raw-value access; use run with a bound consumer command"
     )]
     Get(GetArgs),
+    #[command(about = "Inspect and execute a consumer command with a daemon-injected credential")]
+    Run(RunArgs),
     #[command(about = "List provider-neutral password fields without revealing values")]
     List(ListArgs),
     #[command(
@@ -346,14 +345,18 @@ struct GetArgs {
     resource: Option<String>,
     #[arg(long = "resource", hide = true, group = "resource_input")]
     resource_flag: Option<String>,
-    #[arg(long, help = "Why access is needed")]
+    #[arg(
+        long,
+        default_value = "",
+        help = "Legacy argument; raw-value access is disabled"
+    )]
     reason: String,
     #[arg(long, help = "Requester identity; defaults to the OS user")]
     requested_by: Option<String>,
     #[arg(
         long,
         value_name = "PATH",
-        help = "Declare a credential-free consumer script for review; does not execute or bind the consumer"
+        help = "Legacy argument; get is disabled even when a consumer script is declared"
     )]
     consumer_script: Option<PathBuf>,
     #[arg(
@@ -368,6 +371,77 @@ struct GetArgs {
         help = "Repeat to attach request metadata"
     )]
     metadata: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("consumer")
+        .required(true)
+        .multiple(true)
+        .args(["script", "arguments"]),
+))]
+struct RunArgs {
+    #[arg(value_name = "RESOURCE")]
+    resource: String,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Compatibility shortcut for a Python file; command arguments follow --"
+    )]
+    script: Option<PathBuf>,
+    #[arg(
+        long,
+        requires = "script",
+        value_name = "PATH",
+        help = "Interpreter for --script; defaults to /usr/bin/python3"
+    )]
+    python: Option<PathBuf>,
+    #[arg(
+        long = "env",
+        value_name = "NAME",
+        help = "Inject the credential into this consumer environment variable; accepts a name, never a value"
+    )]
+    credential_env: Option<String>,
+    #[arg(
+        long,
+        requires = "credential_env",
+        value_name = "FILE|-",
+        help = "Provide bounded UTF-8 consumer stdin from a file or -; requires --env so it cannot replace credential stdin"
+    )]
+    input: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Working directory; defaults to the current directory"
+    )]
+    cwd: Option<PathBuf>,
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u16).range(1..=300), help = "Consumer execution timeout in seconds, excluding review time")]
+    timeout: u16,
+    #[arg(
+        long,
+        help = "Purpose and intended destination; never include a credential"
+    )]
+    reason: String,
+    #[arg(long, help = "Requester identity; defaults to the OS user")]
+    requested_by: Option<String>,
+    #[arg(
+        last = true,
+        value_name = "COMMAND_OR_ARG",
+        help = "Consumer command and literal arguments after --; with --script these are script arguments"
+    )]
+    arguments: Vec<String>,
+}
+
+fn parse_credential_env(name: &str) -> std::result::Result<String, String> {
+    let mut chars = name.chars();
+    if !chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return Err("--env requires a POSIX variable name, never NAME=VALUE".into());
+    }
+    Ok(name.into())
 }
 
 #[derive(Debug, Args)]
@@ -868,6 +942,7 @@ async fn run() -> Result<ExitCode> {
     let Cli { output, command } = Cli::parse();
     match command {
         Commands::Get(args) => run_get(output.unwrap_or(OutputFormat::Text), args).await,
+        Commands::Run(args) => run_consumer(output.unwrap_or(OutputFormat::Text), args).await,
         Commands::List(_) => {
             let client = connect().await?;
             let items = search_all_resources(&client).await?;
@@ -949,93 +1024,180 @@ fn print_bundled_skill(output: OutputFormat) -> Result<()> {
     }
 }
 
-async fn run_get(output: OutputFormat, args: GetArgs) -> Result<ExitCode> {
-    let resource_id = args
-        .resource
-        .or(args.resource_flag)
-        .expect("clap requires a resource");
-    let call_chain =
-        collect_runtime_call_chain().context("failed to collect runtime call chain")?;
-    let mut metadata = parse_key_values("metadata", args.metadata)?;
-    for (key, value) in parse_key_values("env", args.env_vars)? {
-        metadata.insert(format!("env.{key}"), value);
-    }
-    let script_path = consumer_script::prepare_script_context(
-        derive_script_path(&call_chain),
-        args.consumer_script.as_deref(),
-        &mut metadata,
-    )?;
-    let call_chain_details = resource_access_call_chain(&call_chain);
-    let call_chain = prompt_call_chain_paths(&call_chain);
+async fn run_get(_output: OutputFormat, _args: GetArgs) -> Result<ExitCode> {
+    bail!("raw credential access is disabled because no consumer is bound. Use `plankton run RESOURCE --reason PURPOSE [--env NAME] -- COMMAND ARGS...` or the --script shortcut. The daemon identifies and binds the actual consumer before review; --consumer-script declarations alone cannot grant access")
+}
 
+fn canonical_path(path: &std::path::Path, directory: bool, label: &str) -> Result<String> {
+    let path = std::fs::canonicalize(path).with_context(|| format!("{label} path must exist"))?;
+    if (directory && !path.is_dir()) || (!directory && !path.is_file()) {
+        bail!(
+            "{label} must be a {}",
+            if directory {
+                "directory"
+            } else {
+                "regular file"
+            }
+        );
+    }
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{label} path must use UTF-8"))
+}
+
+fn interpreter_launch_path(path: &std::path::Path) -> Result<String> {
+    canonical_path(path, false, "Python interpreter")?;
+    // Python discovers pyvenv.cfg relative to the launch path. Resolving a
+    // venv symlink here would silently select the base runtime's dependencies.
+    std::path::absolute(path)
+        .context("cannot determine absolute Python interpreter path")?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("Python interpreter path must use UTF-8"))
+}
+
+fn execution_request(args: RunArgs) -> Result<ResourceExecutionRequest> {
+    execution_request_with_input(args, command_stdin::read_stdin)
+}
+
+fn execution_request_with_input(
+    args: RunArgs,
+    read_stdin: impl FnOnce() -> Result<String>,
+) -> Result<ResourceExecutionRequest> {
+    if args.resource.trim().is_empty() || args.reason.trim().is_empty() {
+        bail!("resource and reason must not be empty");
+    }
+    if let Some(name) = args.credential_env.as_deref() {
+        parse_credential_env(name).map_err(anyhow::Error::msg)?;
+    }
+    let cwd = match args.cwd {
+        Some(cwd) => cwd,
+        None => std::env::current_dir().context("cannot determine current directory")?,
+    };
+    let requested_by = args.requested_by.unwrap_or_else(default_actor);
+    if requested_by.trim().is_empty() {
+        bail!("requested-by must not be empty");
+    }
+    let (script_path, interpreter_path, command, arguments) = match args.script {
+        Some(script) => (
+            canonical_path(&script, false, "script")?,
+            interpreter_launch_path(
+                &args
+                    .python
+                    .unwrap_or_else(|| PathBuf::from("/usr/bin/python3")),
+            )?,
+            Vec::new(),
+            args.arguments,
+        ),
+        None => {
+            if args
+                .arguments
+                .first()
+                .is_none_or(|program| program.trim().is_empty())
+            {
+                bail!("run requires a consumer command after -- or a --script file");
+            }
+            (String::new(), String::new(), args.arguments, Vec::new())
+        }
+    };
+    let needs_source_stdin = plankton_core::execution::requires_source_stdin(&command);
+    if args.credential_env.is_none() && (args.input.is_some() || needs_source_stdin) {
+        bail!("the consumer needs its own stdin; choose --env NAME for credential injection so stdin can carry code or task input");
+    }
+    let cwd = canonical_path(&cwd, true, "working directory")?;
+    let command_stdin = match args.input {
+        Some(path) if path == std::path::Path::new("-") => Some(read_stdin()?),
+        Some(path) => Some(command_stdin::read_file(&path)?),
+        None if needs_source_stdin => Some(read_stdin()?),
+        None => None,
+    };
+    Ok(ResourceExecutionRequest {
+        resource_id: args.resource,
+        reason: args.reason,
+        requested_by,
+        script_path,
+        interpreter_path,
+        command,
+        credential_env: args.credential_env,
+        command_stdin,
+        cwd,
+        arguments,
+        timeout_seconds: args.timeout,
+    })
+}
+
+async fn run_consumer(output: OutputFormat, args: RunArgs) -> Result<ExitCode> {
+    let request = execution_request(args)?;
     let client = connect().await?;
-    let result = client
-        .request_resource_access(ResourceAccessRequest {
-            resource_id,
-            reason: args.reason,
-            requested_by: args.requested_by.unwrap_or_else(default_actor),
-            script_path,
-            call_chain_details,
-            call_chain,
-            metadata,
-        })
-        .await
-        .context("failed to submit access request")?;
-    let result = poll_access_until_resolved(
-        result,
-        |request_id| client.resource_access_status(request_id),
+    let result = submit_execution_and_wait(
+        client.execute_resource(request),
+        |request_id| client.resource_execution_status(request_id),
         sleep,
         trigger_request_handoff,
     )
     .await?;
-    handle_get_result(output, result)
+    handle_execution_result(output, result)
 }
 
-fn resource_access_call_chain(call_chain: &[CallChainNode]) -> Vec<ResourceAccessCallChainNode> {
-    call_chain
-        .iter()
-        .map(|node| ResourceAccessCallChainNode {
-            pid: node.pid,
-            ppid: node.ppid,
-            process_name: node.process_name.clone(),
-            executable_path: node.executable_path.clone(),
-            argv: node.argv.clone(),
-            resolved_file_path: node.resolved_file_path.clone(),
-        })
-        .collect()
-}
-
-async fn poll_access_until_resolved<Poll, PollFuture, Wait, WaitFuture, Handoff>(
-    mut result: ResourceAccessResponse,
-    mut poll: Poll,
-    mut wait: Wait,
-    mut handoff: Handoff,
-) -> Result<ResourceAccessResponse>
+async fn submit_execution_and_wait<Submit, Poll, PollFuture, Wait, WaitFuture, Handoff>(
+    submit: Submit,
+    poll: Poll,
+    wait: Wait,
+    handoff: Handoff,
+) -> Result<ResourceExecutionResponse>
 where
+    Submit: Future<Output = Result<ResourceExecutionResponse, ClientError>>,
     Poll: FnMut(String) -> PollFuture,
-    PollFuture: Future<Output = Result<ResourceAccessResponse, ClientError>>,
+    PollFuture: Future<Output = Result<ResourceExecutionResponse, ClientError>>,
     Wait: FnMut(Duration) -> WaitFuture,
     WaitFuture: Future<Output = ()>,
     Handoff: FnMut(String) -> Result<()>,
 {
-    let mut previous_human_review_required = false;
+    // The submission future is consumed once; only read-only status may be retried.
+    let result = submit.await.context(
+        "failed to submit consumer execution; do not blindly retry an ambiguous submission",
+    )?;
+    poll_execution_until_resolved(result, poll, wait, handoff).await
+}
+
+async fn poll_execution_until_resolved<Poll, PollFuture, Wait, WaitFuture, Handoff>(
+    mut result: ResourceExecutionResponse,
+    mut poll: Poll,
+    mut wait: Wait,
+    mut handoff: Handoff,
+) -> Result<ResourceExecutionResponse>
+where
+    Poll: FnMut(String) -> PollFuture,
+    PollFuture: Future<Output = Result<ResourceExecutionResponse, ClientError>>,
+    Wait: FnMut(Duration) -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+    Handoff: FnMut(String) -> Result<()>,
+{
     let mut handoff_dispatched = false;
     loop {
-        if !handoff_dispatched && !previous_human_review_required && result.human_review_required {
+        if !matches!(
+            result.state,
+            ResourceExecutionState::Pending | ResourceExecutionState::Running
+        ) {
+            return Ok(result);
+        }
+        if !handoff_dispatched
+            && result.state == ResourceExecutionState::Pending
+            && result.human_review_required
+        {
             handoff(result.request_id.clone())?;
             handoff_dispatched = true;
         }
-        previous_human_review_required = result.human_review_required;
-
-        if result.state != ResourceAccessState::Pending {
-            return Ok(result);
-        }
-
         wait(GET_POLL_INTERVAL).await;
         let request_id = result.request_id.clone();
         result = retry_transient_status(|| poll(request_id.clone()), &mut wait)
             .await
-            .with_context(|| format!("failed to query request {}", result.request_id))?;
+            .with_context(|| {
+                format!(
+                    "failed to query execution {}; do not resubmit the consumer to recover status",
+                    result.request_id
+                )
+            })?;
     }
 }
 
@@ -1613,27 +1775,52 @@ async fn search_all_resources(client: &DaemonClient) -> Result<Vec<ResourceSearc
     }
 }
 
-fn handle_get_result(output: OutputFormat, result: ResourceAccessResponse) -> Result<ExitCode> {
+fn execution_exit_code(result: &ResourceExecutionResponse) -> Result<ExitCode> {
     match result.state {
-        ResourceAccessState::Approved => {
-            let value = result
-                .value
-                .as_deref()
-                .context("daemon approved access without returning a value")?;
-            match output {
-                OutputFormat::Text => print_raw_value(value)?,
-                OutputFormat::Json | OutputFormat::Jsonl => {
-                    print_value(output, &result, String::new)?
-                }
-            }
-            Ok(ExitCode::SUCCESS)
+        ResourceExecutionState::Completed => {
+            let code = result
+                .exit_code
+                .context("completed consumer execution has no exit code")?;
+            Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
         }
-        ResourceAccessState::Denied => {
-            let note = result.decision_note.as_deref().unwrap_or("request denied");
-            bail!("access denied for {}: {note}", result.resource_id)
+        ResourceExecutionState::Failed => Ok(ExitCode::from(
+            result
+                .exit_code
+                .and_then(|code| u8::try_from(code).ok())
+                .filter(|code| *code != 0)
+                .unwrap_or(1),
+        )),
+        ResourceExecutionState::Denied => Ok(ExitCode::FAILURE),
+        ResourceExecutionState::Pending | ResourceExecutionState::Running => {
+            bail!("consumer execution has not finished")
         }
-        ResourceAccessState::Pending => bail!("access request is still pending"),
     }
+}
+
+fn handle_execution_result(
+    output: OutputFormat,
+    result: ResourceExecutionResponse,
+) -> Result<ExitCode> {
+    let code = execution_exit_code(&result)?;
+    match output {
+        OutputFormat::Text => {
+            let mut stdout = io::stdout().lock();
+            stdout
+                .write_all(result.stdout.as_bytes())
+                .context("failed to write consumer stdout")?;
+            stdout.flush().context("failed to flush consumer stdout")?;
+            let mut stderr = io::stderr().lock();
+            stderr
+                .write_all(result.stderr.as_bytes())
+                .context("failed to write consumer stderr")?;
+            if let Some(error) = &result.error {
+                writeln!(stderr, "execution failed: {error}")?;
+            }
+            stderr.flush().context("failed to flush consumer stderr")?;
+        }
+        OutputFormat::Json | OutputFormat::Jsonl => print_value(output, &result, String::new)?,
+    }
+    Ok(code)
 }
 
 fn print_search_items(output: OutputFormat, items: &[ResourceSearchItem]) -> Result<()> {
@@ -1697,17 +1884,6 @@ where
     Ok(())
 }
 
-fn print_raw_value(value: &str) -> Result<()> {
-    let mut stdout = io::stdout().lock();
-    stdout
-        .write_all(value.as_bytes())
-        .context("failed to write secret value to stdout")?;
-    stdout
-        .write_all(b"\n")
-        .context("failed to terminate secret value output")?;
-    stdout.flush().context("failed to flush stdout")
-}
-
 fn parse_key_values(kind: &str, values: Vec<String>) -> Result<BTreeMap<String, String>> {
     values
         .into_iter()
@@ -1740,32 +1916,361 @@ fn init_tracing() {
 mod tests {
     use super::*;
 
+    fn execution_response(state: ResourceExecutionState) -> ResourceExecutionResponse {
+        ResourceExecutionResponse {
+            request_id: "execution-one".into(),
+            resource_id: "secret/api".into(),
+            state,
+            human_review_required: false,
+            exit_code: Some(7),
+            stdout: "consumer result\n".into(),
+            stderr: String::new(),
+            error: None,
+        }
+    }
+
     #[test]
-    fn resource_access_call_chain_preserves_structured_process_context() {
-        let call_chain = vec![CallChainNode {
-            pid: Some(42),
-            ppid: Some(1),
-            process_name: Some("zsh".into()),
-            executable_path: Some("/bin/zsh".into()),
-            argv: vec!["/workspace/analyze.sh".into(), "--trace-id".into()],
-            resolved_file_path: Some("/workspace/analyze.sh".into()),
-            source: plankton_core::CallChainNodeSource::OsProbe,
-            previewable: true,
-            preview_status: plankton_core::CallChainPreviewStatus::PreviewReady,
-            preview_text: Some("must not cross the daemon boundary".into()),
-            preview_error: None,
-        }];
-
-        let transferred = resource_access_call_chain(&call_chain);
-
-        assert_eq!(transferred.len(), 1);
-        assert_eq!(transferred[0].pid, Some(42));
-        assert_eq!(transferred[0].process_name.as_deref(), Some("zsh"));
-        assert_eq!(transferred[0].argv, ["/workspace/analyze.sh", "--trace-id"]);
+    fn parses_run_with_literal_consumer_arguments_and_bounded_timeout() {
+        let cli = Cli::try_parse_from([
+            "plankton",
+            "run",
+            "secret/api",
+            "--script",
+            "client.py",
+            "--python",
+            "/usr/bin/python3",
+            "--cwd",
+            "/tmp",
+            "--timeout",
+            "120",
+            "--reason",
+            "Read API state",
+            "--requested-by",
+            "agent",
+            "--",
+            "--endpoint",
+            "https://api.example.test",
+            "literal;not-a-shell",
+        ])
+        .unwrap();
+        let Commands::Run(args) = cli.command else {
+            panic!("expected run")
+        };
+        assert_eq!(args.timeout, 120);
         assert_eq!(
-            transferred[0].resolved_file_path.as_deref(),
-            Some("/workspace/analyze.sh")
+            args.arguments,
+            [
+                "--endpoint",
+                "https://api.example.test",
+                "literal;not-a-shell"
+            ]
         );
+        for timeout in ["0", "301"] {
+            assert!(Cli::try_parse_from([
+                "plankton",
+                "run",
+                "secret/api",
+                "--script",
+                "client.py",
+                "--reason",
+                "test",
+                "--timeout",
+                timeout
+            ])
+            .is_err());
+        }
+    }
+
+    fn command_args(arguments: &[&str]) -> RunArgs {
+        let mut argv = vec![
+            "plankton",
+            "run",
+            "secret/api",
+            "--reason",
+            "Read API state",
+        ];
+        argv.extend_from_slice(arguments);
+        let Commands::Run(args) = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("expected run")
+        };
+        args
+    }
+
+    #[test]
+    fn command_mode_preserves_literal_arguments_and_does_not_read_stdin_by_default() {
+        for arguments in [
+            vec![
+                "--",
+                "python3",
+                "-c",
+                "import sys; print('task result')",
+                "literal;not-a-shell",
+            ],
+            vec![
+                "--env",
+                "API_TOKEN",
+                "--",
+                "bash",
+                "-c",
+                r#"python3 -c 'print("task result")'"#,
+            ],
+        ] {
+            let args = command_args(&arguments);
+            let expected = args.arguments.clone();
+            let request =
+                execution_request_with_input(args, || panic!("must not read caller stdin"))
+                    .unwrap();
+            assert_eq!(request.command, expected);
+            assert!(request.command_stdin.is_none());
+            assert!(request.script_path.is_empty());
+            assert!(request.interpreter_path.is_empty());
+        }
+    }
+
+    #[test]
+    fn stdin_programs_require_env_injection_and_capture_only_after_selection() {
+        for program in ["python3", "node", "bash"] {
+            let args = command_args(&["--", program, "-"]);
+            let error =
+                execution_request_with_input(args, || panic!("credential stdin is reserved"))
+                    .unwrap_err();
+            assert!(error.to_string().contains("--env NAME"));
+            let args = command_args(&["--env", "API_TOKEN", "--", program, "-"]);
+            let request =
+                execution_request_with_input(args, || Ok("synthetic source".into())).unwrap();
+            assert_eq!(request.command_stdin.as_deref(), Some("synthetic source"));
+            assert_eq!(request.credential_env.as_deref(), Some("API_TOKEN"));
+        }
+    }
+
+    #[test]
+    fn explicit_input_carries_task_data_without_claiming_it_is_code() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("body.json");
+        std::fs::write(&input, r#"{"message":"synthetic task input"}"#).unwrap();
+        let args = command_args(&[
+            "--env",
+            "API_TOKEN",
+            "--input",
+            input.to_str().unwrap(),
+            "--",
+            "curl",
+            "--data-binary",
+            "@-",
+            "https://api.example.test",
+        ]);
+        let request =
+            execution_request_with_input(args, || panic!("file input must not touch stdin"))
+                .unwrap();
+        assert_eq!(
+            request.command_stdin.as_deref(),
+            Some(r#"{"message":"synthetic task input"}"#)
+        );
+        let args = command_args(&[
+            "--env",
+            "API_TOKEN",
+            "--input",
+            "-",
+            "--",
+            "curl",
+            "--data-binary",
+            "@-",
+            "https://api.example.test",
+        ]);
+        assert_eq!(
+            execution_request_with_input(args, || Ok("body".into()))
+                .unwrap()
+                .command_stdin
+                .as_deref(),
+            Some("body")
+        );
+        assert!(Cli::try_parse_from([
+            "plankton",
+            "run",
+            "secret/api",
+            "--reason",
+            "test",
+            "--input",
+            "-",
+            "--",
+            "curl",
+            "https://api.example.test"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn env_injection_accepts_only_names_and_never_echoes_an_accidental_value() {
+        let args = command_args(&[
+            "--env",
+            "TOKEN=SYNTHETIC_PRIVATE_VALUE",
+            "--",
+            "python3",
+            "-c",
+            "pass",
+        ]);
+        let error =
+            execution_request_with_input(args, || panic!("invalid name must fail before input"))
+                .unwrap_err();
+        assert!(error.to_string().contains("NAME=VALUE"));
+        assert!(!format!("{error:#}").contains("SYNTHETIC_PRIVATE_VALUE"));
+        assert!(
+            Cli::try_parse_from(["plankton", "run", "secret/api", "--reason", "test"]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "plankton",
+            "run",
+            "secret/api",
+            "--reason",
+            "test",
+            "--python",
+            "/usr/bin/python3",
+            "--",
+            "echo",
+            "result"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn run_resolves_paths_but_does_not_consume_or_execute_script() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("client.py");
+        let marker = directory.path().join("must-not-exist");
+        std::fs::write(&script, format!("open({:?}, 'w').close()\n", marker)).unwrap();
+        let interpreter = directory.path().join("python3");
+        std::fs::write(&interpreter, b"test interpreter path").unwrap();
+        let args = RunArgs {
+            resource: "secret/api".into(),
+            script: Some(script.clone()),
+            python: Some(interpreter.clone()),
+            credential_env: None,
+            input: None,
+            cwd: Some(directory.path().to_path_buf()),
+            timeout: 60,
+            reason: "Read state".into(),
+            requested_by: Some("agent".into()),
+            arguments: vec!["--status".into()],
+        };
+        let request = execution_request(args).unwrap();
+        assert_eq!(
+            request.script_path,
+            script.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            request.interpreter_path,
+            std::path::absolute(&interpreter).unwrap().to_str().unwrap()
+        );
+        assert!(std::path::Path::new(&request.cwd).is_absolute());
+        assert!(!marker.exists());
+        assert_eq!(request.arguments, ["--status"]);
+        assert!(canonical_path(directory.path(), false, "script").is_err());
+        assert!(canonical_path(&script, true, "cwd").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_preserves_the_venv_interpreter_launch_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("installed-python3");
+        std::fs::write(&runtime, b"test runtime").unwrap();
+        let venv = directory.path().join("venv/bin");
+        std::fs::create_dir_all(&venv).unwrap();
+        let interpreter = venv.join("python3");
+        std::os::unix::fs::symlink(&runtime, &interpreter).unwrap();
+        let launch = interpreter_launch_path(&interpreter).unwrap();
+        assert_eq!(launch, interpreter.to_str().unwrap());
+        assert_ne!(launch, runtime.canonicalize().unwrap().to_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn legacy_get_fails_before_reading_a_declared_file_or_contacting_daemon() {
+        for output in [OutputFormat::Text, OutputFormat::Json, OutputFormat::Jsonl] {
+            let cli = Cli::try_parse_from([
+                "plankton",
+                "get",
+                "secret/api",
+                "--reason",
+                "test",
+                "--consumer-script",
+                "/does/not/exist.py",
+            ])
+            .unwrap();
+            let Commands::Get(args) = cli.command else {
+                panic!("expected get")
+            };
+            let error = run_get(output, args).await.unwrap_err().to_string();
+            assert!(error.contains("raw credential access is disabled"));
+            assert!(error.contains("plankton run"));
+            assert!(!error.contains("path must exist"));
+        }
+        for command in ["get", "request"] {
+            let cli = Cli::try_parse_from(["plankton", command, "secret/api"]).unwrap();
+            let Commands::Get(args) = cli.command else {
+                panic!("expected disabled get")
+            };
+            assert!(run_get(OutputFormat::Text, args)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("plankton run"));
+        }
+    }
+
+    #[test]
+    fn execution_exit_status_preserves_consumer_code_and_fails_closed() {
+        let mut result = execution_response(ResourceExecutionState::Completed);
+        assert_eq!(execution_exit_code(&result).unwrap(), ExitCode::from(7));
+        result.exit_code = Some(0);
+        assert_eq!(execution_exit_code(&result).unwrap(), ExitCode::SUCCESS);
+        result.exit_code = None;
+        assert!(execution_exit_code(&result).is_err());
+        for state in [
+            ResourceExecutionState::Failed,
+            ResourceExecutionState::Denied,
+        ] {
+            result.state = state;
+            assert_eq!(execution_exit_code(&result).unwrap(), ExitCode::FAILURE);
+        }
+    }
+
+    #[test]
+    fn failed_execution_preserves_nonzero_consumer_exit_but_never_returns_success() {
+        let mut result = execution_response(ResourceExecutionState::Failed);
+        assert_eq!(execution_exit_code(&result).unwrap(), ExitCode::from(7));
+        for code in [0, -1, 256] {
+            result.exit_code = Some(code);
+            assert_eq!(execution_exit_code(&result).unwrap(), ExitCode::FAILURE);
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_status_retries_never_resubmit_consumer_execution() {
+        use std::{cell::Cell, future::ready};
+        let submissions = Cell::new(0);
+        let polls = Cell::new(0);
+        let result = submit_execution_and_wait(
+            async {
+                submissions.set(submissions.get() + 1);
+                Ok(execution_response(ResourceExecutionState::Pending))
+            },
+            |id| {
+                assert_eq!(id, "execution-one");
+                polls.set(polls.get() + 1);
+                ready(if polls.get() == 1 {
+                    Err(ClientError::Unavailable("temporary".into()))
+                } else {
+                    Ok(execution_response(ResourceExecutionState::Completed))
+                })
+            },
+            |_| ready(()),
+            |_| panic!("no human review required"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.state, ResourceExecutionState::Completed);
+        assert_eq!(submissions.get(), 1);
+        assert_eq!(polls.get(), 2);
     }
 
     #[test]
@@ -2329,27 +2834,29 @@ mod tests {
         };
 
         fn response(
-            state: ResourceAccessState,
+            state: ResourceExecutionState,
             human_review_required: bool,
-        ) -> ResourceAccessResponse {
-            ResourceAccessResponse {
+        ) -> ResourceExecutionResponse {
+            ResourceExecutionResponse {
                 request_id: "request-automatic".into(),
                 resource_id: "secret/automatic".into(),
                 state,
-                value: None,
-                decision_note: None,
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
                 human_review_required,
             }
         }
 
         let responses = Rc::new(RefCell::new(
             [
-                response(ResourceAccessState::Pending, false),
-                response(ResourceAccessState::Pending, true),
-                response(ResourceAccessState::Pending, true),
-                response(ResourceAccessState::Pending, false),
-                response(ResourceAccessState::Pending, true),
-                response(ResourceAccessState::Approved, false),
+                response(ResourceExecutionState::Pending, false),
+                response(ResourceExecutionState::Pending, true),
+                response(ResourceExecutionState::Pending, true),
+                response(ResourceExecutionState::Running, false),
+                response(ResourceExecutionState::Running, false),
+                response(ResourceExecutionState::Completed, false),
             ]
             .into_iter(),
         ));
@@ -2359,8 +2866,8 @@ mod tests {
         let polls_for_poll = Rc::clone(&polls);
         let handoffs_for_dispatch = Rc::clone(&handoffs);
 
-        let result = poll_access_until_resolved(
-            response(ResourceAccessState::Pending, false),
+        let result = poll_execution_until_resolved(
+            response(ResourceExecutionState::Pending, false),
             move |_request_id| {
                 polls_for_poll.set(polls_for_poll.get() + 1);
                 ready(Ok(responses_for_poll
@@ -2377,7 +2884,7 @@ mod tests {
         .await
         .expect("automatic request should reach terminal status");
 
-        assert_eq!(result.state, ResourceAccessState::Approved);
+        assert_eq!(result.state, ResourceExecutionState::Completed);
         assert_eq!(polls.get(), 6);
         assert_eq!(
             handoffs.borrow().as_slice(),

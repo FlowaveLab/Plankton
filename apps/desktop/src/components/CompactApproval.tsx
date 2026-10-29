@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Bot, Check, ExternalLink, ShieldAlert, X } from "lucide-react";
 import { SplitPane } from "./desktop/PagePrimitives";
 import { useCallback, useEffect, useRef, useState, type JSX } from "react";
@@ -11,10 +10,16 @@ import {
   codeAgentBoundaryIndex,
 } from "../callChainPresentation";
 import { getPreviewHighlightResult } from "../codePreview";
+import {
+  executionEvidenceSources,
+  type EvidenceSource,
+} from "../executionEvidence";
 import type {
   CallChainEntry,
   CredentialExposureReport,
   DecisionCommand,
+  AccessRequest,
+  RememberExposureOptions,
   SanitizedPromptContext,
 } from "../types";
 import {
@@ -29,6 +34,7 @@ import {
 } from "./desktop/OperationsPages";
 import "./desktop/password-vault.css";
 import { ApprovalMarkdown } from "./ApprovalMarkdown";
+import { RememberExposure } from "./RememberExposure";
 
 const APPROVAL_QUEUE_EVENT = "plankton://approval-queue";
 
@@ -36,6 +42,7 @@ export type CompactApprovalRequest = {
   locale?: string;
   created_at?: string;
   resource_metadata?: Record<string, string>;
+  policy_mode?: AccessRequest["policy_mode"];
   id: string;
   resource: string;
   requested_by: string;
@@ -47,6 +54,7 @@ export type CompactApprovalRequest = {
   risk_score: number | null;
   exposure_report?: CredentialExposureReport | null;
   inline_sources?: SanitizedPromptContext["inline_sources"];
+  execution_sources?: string | null;
   exposure_policy?: CredentialExposurePolicy;
   approval_status: "pending" | "approved" | "rejected";
   evaluation_state:
@@ -72,6 +80,7 @@ export type CompactApprovalApi = {
     requestId: string,
     decision: DecisionCommand,
     note: string | null,
+    remember?: RememberExposureOptions,
   ) => Promise<void>;
   openFullDetails: (requestId: string) => Promise<void>;
   close: () => Promise<void>;
@@ -82,14 +91,14 @@ const defaultApi: CompactApprovalApi = {
   async loadRequests() {
     return invoke<CompactApprovalRequest[]>("compact_approval_requests");
   },
-  async decide(requestId, decision, note) {
-    await invoke(decision, { requestId, note });
+  async decide(requestId, decision, note, remember) {
+    await invoke(decision, { requestId, note, ...remember });
   },
   async openFullDetails(requestId) {
     await invoke("open_full_request_details", { requestId });
   },
   async close() {
-    await getCurrentWindow().hide();
+    await invoke("dismiss_approval_popup");
   },
   async subscribe(onQueueChanged) {
     return listen(APPROVAL_QUEUE_EVENT, onQueueChanged);
@@ -121,7 +130,7 @@ function CompactCallChain({
 }: {
   callChain: CallChainEntry[];
   exposureReport?: CredentialExposureReport | null;
-  inlineSources: SanitizedPromptContext["inline_sources"];
+  inlineSources: EvidenceSource[];
   zh?: boolean;
 }): JSX.Element {
   const agentBoundary = codeAgentBoundaryIndex(callChain);
@@ -160,6 +169,13 @@ function CompactCallChain({
                 <div>
                   <strong>{callChainEntryName(entry)}</strong>
                   <code>{callChainEntryPath(entry)}</code>
+                  {entry.source === "controlled_execution" ? (
+                    <small>
+                      {zh
+                        ? "Plankton 已绑定 · 批准后执行"
+                        : "Bound by Plankton · runs after approval"}
+                    </small>
+                  ) : null}
                   {argumentsList.length > 0 ? (
                     <div className="compact-approval__call-chain-args">
                       {argumentsList.map((argument, argumentIndex) => {
@@ -416,14 +432,21 @@ export function CompactApproval(props: {
     }
   }
 
-  async function decide(decision: DecisionCommand): Promise<void> {
+  async function decide(
+    decision: DecisionCommand,
+    remember?: RememberExposureOptions,
+  ): Promise<void> {
     if (!current || isSubmitting || current.approval_status !== "pending") {
       return;
     }
     setIsSubmitting(true);
     setErrorMessage(null);
     try {
-      await api.decide(current.id, decision, note.trim() || null);
+      if (remember) {
+        await api.decide(current.id, decision, note.trim() || null, remember);
+      } else {
+        await api.decide(current.id, decision, note.trim() || null);
+      }
       setNote("");
       const remaining = await loadRequests();
       const remainingAfterDecision = (remaining ?? requests).filter(
@@ -768,10 +791,30 @@ export function CompactApproval(props: {
                     />
                   </label>
 
+                  <RememberExposure
+                    key={current.id}
+                    request={{
+                      id: current.id,
+                      policy_mode: current.policy_mode ?? "manual_only",
+                      context: {
+                        resource_metadata: current.resource_metadata ?? {},
+                      },
+                      llm_suggestion: {
+                        exposure_report: current.exposure_report,
+                      },
+                    }}
+                    zh={zh}
+                    busy={isSubmitting || decisionRecorded}
+                    onApprove={(options) => decide("approve_request", options)}
+                  />
+
                   <CompactCallChain
                     callChain={current.call_chain}
                     exposureReport={current.exposure_report}
-                    inlineSources={current.inline_sources ?? []}
+                    inlineSources={executionEvidenceSources(
+                      current.execution_sources,
+                      current.inline_sources,
+                    )}
                     zh={zh}
                   />
                 </div>
@@ -848,6 +891,7 @@ const compactApprovalStyles = `
   }
   button, textarea { font: inherit; }
   .compact-approval {
+    --rule: #d4cfc7; --line: #d4cfc7; --ink: #171716; --muted-ink: #706d67; --muted: #706d67; --red: #f2381e; --vermilion: #f2381e; --surface: #fffefb; --paper: #f4f1ea; --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     box-sizing: border-box;
     height: 100vh;
     min-height: 0;
@@ -928,6 +972,7 @@ const compactApprovalStyles = `
     flex-direction: column;
     overflow: hidden;
   }
+  .compact-approval__review-scroll > * { flex-shrink: 0; }
   .compact-approval__review-scroll {
     min-height: 0;
     flex: 1 1 auto;

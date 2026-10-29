@@ -3,11 +3,11 @@ use serde::Serialize;
 
 use crate::{PolicyMode, SanitizedPromptContext};
 
-pub const PROMPT_CONTRACT_VERSION: &str = "prompt_context.v13";
+pub const PROMPT_CONTRACT_VERSION: &str = "prompt_context.v14";
 pub const REQUEST_TEMPLATE_ID: &str = "manual_review_summary";
 pub const REQUEST_TEMPLATE_VERSION: &str = "5";
 pub const LLM_ADVICE_TEMPLATE_ID: &str = "llm_advice_request";
-pub const LLM_ADVICE_TEMPLATE_VERSION: &str = "13";
+pub const LLM_ADVICE_TEMPLATE_VERSION: &str = "14";
 
 pub const DEFAULT_REQUEST_TEMPLATE: &str = r#"{% if locale == "zh-CN" %}人工审批请求
 请使用{{ i18n.current_language }}
@@ -69,9 +69,34 @@ Trust and evidence:
   as evidence of intended credential consumption. It is not an observed ancestor, proof of execution,
   or complete pipeline coverage. Do not invent a call-chain node or bind source_quote to an unrelated
   node; describe independent file evidence in chain_summary and surface summaries.
+- Credential execution admission is deterministic and separate from approval. Unbound legacy get
+  and a caller-declared script alone cannot receive credentials. Do not suggest human approval
+  as a way to bypass unsupported execution modes. An env, stdin, inline-code, heredoc or pipeline
+  delivery mode is not inherently invalid: assess the actual daemon-admitted execution plan.
+- For daemon_command_v1 and legacy daemon_python_file_v1 requests, controlled_execution nodes
+  and execution_* metadata describe the daemon-collected plan, not a requester assertion or an
+  already observed process. The daemon binds the executable, cwd, arguments, captured sources,
+  input bytes, credential injection channel and timeout. Inspect execution_sources snapshots
+  using their own node_index and source_id; do not replace them with possibly changed live files.
+  Consult the recorded execution mode for whether source bytes are executed from a snapshot or
+  file hashes are rechecked before launch. Do not claim imports or runtime behavior are frozen.
+  Credential env injection names the child environment variable, not its value. The credential
+  is supplied only by the daemon after approval. Delivery via env or stdin to the declared local
+  consumer is process_propagation level 1; determine any further propagation from the actual code.
+  An env variable containing a credential is not by itself terminal, file or LLM exposure.
+  Returned stdout/stderr reach both terminal_log and llm_context. Literal credential bytes in output
+  are withheld unless both surfaces explicitly permit them; this is not a guarantee against
+  encoding, splitting or network/persistence leaks. Assess actual credential flow on all five surfaces.
+  Do not execute the consumer during review. Imported packages, dynamic code, files, subprocesses
+  and network behavior are not sandboxed or fully captured by entrypoint hashing. Unresolved
+  decision-relevant behavior remains unknown and cannot support allow.
 - Do not deny solely because a path or text contains words such as secret, token or password.
 
 Exposure semantics (for the credential, not merely the presence of a tool):
+- Track the credential's data flow, not every side effect. Writing a constant marker such as
+  write_text('executed') or logging a fixed success message is not credential persistence/logging.
+  Cite a demonstrated credential flow or explain the specific missing evidence; never label an
+  unrelated constant write as secret exposure just because the same script also reads a secret.
 - 0: no credential exposure on this surface is established by sufficiently complete evidence.
 - 1: controlled exposure: network only to configured destinations; process propagation only to
   the declared local consumer; other surfaces only within their configured scope and notes.

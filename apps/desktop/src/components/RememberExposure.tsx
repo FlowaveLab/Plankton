@@ -12,7 +12,13 @@ import {
 import "./remember-exposure.css";
 
 export function RememberExposure(props: {
-  request: AccessRequest;
+  request: Pick<AccessRequest, "id" | "policy_mode"> & {
+    context: Pick<AccessRequest["context"], "resource_metadata">;
+    llm_suggestion?: Pick<
+      NonNullable<AccessRequest["llm_suggestion"]>,
+      "exposure_report"
+    > | null;
+  };
   zh: boolean;
   busy: boolean;
   onApprove: (options: RememberExposureOptions) => Promise<void>;

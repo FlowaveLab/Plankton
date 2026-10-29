@@ -1,10 +1,12 @@
-.desktop-workspace .remember-exposure {
+:is(.desktop-workspace, .compact-approval) .remember-exposure {
   border: 0;
   border-top: 1px solid var(--rule);
   margin: 0 0 16px;
   background: transparent;
 }
-.desktop-workspace .remember-exposure > button.remember-exposure-toggle {
+:is(.desktop-workspace, .compact-approval)
+  .remember-exposure
+  > button.remember-exposure-toggle {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -15,26 +17,28 @@
   text-align: left;
   font-weight: 600;
 }
-.desktop-workspace .remember-exposure > button.remember-exposure-toggle:hover {
+:is(.desktop-workspace, .compact-approval)
+  .remember-exposure
+  > button.remember-exposure-toggle:hover {
   color: var(--vermilion);
   background: transparent;
 }
-.desktop-workspace .remember-exposure-body {
+:is(.desktop-workspace, .compact-approval) .remember-exposure-body {
   padding: 0 0 12px;
 }
-.desktop-workspace .remember-exposure-body > p {
+:is(.desktop-workspace, .compact-approval) .remember-exposure-body > p {
   margin: 0 0 10px;
   font-size: 13px;
   line-height: 1.6;
   color: var(--muted-ink);
 }
-.desktop-workspace .remember-exposure-body fieldset {
+:is(.desktop-workspace, .compact-approval) .remember-exposure-body fieldset {
   border: 0;
   padding: 0;
   margin: 12px 0;
   min-width: 0;
 }
-.desktop-workspace
+:is(.desktop-workspace, .compact-approval)
   .remember-exposure
   .remember-exposure-body
   > button.remember-exposure-reload {
@@ -47,19 +51,21 @@
   text-decoration: underline;
   text-underline-offset: 3px;
 }
-.desktop-workspace .remember-exposure-notice {
+:is(.desktop-workspace, .compact-approval) .remember-exposure-notice {
   padding: 0;
 }
-.desktop-workspace .request-metadata-disclosure {
+:is(.desktop-workspace, .compact-approval) .request-metadata-disclosure {
   margin-top: 16px;
 }
-.desktop-workspace .request-metadata-disclosure summary {
+:is(.desktop-workspace, .compact-approval)
+  .request-metadata-disclosure
+  summary {
   cursor: pointer;
   font-size: 13px;
   font-weight: 600;
   padding: 8px 0;
 }
-.desktop-workspace .request-capture-summary {
+:is(.desktop-workspace, .compact-approval) .request-capture-summary {
   font-size: 12px;
   color: var(--muted-ink);
   line-height: 1.6;

@@ -1,3 +1,4 @@
+mod approval_notifications;
 mod batch_review;
 mod diagnostics;
 mod exposure;
@@ -8,6 +9,7 @@ mod resources;
 mod sqlite;
 mod sync;
 
+pub use approval_notifications::{ApprovalNotificationDetails, ApprovalNotificationStatus};
 pub use diagnostics::{DiagnosticRecord, InterruptedOperation, OperationStatus};
 pub use password_changes::StoredPasswordChange;
 pub use read::{AuditFeedRecord, QueueRequestRecord, RequestAuditView, SqliteReadStore};

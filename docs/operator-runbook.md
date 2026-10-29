@@ -1,12 +1,13 @@
 # Operator Runbook
 
 This runbook is the command-level path for validating the complete local
-Plankton workflow.
+Plankton workflow. Version 0.2.4 / protocol 6 is a breaking migration: validate the matching
+desktop app and CLI, and migrate raw `get` consumers to `run` before upgrading.
 
 The accepted primary flow is:
 
 ```text
-CLI list/search -> CLI get -> desktop approve/reject when needed
+CLI list/search -> CLI run -> desktop review when needed -> daemon-owned consumer execution
 ```
 
 ## Prerequisites
@@ -104,26 +105,29 @@ Expected result:
 - matching is fuzzy on the resource identifier
 - no secret value is printed
 
-### 3. Request one resource
+### 3. Execute an inspectable consumer
 
-From another terminal:
+Use a synthetic credential and a named Python fixture that reads stdin, performs
+the test task, and prints a fixed non-secret result. Do not test with real values.
 
 ```bash
-cargo run -p plankton -- get secret/api-key \
-  --reason "Need local smoke test access" \
-  --requested-by alice \
-  --metadata environment=dev
+cargo run -p plankton -- run secret/api-key \
+  --script ./smoke-consumer.py --python /usr/bin/python3 --cwd . \
+  --timeout 60 --reason "Run the local synthetic consumer smoke test" \
+  --requested-by test-agent
 ```
 
 Expected result:
 
-- Plankton automatically captures the runtime call chain during request submission
-- if the request needs review, Plankton hands off to the desktop UI and keeps the request pending until a final decision is recorded
-- on `allow + resolve value success`, default text `stdout` prints only the raw secret value
-- if you run the same command with `--output json`, the result is a minimal `get` envelope rather than a full request or audit dump
-- the resolved value comes from the local secret catalog runtime resolver, not from SQLite, audit records, or provider payloads
-- `deny`, `pending`, or resolver errors keep `stdout` empty and report status or errors separately
-- when a deny decision carries a reason or note, the CLI appends that reason to the deny error; otherwise the deny output stays concise
+- source, interpreter, arguments and working directory pass daemon admission before review
+- the CLI submits once and polls the execution ID; human review dispatches at most once
+- approval executes the bound consumer with the credential on stdin or its configured environment variable
+- text output contains only consumer stdout/stderr, and exit status matches the consumer
+- JSON/JSONL contains execution state and output, with no `value` field
+- changed bound files, unknown consumers and raw `get` are rejected
+- recognized inline/wrapped commands and stdin source with `--env` are inspected and admitted when evidence is complete
+- `--input FILE|-` with `--env` captures bounded task input, classified separately from program source
+- transient status failures retry status reads without replaying execution
 
 ### 4. Approve or reject in the desktop UI when review is required
 
@@ -145,7 +149,7 @@ Back in the terminal output and desktop UI:
 
 Expected result after approval:
 
-- the terminal prints only the resolved secret value on `stdout`
+- the terminal prints the consumer result without a credential value
 - the desktop request audit shows the submission event and the approval event
 
 Expected result after rejection:
@@ -159,8 +163,9 @@ Expected result after rejection:
 - successful exit for `make fmt-check`, `make check`, `make build`, `make test`, and when needed `make desktop-build`
 - CLI `list` output showing resource identifiers without secret values
 - CLI `search` output showing filtered identifiers without secret values
-- successful `get` text output showing only one raw value on `stdout`
-- `get --output json` showing a minimal value envelope instead of a request/status dump
+- successful `run` text output showing only the synthetic consumer result
+- `run --output json` showing execution status/output and no raw value field
+- disabled `get` and unsupported consumers failing before any credential resolution
 - the same request visible in the desktop queue
 - desktop approval or rejection action recorded in the UI
 - desktop detail and request audit views after the decision
@@ -168,9 +173,9 @@ Expected result after rejection:
 ## Current behavior
 
 - manual, assisted, and LLM-automatic policies are active and audited
-- ACP supports Codex, Claude Code, and OpenCode with `latest`, pinned, and
+- ACP supports Codex, Claude Code, OpenCode, and Pi with `latest`, pinned, and
   custom executable profiles
-- the AI CLI is limited to metadata-only list/search, approved get, and
+- the AI CLI is limited to metadata-only list/search, reviewed consumer execution, and
   password-draft creation; final writes and approval decisions remain human UI
   operations
 - local password writes use the bundled KeePassXC/KDBX4 engine; 1Password and

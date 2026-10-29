@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use axum::{extract::State, routing::post, Json, Router};
 use plankton_client::{ClientError, DaemonClient};
@@ -13,7 +13,7 @@ use plankton_protocol::{
     passwords::{
         PasswordDestination, PasswordDraftInput, PasswordDraftState, SelectedPasswordEntry,
     },
-    resources::{ResourceAccessRequest, ResourceAccessResponse, ResourceAccessState},
+    resources::{ResourceExecutionRequest, ResourceExecutionResponse, ResourceExecutionState},
     PROTOCOL_VERSION,
 };
 use plankton_store::SqliteStore;
@@ -151,6 +151,7 @@ async fn client_reports_daemon_absence_without_retrying_forever() {
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn daemon_response_exposes_human_review_required() {
     let temp = tempdir().expect("temp dir");
@@ -165,20 +166,23 @@ async fn daemon_response_exposes_human_review_required() {
     .expect("daemon starts");
     let client = DaemonClient::from_state(running.state().clone()).expect("client");
 
+    let script = temp.path().join("consumer.py");
+    std::fs::write(&script, "import sys\nprint(len(sys.stdin.read()))\n").unwrap();
     let response = client
-        .request_resource_access(ResourceAccessRequest {
+        .execute_resource(ResourceExecutionRequest {
             resource_id: "secret/manual-review-contract".into(),
             reason: "verify derived review transport".into(),
             requested_by: "integration-test".into(),
-            script_path: None,
-            call_chain_details: Vec::new(),
-            call_chain: Vec::new(),
-            metadata: BTreeMap::new(),
+            script_path: script.display().to_string(),
+            interpreter_path: "/usr/bin/python3".into(),
+            cwd: temp.path().display().to_string(),
+            arguments: Vec::new(),
+            timeout_seconds: 60,
+            ..Default::default()
         })
         .await
-        .expect("manual access response");
-
-    assert_eq!(response.state, ResourceAccessState::Pending);
+        .expect("manual execution response");
+    assert_eq!(response.state, ResourceExecutionState::Pending);
     assert!(response.human_review_required);
 
     running.shutdown().await.expect("shutdown");
@@ -409,6 +413,7 @@ async fn manual_batch_draft_status_reports_resources_only_after_human_save() {
     running.shutdown().await.expect("shutdown");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn access_request_returns_pending_before_provider_is_released() {
     let temp = tempdir().expect("temp dir");
@@ -449,26 +454,30 @@ async fn access_request_returns_pending_before_provider_is_released() {
     )
     .await
     .expect("daemon starts");
-    let request = RequestEnvelope::new(ResourceAccessRequest {
+    let script = temp.path().join("consumer.py");
+    std::fs::write(&script, "import sys\nprint(len(sys.stdin.read()))\n").unwrap();
+    let request = RequestEnvelope::new(ResourceExecutionRequest {
         resource_id: "secret/blocked-provider".into(),
         reason: "verify durable asynchronous evaluation".into(),
         requested_by: "integration-test".into(),
-        script_path: None,
-        call_chain_details: Vec::new(),
-        call_chain: Vec::new(),
-        metadata: BTreeMap::new(),
+        script_path: script.display().to_string(),
+        interpreter_path: "/usr/bin/python3".into(),
+        cwd: temp.path().display().to_string(),
+        arguments: Vec::new(),
+        timeout_seconds: 60,
+        ..Default::default()
     });
     let endpoint = running.state().endpoint.clone();
     let token = running.state().bearer_token.clone();
     let mut access_task = tokio::spawn(async move {
         reqwest::Client::new()
-            .post(format!("{endpoint}/v1/resources/access"))
+            .post(format!("{endpoint}/v1/resources/execute"))
             .bearer_auth(token)
             .json(&request)
             .send()
             .await
             .expect("access response")
-            .json::<ResponseEnvelope<ResourceAccessResponse>>()
+            .json::<ResponseEnvelope<ResourceExecutionResponse>>()
             .await
             .expect("typed access response")
     });
@@ -511,10 +520,9 @@ async fn access_request_returns_pending_before_provider_is_released() {
     assert!(matches!(
         response,
         ResponseEnvelope::Success {
-            data: ResourceAccessResponse {
-                state: ResourceAccessState::Pending,
+            data: ResourceExecutionResponse {
+                state: ResourceExecutionState::Pending,
                 human_review_required: false,
-                value: None,
                 ..
             },
             ..

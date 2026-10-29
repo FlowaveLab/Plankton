@@ -3,14 +3,13 @@ use std::{collections::BTreeMap, io, path::Path, time::UNIX_EPOCH};
 use axum::{extract::State, Json};
 use chrono::Utc;
 use plankton_core::{
-    default_value_resolver, is_direct_access, list_local_secret_catalog, load_settings,
-    local_secret_catalog_path,
+    is_direct_access, list_local_secret_catalog, load_settings, local_secret_catalog_path,
     resources::{
         search::{ResourceSearchEngine, SearchQuery},
         BackendKind, ResourceDocument,
     },
-    AccessRequest, ApprovalStatus, AuditAction, ImportedSecretReference, LocalSecretCatalog,
-    LocalSecretLiteralEntry, PolicyMode, RequestContext, ValueResolver,
+    AccessRequest, ApprovalStatus, ImportedSecretReference, LocalSecretCatalog,
+    LocalSecretLiteralEntry, PolicyMode, RequestContext,
 };
 use plankton_protocol::{
     daemon::{RequestEnvelope, ResponseEnvelope},
@@ -22,9 +21,7 @@ use plankton_protocol::{
     },
     PROTOCOL_VERSION,
 };
-use plankton_store::{
-    BackendBindingRecord, RequestQueryResult, SqliteStore, StoreError, VaultManifestRecord,
-};
+use plankton_store::{BackendBindingRecord, SqliteStore, StoreError, VaultManifestRecord};
 
 use crate::server::ServerState;
 
@@ -141,8 +138,25 @@ pub async fn search_resources(
 }
 
 pub async fn access_resource(
+    State(_state): State<ServerState>,
+    Json(request): Json<RequestEnvelope<ResourceAccessRequest>>,
+) -> Json<ResponseEnvelope<ResourceAccessResponse>> {
+    if let Err(error) = request.validate_version() {
+        return Json(failure(
+            request.correlation_id,
+            ErrorCode::ProtocolMismatch,
+            error.to_string(),
+            false,
+        ));
+    }
+    Json(failure(request.correlation_id, ErrorCode::InvalidRequest,
+        "Unbound credential retrieval is disabled. Use plankton run with a collected command; a declared consumer path alone cannot authorize credential delivery.".into(), false))
+}
+
+pub(super) async fn admitted_access_resource(
     State(state): State<ServerState>,
     Json(request): Json<RequestEnvelope<ResourceAccessRequest>>,
+    execution_nodes: Vec<plankton_core::CallChainNode>,
 ) -> Json<ResponseEnvelope<ResourceAccessResponse>> {
     if let Err(error) = request.validate_version() {
         return Json(failure(
@@ -220,6 +234,12 @@ pub async fn access_resource(
     }
     let (tags, resource_metadata) = resource_annotations(catalog, &request.payload.resource_id);
     let mut context = resource_access_context(request.payload, tags, resource_metadata);
+    context.call_chain = execution_nodes;
+    if let Some(plan_id) = context.metadata.get("execution_plan_id").cloned() {
+        context
+            .resource_metadata
+            .insert("execution_admission_id".into(), plan_id);
+    }
     let fingerprint_key = plankton_core::exposure::EXPOSURE_CATALOG_FINGERPRINT_KEY;
     context.metadata.remove(fingerprint_key);
     if let Some(fingerprint) = fingerprint {
@@ -271,34 +291,13 @@ pub async fn access_resource(
                 ));
             }
         };
-        let resource_id = approved.context.resource.clone();
-        let resolved = tokio::task::spawn_blocking(move || {
-            let resolver = default_value_resolver()?;
-            resolver.resolve(&resource_id)
-        })
-        .await;
-        return match resolved {
-            Ok(Ok(value)) => {
-                let mut response = response_from_request(
-                    &approved,
-                    Some("Direct field: approval bypassed by its exposure policy.".into()),
-                );
-                response.value = Some(value);
-                Json(success(correlation_id, response))
-            }
-            Ok(Err(error)) => Json(failure(
-                correlation_id,
-                ErrorCode::BackendFailed,
-                error.to_string(),
-                true,
-            )),
-            Err(error) => Json(failure(
-                correlation_id,
-                ErrorCode::Internal,
-                format!("resource resolver task failed: {error}"),
-                true,
-            )),
-        };
+        return Json(success(
+            correlation_id,
+            response_from_request(
+                &approved,
+                Some("Direct field: execution still requires verified consumer evidence.".into()),
+            ),
+        ));
     }
     let submitted = state
         .store
@@ -398,7 +397,7 @@ fn core_call_chain_node(node: ResourceAccessCallChainNode) -> plankton_core::Cal
 }
 
 pub async fn access_status(
-    State(state): State<ServerState>,
+    State(_state): State<ServerState>,
     Json(request): Json<RequestEnvelope<ResourceAccessStatusRequest>>,
 ) -> Json<ResponseEnvelope<ResourceAccessResponse>> {
     if let Err(error) = request.validate_version() {
@@ -409,105 +408,8 @@ pub async fn access_status(
             false,
         ));
     }
-    let correlation_id = request.correlation_id;
-    let result = match state.store.get_request(&request.payload.request_id).await {
-        Ok(result) => result,
-        Err(StoreError::NotFound(_)) => {
-            return Json(failure(
-                correlation_id,
-                ErrorCode::NotFound,
-                "access request was not found".into(),
-                false,
-            ));
-        }
-        Err(error) => {
-            return Json(failure(
-                correlation_id,
-                ErrorCode::StorageFailed,
-                error.to_string(),
-                true,
-            ));
-        }
-    };
-    let note = decision_note(&result);
-    if result.request.approval_status != ApprovalStatus::Approved {
-        return Json(success(
-            correlation_id,
-            response_from_request(&result.request, note),
-        ));
-    }
-    match resource_backend_enabled(&state.store, &result.request.context.resource).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return Json(failure(
-                correlation_id,
-                ErrorCode::BackendUnavailable,
-                "the resource is not available from an enabled credential backend".into(),
-                false,
-            ));
-        }
-        Err(error) => {
-            return Json(failure(
-                correlation_id,
-                ErrorCode::StorageFailed,
-                error.to_string(),
-                true,
-            ));
-        }
-    }
-
-    let resource_id = result.request.context.resource.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
-        let resolver = default_value_resolver()?;
-        resolver.resolve(&resource_id)
-    })
-    .await;
-    match resolved {
-        Ok(Ok(value)) => {
-            let mut response = response_from_request(&result.request, note);
-            response.value = Some(value);
-            Json(success(correlation_id, response))
-        }
-        Ok(Err(error)) => {
-            let diagnostic = PlanktonError {
-                code: ErrorCode::BackendFailed,
-                user_message: "credential provider could not resolve the approved resource"
-                    .to_string(),
-                internal_message: Some(error.to_string()),
-                public_context: BTreeMap::new(),
-                internal_context: BTreeMap::from([(
-                    "resource_id".to_string(),
-                    result.request.context.resource.clone(),
-                )]),
-                severity: ErrorSeverity::Error,
-                retryable: true,
-                timestamp: Utc::now(),
-                correlation_id,
-                source: ErrorSource::Backend {
-                    backend_id: "credential_backend".to_string(),
-                },
-            };
-            if let Err(store_error) = state.store.record_diagnostic_error(&diagnostic).await {
-                return Json(failure(
-                    correlation_id,
-                    ErrorCode::StorageFailed,
-                    format!("failed to persist provider diagnostic: {store_error}"),
-                    true,
-                ));
-            }
-            Json(ResponseEnvelope::Failure {
-                protocol_version: PROTOCOL_VERSION,
-                correlation_id,
-                error: diagnostic.ai_safe(),
-            })
-        }
-        Err(error) => Json(failure(
-            correlation_id,
-            ErrorCode::Internal,
-            format!("resource resolver task failed: {error}"),
-            true,
-        )),
-    }
+    Json(failure(request.correlation_id, ErrorCode::InvalidRequest,
+        "Unbound credential retrieval is disabled, including previously approved requests. Use plankton run and execution status.".into(), false))
 }
 
 async fn open_store() -> anyhow::Result<(plankton_core::PlanktonSettings, SqliteStore)> {
@@ -625,7 +527,10 @@ async fn ensure_resource_index_hierarchy(
     Ok(())
 }
 
-async fn resource_backend_enabled(store: &SqliteStore, resource_id: &str) -> anyhow::Result<bool> {
+pub(super) async fn resource_backend_enabled(
+    store: &SqliteStore,
+    resource_id: &str,
+) -> anyhow::Result<bool> {
     let resource_id = resource_id.to_string();
     let backend = tokio::task::spawn_blocking(move || {
         let catalog = list_local_secret_catalog()?;
@@ -802,7 +707,7 @@ fn catalog_generation_for_path(path: &Path) -> io::Result<u64> {
     Ok(duration.as_secs() ^ u64::from(duration.subsec_nanos()))
 }
 
-fn resource_annotations(
+pub(super) fn resource_annotations(
     catalog: LocalSecretCatalog,
     resource_id: &str,
 ) -> (Vec<String>, BTreeMap<String, String>) {
@@ -857,16 +762,7 @@ fn submission_response_from_request(request: &AccessRequest) -> ResourceAccessRe
     response
 }
 
-fn decision_note(result: &RequestQueryResult) -> Option<String> {
-    result
-        .audit_records
-        .iter()
-        .rev()
-        .find(|record| record.action == AuditAction::ApprovalRecorded)
-        .and_then(|record| record.note.clone())
-}
-
-fn success<T>(correlation_id: uuid::Uuid, data: T) -> ResponseEnvelope<T> {
+pub(super) fn success<T>(correlation_id: uuid::Uuid, data: T) -> ResponseEnvelope<T> {
     ResponseEnvelope::Success {
         protocol_version: PROTOCOL_VERSION,
         correlation_id,
@@ -874,7 +770,7 @@ fn success<T>(correlation_id: uuid::Uuid, data: T) -> ResponseEnvelope<T> {
     }
 }
 
-fn failure<T>(
+pub(super) fn failure<T>(
     correlation_id: uuid::Uuid,
     code: ErrorCode,
     message: String,

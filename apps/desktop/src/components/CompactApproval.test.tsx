@@ -4,6 +4,8 @@ import { act, type ReactNode } from "react";
 import ReactDOM from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { defaultExposurePolicy } from "./ExposurePolicy";
+
 import {
   CompactApproval,
   type CompactApprovalApi,
@@ -117,6 +119,56 @@ afterEach(() => {
 });
 
 describe("CompactApproval", () => {
+  it("approves with the edited and expected exposure policies from the human popup", async () => {
+    const api = createApi([
+      { ...firstRequest, locale: "zh-CN", policy_mode: "llm_automatic" },
+    ]);
+    const view = render(<CompactApproval api={api} />);
+    await flush();
+    act(() =>
+      view.container
+        .querySelector<HTMLButtonElement>(".remember-exposure-toggle")!
+        .click(),
+    );
+    const editor =
+      view.container.querySelector<HTMLElement>(".remember-exposure")!;
+    act(() =>
+      editor
+        .querySelector("canvas")!
+        .dispatchEvent(
+          new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }),
+        ),
+    );
+    const controlled = Array.from(
+      editor.querySelectorAll<HTMLInputElement>('input[type="radio"]'),
+    ).find((input) =>
+      input.parentElement?.textContent?.includes("1 · 受控使用"),
+    )!;
+    act(() => controlled.click());
+    const input = editor.querySelector<HTMLTextAreaElement>(
+      ".exposure-network-allowlist textarea",
+    )!;
+    act(() => {
+      Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        "value",
+      )!.set!.call(input, "domain:api.example.com");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => button(editor, "通过并记住暴露域").click());
+    expect(api.decide).toHaveBeenCalledWith(
+      "request-1",
+      "approve_request",
+      null,
+      expect.objectContaining({
+        expectedExposurePolicy: defaultExposurePolicy(),
+        exposurePolicy: expect.objectContaining({ access_mode: "protected" }),
+      }),
+    );
+    expect(api.close).toHaveBeenCalled();
+    view.unmount();
+  });
+
   it("uses the request locale and readable identity, rendering Markdown emphasis and inline code", async () => {
     const api = createApi([
       {
@@ -485,117 +537,137 @@ describe("CompactApproval", () => {
     view.unmount();
   });
 
-  it("shows the same complete evidence references as the detailed review", async () => {
-    const api = createApi([
-      {
-        ...firstRequest,
-        inline_sources: [
-          {
-            source_id: "inline:python",
-            node_index: 2,
-            argument_index: 2,
-            language: "python",
-            lines: [
-              { line: 1, text: "from urllib.request import urlopen" },
+  it.each(["historical", "daemon"])(
+    "shows complete %s source evidence references",
+    async (sourceKind) => {
+      const api = createApi([
+        {
+          ...firstRequest,
+          execution_sources:
+            sourceKind === "daemon"
+              ? JSON.stringify([
+                  {
+                    source_id: "inline:python",
+                    node_index: 2,
+                    language: "python",
+                    kind: "stdin",
+                    binding: "frozen",
+                    content:
+                      'from urllib.request import urlopen\nresponse = urlopen("https://api.example.test/v1")',
+                  },
+                ])
+              : undefined,
+          inline_sources:
+            sourceKind === "historical"
+              ? [
+                  {
+                    source_id: "inline:python",
+                    node_index: 2,
+                    argument_index: 2,
+                    language: "python",
+                    lines: [
+                      { line: 1, text: "from urllib.request import urlopen" },
+                      {
+                        line: 2,
+                        text: 'response = urlopen("https://api.example.test/v1")',
+                      },
+                    ],
+                  },
+                ]
+              : [],
+          exposure_report: {
+            chain_summary:
+              "The command hands control to a network-capable script.",
+            node_assessments: [
               {
-                line: 2,
-                text: 'response = urlopen("https://api.example.test/v1")',
+                node_index: 2,
+                summary: "The shell launches the inline Python program.",
+                capabilities: ["subprocess launch", "network request"],
+              },
+            ],
+            surfaces: [
+              {
+                surface: "process_propagation",
+                actual_level: 1,
+                evidence_state: "observed",
+                summary: "Python receives the command argument.",
+                annotations: [
+                  {
+                    reason: "This exact argument starts the Python program.",
+                    target: {
+                      kind: "argument_quote",
+                      node_index: 2,
+                      argument_index: 2,
+                      quote: "python3",
+                      occurrence: 0,
+                    },
+                  },
+                ],
+              },
+              {
+                surface: "network",
+                actual_level: 1,
+                evidence_state: "observed",
+                summary: "The inline source performs a network request.",
+                annotations: [
+                  {
+                    reason: "This exact source expression opens the URL.",
+                    target: {
+                      kind: "source_quote",
+                      node_index: 2,
+                      source_id: "inline:python",
+                      start_line: 2,
+                      end_line: 2,
+                      quote: "urlopen",
+                      occurrence: 0,
+                    },
+                  },
+                ],
               },
             ],
           },
-        ],
-        exposure_report: {
-          chain_summary:
-            "The command hands control to a network-capable script.",
-          node_assessments: [
-            {
-              node_index: 2,
-              summary: "The shell launches the inline Python program.",
-              capabilities: ["subprocess launch", "network request"],
-            },
-          ],
-          surfaces: [
-            {
-              surface: "process_propagation",
-              actual_level: 1,
-              evidence_state: "observed",
-              summary: "Python receives the command argument.",
-              annotations: [
-                {
-                  reason: "This exact argument starts the Python program.",
-                  target: {
-                    kind: "argument_quote",
-                    node_index: 2,
-                    argument_index: 2,
-                    quote: "python3",
-                    occurrence: 0,
-                  },
-                },
-              ],
-            },
-            {
-              surface: "network",
-              actual_level: 1,
-              evidence_state: "observed",
-              summary: "The inline source performs a network request.",
-              annotations: [
-                {
-                  reason: "This exact source expression opens the URL.",
-                  target: {
-                    kind: "source_quote",
-                    node_index: 2,
-                    source_id: "inline:python",
-                    start_line: 2,
-                    end_line: 2,
-                    quote: "urlopen",
-                    occurrence: 0,
-                  },
-                },
-              ],
-            },
-          ],
         },
-      },
-    ]);
-    const view = render(<CompactApproval api={api} />);
-    await flush();
+      ]);
+      const view = render(<CompactApproval api={api} />);
+      await flush();
 
-    expect(view.container.textContent).toContain("Automatic guidance");
-    expect(view.container.textContent).toContain(
-      "The command hands control to a network-capable script.",
-    );
-    expect(view.container.textContent).toContain(
-      "The shell launches the inline Python program.",
-    );
-    expect(view.container.textContent).toContain(
-      "subprocess launch · network request",
-    );
-    expect(
-      view.container.querySelector(
-        '.compact-approval__reference-scope [aria-label="Precise node evidence"]',
-      ),
-    ).not.toBeNull();
-    expect(
-      view.container.querySelector(
-        '.request-evidence-workbench__command mark[data-reference-ids~="1"]',
-      )?.textContent,
-    ).toContain("python3");
-    expect(
-      view.container.querySelector(
-        '.request-evidence-workbench__origin mark[data-reference-ids~="2"]',
-      )?.textContent,
-    ).toContain("urlopen");
-    expect(
-      view.container.querySelector('button[aria-label="Locate evidence 1"]'),
-    ).not.toBeNull();
-    expect(view.container.textContent).toContain(
-      "This exact argument starts the Python program.",
-    );
-    expect(view.container.textContent).toContain(
-      "This exact source expression opens the URL.",
-    );
-    view.unmount();
-  });
+      expect(view.container.textContent).toContain("Automatic guidance");
+      expect(view.container.textContent).toContain(
+        "The command hands control to a network-capable script.",
+      );
+      expect(view.container.textContent).toContain(
+        "The shell launches the inline Python program.",
+      );
+      expect(view.container.textContent).toContain(
+        "subprocess launch · network request",
+      );
+      expect(
+        view.container.querySelector(
+          '.compact-approval__reference-scope [aria-label="Precise node evidence"]',
+        ),
+      ).not.toBeNull();
+      expect(
+        view.container.querySelector(
+          '.request-evidence-workbench__command mark[data-reference-ids~="1"]',
+        )?.textContent,
+      ).toContain("python3");
+      expect(
+        view.container.querySelector(
+          '.request-evidence-workbench__origin mark[data-reference-ids~="2"]',
+        )?.textContent,
+      ).toContain("urlopen");
+      expect(
+        view.container.querySelector('button[aria-label="Locate evidence 1"]'),
+      ).not.toBeNull();
+      expect(view.container.textContent).toContain(
+        "This exact argument starts the Python program.",
+      );
+      expect(view.container.textContent).toContain(
+        "This exact source expression opens the URL.",
+      );
+      view.unmount();
+    },
+  );
 
   it("uses one reachable review scroller while keeping decision actions outside", async () => {
     const api = createApi([firstRequest]);

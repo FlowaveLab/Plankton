@@ -53,4 +53,22 @@ describe("callChainPresentation", () => {
       }),
     ).toBe("python3");
   });
+
+  it("recognizes Pi process and package paths without treating unrelated Python as Pi", () => {
+    expect(isCodeAgentEntry({ process_name: "pi" })).toBe(true);
+    expect(isCodeAgentEntry({ process_name: "pi-acp" })).toBe(true);
+    expect(
+      isCodeAgentEntry({
+        process_name: "node",
+        resolved_file_path:
+          "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+      }),
+    ).toBe(true);
+    expect(
+      isCodeAgentEntry({
+        process_name: "python3",
+        resolved_file_path: "/workspace/pi.py",
+      }),
+    ).toBe(false);
+  });
 });

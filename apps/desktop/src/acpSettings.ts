@@ -65,7 +65,9 @@ export function buildAcpProgramSummary(
       ? "@zed-industries/claude-code-acp"
       : profile.agent_kind === "open_code"
         ? "opencode-ai"
-        : CODEX_ACP_PACKAGE;
+        : profile.agent_kind === "pi"
+          ? "pi-acp"
+          : CODEX_ACP_PACKAGE;
   const selector =
     profile.version_mode === "pinned" ? profile.version : "latest";
   const currentProgram =

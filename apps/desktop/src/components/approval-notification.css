@@ -1,9 +1,9 @@
-/* A small companion to the desktop's paper, ink, and vermilion palette. */
+/* A 320 × 170 companion to the desktop's paper, ink, and vermilion palette. */
 .approval-notification {
   --notification-ink: #171716;
   --notification-paper: #fffefb;
   --notification-muted: #706d67;
-  --notification-rule: #cfcac1;
+  --notification-rule: #d9d4cc;
   --notification-accent: #f2381e;
   box-sizing: border-box;
   display: flex;
@@ -13,177 +13,166 @@
   min-height: 0;
   overflow: hidden;
   border: 1px solid var(--notification-rule);
-  border-top: 3px solid var(--notification-accent);
+  border-top: 2px solid var(--notification-accent);
   background: var(--notification-paper);
   color: var(--notification-ink);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font:
+    11px/1.35 -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 .approval-notification * {
   box-sizing: border-box;
 }
 .approval-notification button {
+  min-height: 0;
   cursor: pointer;
+  border: 0;
   border-radius: 0;
+  background: transparent;
+  color: inherit;
   font: inherit;
   transition: background 120ms ease;
 }
 .approval-notification button:focus-visible {
   outline: 2px solid var(--notification-accent);
-  outline-offset: 2px;
+  outline-offset: 1px;
 }
 .approval-notification button:disabled {
   cursor: default;
   opacity: 0.55;
 }
+.approval-notification button:hover:not(:disabled) {
+  background: #f0ece5;
+}
 .approval-notification__header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 12px 14px 0;
-}
-.approval-notification__mark {
-  display: flex;
-  color: var(--notification-accent);
+  gap: 6px;
+  padding: 5px 8px 0 11px;
+  flex: 0 0 29px;
 }
 .approval-notification__header > strong {
-  font-size: 10px;
-  font-weight: 750;
-  letter-spacing: 0.12em;
+  font-size: 12px;
+  font-weight: 650;
 }
-.approval-notification__count {
+.approval-notification__stage-icon {
+  flex: none;
+}
+.approval-notification[data-stage="evaluating"]
+  .approval-notification__stage-icon {
+  color: var(--notification-accent);
+  animation: approval-notification-spin 1.5s linear infinite;
+}
+.approval-notification[data-stage="failed"] .approval-notification__stage-icon,
+.approval-notification[data-stage="rejected"]
+  .approval-notification__stage-icon {
+  color: var(--notification-accent);
+}
+.approval-notification__brand {
   margin-left: auto;
   color: var(--notification-muted);
-  font-size: 10px;
-  white-space: nowrap;
+  font-size: 8px;
+  letter-spacing: 0.08em;
 }
-.approval-notification__close {
+.approval-notification .approval-notification__close {
   display: grid;
   place-items: center;
-  width: 26px;
-  height: 26px;
+  width: 22px;
+  height: 22px;
   padding: 0;
-  border: 0;
   color: var(--notification-muted);
-  background: transparent;
-}
-.approval-notification__close:hover {
-  background: #f4f1ea;
 }
 .approval-notification__content {
   flex: 1;
   min-height: 0;
-  padding: 12px 18px 8px;
-  overflow: auto;
+  padding: 3px 12px 0;
+  overflow: hidden;
 }
-.approval-notification h1 {
-  margin: 0 0 10px;
-  font-family: Georgia, "Times New Roman", serif;
-  font-size: 21px;
-  font-weight: 500;
-  line-height: 1.2;
-  letter-spacing: -0.025em;
-}
-.approval-notification:lang(zh-CN) h1 {
-  font-family: inherit;
-  font-size: 20px;
-  font-weight: 650;
-  letter-spacing: 0;
+.approval-notification__identity {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 5px;
 }
 .approval-notification__resource {
   display: block;
+  min-width: 0;
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font:
-    11px/1.5 ui-monospace,
-    SFMono-Regular,
-    Menlo,
-    monospace;
-  color: var(--notification-ink);
+  font-size: 11px;
+  font-weight: 650;
 }
-.approval-notification__reason {
+.approval-notification__requester {
+  max-width: 36%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--notification-muted);
+  font-size: 9px;
+}
+.approval-notification__reason,
+.approval-notification__decision {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  margin: 6px 0 8px;
-  color: var(--notification-muted);
-  font-size: 12px;
-  line-height: 1.5;
+  margin: 0 0 4px;
+  line-height: 1.4;
   overflow-wrap: anywhere;
 }
-.approval-notification__requester {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  margin: 0;
-  font-size: 11px;
-}
-.approval-notification__requester > span {
-  flex-shrink: 0;
+.approval-notification__reason > span,
+.approval-notification__decision > span {
   color: var(--notification-muted);
-}
-.approval-notification__requester > strong {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 550;
 }
 .approval-notification__footer {
   display: flex;
+  flex: 0 0 25px;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  border-top: 1px solid #e8e4dc;
-  padding: 11px 16px 13px;
-  background: #f8f6f1;
+  gap: 8px;
+  padding: 0 8px 5px;
 }
-.approval-notification__later {
-  min-height: 32px;
-  padding: 5px 7px;
-  border: 0;
+.approval-notification .approval-notification__mute {
+  padding: 3px 4px;
   color: var(--notification-muted);
-  background: transparent;
-  font-size: 12px !important;
+  font-size: 10px;
 }
-.approval-notification__later:hover {
-  color: var(--notification-ink);
-  background: #eae6de;
-}
-.approval-notification__open {
-  display: flex;
+.approval-notification .approval-notification__open {
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
-  gap: 10px;
-  min-height: 33px;
-  padding: 7px 12px;
-  border: 1px solid var(--notification-ink);
-  color: var(--notification-paper);
-  background: var(--notification-ink);
-  font-size: 12px !important;
-  font-weight: 600 !important;
-}
-.approval-notification__open:hover {
-  background: #393936;
+  gap: 3px;
+  padding: 3px 4px;
+  font-size: 10px;
 }
 .approval-notification__error {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 7px;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0;
   color: #ad2b18;
-  font-size: 11px;
+  font-size: 10px;
+  line-height: 1.3;
 }
 .approval-notification__error button {
-  border: 0;
-  background: transparent;
-  color: inherit;
+  padding: 0;
   text-decoration: underline;
+}
+@keyframes approval-notification-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 @media (prefers-reduced-motion: reduce) {
   .approval-notification button {
     transition: none;
+  }
+  .approval-notification[data-stage="evaluating"]
+    .approval-notification__stage-icon {
+    animation: none;
   }
 }

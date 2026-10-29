@@ -1,9 +1,14 @@
 import type { DashboardData } from "./types";
 
-export type DesktopSurface = "compact" | "password-change" | "main";
+export type DesktopSurface =
+  | "compact"
+  | "notification"
+  | "password-change"
+  | "main";
 
 export function surfaceForWindowLabel(label: string): DesktopSurface {
   if (label === "approval") return "compact";
+  if (label === "approval-notification") return "notification";
   if (label === "password-change") return "password-change";
   return "main";
 }

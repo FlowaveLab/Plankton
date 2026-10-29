@@ -20,7 +20,8 @@ use plankton_protocol::{
     },
     resources::{
         ResourceAccessRequest, ResourceAccessResponse, ResourceAccessStatusRequest,
-        ResourceSearchRequest, ResourceSearchResponse,
+        ResourceExecutionRequest, ResourceExecutionResponse, ResourceSearchRequest,
+        ResourceSearchResponse,
     },
     PROTOCOL_VERSION,
 };
@@ -130,6 +131,26 @@ impl DaemonClient {
         request: ResourceAccessRequest,
     ) -> Result<ResourceAccessResponse, ClientError> {
         self.post("/v1/resources/access", request).await
+    }
+
+    pub async fn execute_resource(
+        &self,
+        request: ResourceExecutionRequest,
+    ) -> Result<ResourceExecutionResponse, ClientError> {
+        self.post("/v1/resources/execute", request).await
+    }
+
+    pub async fn resource_execution_status(
+        &self,
+        request_id: impl Into<String>,
+    ) -> Result<ResourceExecutionResponse, ClientError> {
+        self.post(
+            "/v1/resources/execute/status",
+            ResourceAccessStatusRequest {
+                request_id: request_id.into(),
+            },
+        )
+        .await
     }
 
     pub async fn resource_access_status(
@@ -296,7 +317,7 @@ pub enum ClientError {
     Transport(#[source] reqwest::Error),
     #[error("failed to decode daemon response: {0}")]
     DecodeResponse(#[source] serde_json::Error),
-    #[error(transparent)]
+    #[error("{0}; upgrade the Plankton desktop app and CLI together")]
     ProtocolMismatch(#[from] ProtocolVersionError),
     #[error("daemon response correlation mismatch: expected {expected}, received {received}")]
     CorrelationMismatch {
@@ -312,6 +333,23 @@ mod tests {
     use plankton_protocol::resources::ResourceAccessResponse;
 
     use super::*;
+
+    #[test]
+    fn old_daemon_is_rejected_before_network_with_an_upgrade_hint() {
+        let state = DaemonState {
+            protocol_version: PROTOCOL_VERSION - 1,
+            endpoint: "http://127.0.0.1:9".into(),
+            bearer_token: "synthetic-unused-token".into(),
+            pid: 1,
+            started_at: "2026-10-29T00:00:00Z".parse().unwrap(),
+        };
+        let error = DaemonClient::from_state(state).unwrap_err();
+        assert!(matches!(error, ClientError::ProtocolMismatch(_)));
+        assert!(error
+            .to_string()
+            .contains("upgrade the Plankton desktop app and CLI together"));
+        assert!(!error.to_string().contains("synthetic-unused-token"));
+    }
 
     #[test]
     fn old_resource_response_reports_protocol_mismatch_before_payload_schema_error() {

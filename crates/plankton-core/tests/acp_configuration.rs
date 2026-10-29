@@ -88,6 +88,7 @@ fn preset_agents_resolve_latest_launch_commands() {
             vec!["-y", "@zed-industries/claude-code-acp@latest"],
         ),
         (AgentKind::OpenCode, vec!["-y", "opencode-ai@latest", "acp"]),
+        (AgentKind::Pi, vec!["-y", "pi-acp@latest"]),
     ];
 
     for (agent_kind, expected_args) in cases {

@@ -24,7 +24,14 @@ export function isCodeAgentEntry(entry: CallChainEntry): boolean {
     return true;
   }
 
-  return /^cc$/i.test(entry.process_name?.trim() ?? "");
+  return (
+    /^(cc|pi|pi-agent|pi-acp)$/i.test(entry.process_name?.trim() ?? "") ||
+    /[/\\]@(?:earendil-works|mariozechner)[/\\]pi-coding-agent[/\\]/i.test(
+      [entry.executable_path, entry.resolved_file_path]
+        .filter(Boolean)
+        .join(" "),
+    )
+  );
 }
 
 export function codeAgentBoundaryIndex(callChain: CallChainEntry[]): number {

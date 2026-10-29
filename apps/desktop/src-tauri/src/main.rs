@@ -1,3 +1,4 @@
+mod approval_notification;
 mod approval_window;
 mod background;
 mod import_browse;
@@ -80,6 +81,7 @@ const PASSWORD_EDIT_EVENT: &str = "plankton://password-edit";
 const PASSWORD_MIGRATION_EVENT: &str = "plankton://password-migration";
 const LOCAL_VAULT_MANAGER_EVENT: &str = "plankton://local-vault-manager";
 const PASSWORD_CATALOG_CHANGED_EVENT: &str = "plankton://password-catalog-changed";
+const APPROVAL_NOTIFICATIONS_CHANGED_EVENT: &str = "plankton://approval-notifications-changed";
 const FRONTEND_CACHE_REVISION: &str = env!("PLANKTON_FRONTEND_REVISION");
 const FRONTEND_CACHE_REVISION_FILE: &str = "frontend-cache-revision";
 const DESKTOP_PASSWORD_CHANGE_REASON: &str = "Manual change confirmed in Plankton desktop";
@@ -795,7 +797,7 @@ impl ApprovalChatRuntime {
 struct AppState {
     settings: Mutex<PlanktonSettings>,
     store: SqliteStore,
-    _owned_daemon: Mutex<Option<RunningDaemon>>,
+    owned_daemon: Mutex<Option<RunningDaemon>>,
     password_drafts: Option<PasswordDraftController>,
     pending_handoff_request_id: Mutex<Option<String>>,
     pending_password_draft_id: Mutex<Option<String>>,
@@ -805,6 +807,26 @@ struct AppState {
     sync_operations_in_flight: Mutex<BTreeSet<String>>,
     desktop_password_changes_in_flight: AtomicUsize,
     approval_chat: ApprovalChatRuntime,
+}
+
+async fn shutdown_owned_daemon<R: Runtime>(app: &AppHandle<R>) -> Result<(), ()> {
+    // Desktop imports can own backend commands even when the API daemon is
+    // external. Cancel this process's children without stopping that daemon.
+    plankton_core::value_resolver::cancel_backend_commands();
+    let daemon = app.try_state::<AppState>().and_then(|state| {
+        state
+            .owned_daemon
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    });
+    if let Some(daemon) = daemon {
+        daemon.shutdown().await.map_err(|_| ())?;
+    } else {
+        // A desktop chat can own an ACP process while its API daemon is external.
+        plankton_core::shutdown_acp_supervisor();
+    }
+    Ok(())
 }
 
 struct SyncOperationGuard<'a> {
@@ -1755,6 +1777,7 @@ fn approval_chat_base_profile(
             Some(plankton_protocol::acp::AgentKind::ClaudeCode)
         }
         Some("opencode-ai") => Some(plankton_protocol::acp::AgentKind::OpenCode),
+        Some("pi-acp") => Some(plankton_protocol::acp::AgentKind::Pi),
         _ => None,
     };
     if let Some(kind) = kind.filter(|kind| *kind != profile.agent_kind) {
@@ -2091,8 +2114,13 @@ async fn save_desktop_settings(
 ) -> Result<UserSettings, String> {
     save_user_settings(&settings).map_err(|error| error.to_string())?;
     let saved = reload_runtime_settings(&state)?;
-    approval_window::set_popup_enabled(&app, saved.approval_popup_enabled)
+    approval_notification::set_enabled(&app, saved.approval_popup_enabled)
         .map_err(|error| error.to_string())?;
+    app.emit(
+        APPROVAL_NOTIFICATIONS_CHANGED_EVENT,
+        saved.approval_popup_enabled,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(saved)
 }
 
@@ -2669,6 +2697,32 @@ async fn reject_request(
 #[tauri::command]
 fn dismiss_approval_popup(app: AppHandle) -> Result<(), String> {
     approval_window::dismiss_popup(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn approval_notification_current(
+    app: AppHandle,
+) -> Result<Option<approval_notification::ApprovalNotification>, String> {
+    approval_notification::current(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn dismiss_approval_notification(app: AppHandle, notification_id: String) -> Result<(), String> {
+    approval_notification::dismiss(&app, &notification_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn disable_approval_notifications(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut settings = UserSettings::from(&load_settings().map_err(|error| error.to_string())?);
+    settings.approval_popup_enabled = false;
+    save_user_settings(&settings).map_err(|error| error.to_string())?;
+    reload_runtime_settings(&state)?;
+    approval_notification::disable(&app).map_err(|error| error.to_string())?;
+    app.emit(APPROVAL_NOTIFICATIONS_CHANGED_EVENT, false)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -6399,12 +6453,9 @@ fn run() -> Result<()> {
         ..ApprovalChatRuntime::default()
     });
     let popup_enabled = settings.approval_popup_enabled;
-    let existing_approval_ids = tauri::async_runtime::block_on(store.list_pending_requests())
-        .context("failed to seed existing approvals")?
-        .into_iter()
-        .filter(|request| request.human_review_required())
-        .map(|request| request.id)
-        .collect::<Vec<_>>();
+    let notification_baseline =
+        tauri::async_runtime::block_on(store.list_approval_notification_statuses(None))
+            .context("failed to seed approval notification baseline")?;
     let initial_handoff_request_id =
         extract_handoff_request_id(&std::env::args().collect::<Vec<_>>());
     let initial_password_draft_id =
@@ -6464,7 +6515,7 @@ fn run() -> Result<()> {
         .manage(AppState {
             settings: Mutex::new(settings),
             store,
-            _owned_daemon: Mutex::new(owned_daemon),
+            owned_daemon: Mutex::new(owned_daemon),
             password_drafts,
             pending_handoff_request_id: Mutex::new(None),
             pending_password_draft_id: Mutex::new(initial_password_draft_id),
@@ -6476,16 +6527,15 @@ fn run() -> Result<()> {
             approval_chat,
         })
         .manage(approval_window::ApprovalRuntime::default())
+        .manage(approval_notification::ApprovalNotificationRuntime::default())
         .manage(tray::TrayRuntime::default())
         .setup(move |app| {
-            approval_window::set_popup_enabled(app.handle(), popup_enabled)?;
-            approval_window::seed_existing_requests(
-                app.handle(),
-                existing_approval_ids
-                    .iter()
-                    .filter(|id| Some(id.as_str()) != initial_handoff_for_setup.as_deref())
-                    .cloned(),
-            )?;
+            approval_notification::set_enabled(app.handle(), popup_enabled)?;
+            approval_notification::seed_baseline(app.handle(), &notification_baseline)?;
+            start_approval_notification_monitor(
+                app.handle().clone(),
+                approval_monitor_store.clone(),
+            );
             refresh_frontend_cache(app).context("failed to refresh frontend cache")?;
             tray::setup(app).context("failed to create persistent tray icon")?;
             background::setup_application_menu(app.handle())
@@ -6584,6 +6634,9 @@ fn run() -> Result<()> {
             reject_request,
             compact_approval_requests,
             dismiss_approval_popup,
+            approval_notification_current,
+            dismiss_approval_notification,
+            disable_approval_notifications,
             hide_current_window,
             open_full_request_details,
             consume_handoff_request,
@@ -6721,6 +6774,40 @@ fn password_change_monitor_transition(
     (has_pending, has_pending && !had_pending)
 }
 
+fn start_approval_notification_monitor(app: AppHandle, store: SqliteStore) {
+    tauri::async_runtime::spawn(async move {
+        let mut last_error: Option<String> = None;
+        loop {
+            let result = async {
+                // Timestamps are assigned before some SQLite writes acquire
+                // their transaction. A timestamp-only cursor could skip a late
+                // commit. Poll only the small status projection and let the
+                // runtime deduplicate stages; evidence is read only on change.
+                let statuses = store.list_approval_notification_statuses(None).await?;
+                approval_notification::observe_statuses(&app, &store, &statuses).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            match result {
+                Ok(()) => last_error = None,
+                Err(error) => {
+                    let message = error.to_string();
+                    if last_error.as_deref() != Some(&message) {
+                        record_approval_presentation_failure(
+                            &store,
+                            "approval-notification",
+                            message.clone(),
+                        )
+                        .await;
+                    }
+                    last_error = Some(message);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+}
+
 fn start_approval_monitor(app: AppHandle, store: SqliteStore) {
     tauri::async_runtime::spawn(async move {
         let mut last_error: Option<String> = None;
@@ -6742,7 +6829,9 @@ fn start_approval_monitor(app: AppHandle, store: SqliteStore) {
                         }
                         current_error = Some(message);
                     }
-                    for request_id in human_review_ids {
+                    // The store lists newest first; the actionable approval
+                    // queue presents the oldest outstanding request first.
+                    for request_id in human_review_ids.into_iter().rev() {
                         if let Err(error) = present_human_review_request(&app, &request_id, true) {
                             let message = error.to_string();
                             if last_error.as_deref() != Some(message.as_str()) {

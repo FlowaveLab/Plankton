@@ -16,6 +16,7 @@ const MAX_PREVIEW_TEXT_BYTES: usize = 64 * 1024;
 pub enum CallChainNodeSource {
     OsProbe,
     BestEffort,
+    ControlledExecution,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -199,6 +200,10 @@ pub fn prompt_call_chain_paths(call_chain: &[CallChainNode]) -> Vec<String> {
 
 pub fn preview_call_chain_for_desktop(call_chain: &mut [CallChainNode]) {
     for node in call_chain {
+        if node.source == CallChainNodeSource::ControlledExecution {
+            // This is the daemon's frozen reviewed entrypoint, not a live-file preview.
+            continue;
+        }
         node.preview_text = None;
         node.preview_error = None;
 
@@ -258,6 +263,23 @@ pub fn read_allowlisted_call_chain_file(
     call_chain: &[CallChainNode],
     requested_path: &str,
 ) -> Result<CallChainReadFileResult, CallChainError> {
+    if let Some(node) = call_chain.iter().find(|node| {
+        node.source == CallChainNodeSource::ControlledExecution
+            && node.resolved_file_path.as_deref().is_some_and(|path| {
+                normalize_path_for_match(Path::new(path))
+                    == normalize_path_for_match(Path::new(requested_path))
+            })
+    }) {
+        if let Some(content) = node.preview_text.as_ref() {
+            return Ok(CallChainReadFileResult {
+                path: requested_path.into(),
+                encoding: "utf-8".into(),
+                content: content.clone(),
+                bytes_returned: content.len(),
+                truncated: false,
+            });
+        }
+    }
     let allowed_paths = call_chain
         .iter()
         .filter_map(|node| node.previewable_path().map(ToOwned::to_owned))
@@ -343,6 +365,9 @@ fn infer_script_path(
     let interpreter = executable_basename.or(inferred_interpreter.as_deref());
 
     match interpreter {
+        // A credential request's file arguments describe consumers; Plankton does not
+        // execute them during collection. Never label those arguments as an observed script.
+        Some("plankton") | Some("plankton.exe") => return None,
         Some("bash") | Some("sh") | Some("zsh") | Some("fish") => {
             return infer_shell_script_path(argv, cwd);
         }
@@ -755,6 +780,35 @@ mod tests {
         assert!(truncated);
         assert!(value.len() <= 1024);
         assert!(value.is_char_boundary(value.len()));
+    }
+
+    #[test]
+    fn declared_consumer_is_not_the_plankton_process_executed_script() {
+        let temp = tempdir().unwrap();
+        let script = temp.path().join("consumer.py");
+        fs::write(&script, "print('ok')\n").unwrap();
+        for program in ["plankton", "plankton.exe"] {
+            let args = vec![
+                program.into(),
+                "get".into(),
+                "secret/test".into(),
+                "--consumer-script".into(),
+                script.display().to_string(),
+            ];
+            assert_eq!(
+                infer_script_path(&args, Some(temp.path()), Some(program)),
+                None
+            );
+            assert_eq!(infer_script_path(&args, Some(temp.path()), None), None);
+        }
+        assert_eq!(
+            infer_script_path(
+                &["python3".into(), script.display().to_string()],
+                Some(temp.path()),
+                Some("python3")
+            ),
+            Some(script.canonicalize().unwrap().display().to_string())
+        );
     }
 
     #[test]
