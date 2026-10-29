@@ -74,13 +74,22 @@ fn keep_running_after_exit_request(explicit_quit: bool, code: Option<i32>) -> bo
 }
 
 pub fn handle_run_event<R: Runtime>(app: &tauri::AppHandle<R>, event: tauri::RunEvent) {
-    if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
-        if keep_running_after_exit_request(EXPLICIT_QUIT.load(Ordering::SeqCst), code) {
+    match event {
+        tauri::RunEvent::ExitRequested { api, code, .. }
+            if keep_running_after_exit_request(EXPLICIT_QUIT.load(Ordering::SeqCst), code) =>
+        {
             api.prevent_exit();
             if let Err(error) = hide_current_user_window(app) {
                 error!(%error, "failed to close current window while keeping Plankton running");
             }
         }
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => {
+            if let Err(error) = show_main_window(app) {
+                error!(%error, "failed to restore Plankton after reopening the app");
+            }
+        }
+        _ => {}
     }
 }
 
