@@ -25,6 +25,7 @@ import type {
 import {
   ExposureRadar,
   defaultExposurePolicy,
+  parseExposurePolicy,
   type CredentialExposurePolicy,
   type ExposureSurface,
 } from "./ExposurePolicy";
@@ -791,23 +792,6 @@ export function CompactApproval(props: {
                     />
                   </label>
 
-                  <RememberExposure
-                    key={current.id}
-                    request={{
-                      id: current.id,
-                      policy_mode: current.policy_mode ?? "manual_only",
-                      context: {
-                        resource_metadata: current.resource_metadata ?? {},
-                      },
-                      llm_suggestion: {
-                        exposure_report: current.exposure_report,
-                      },
-                    }}
-                    zh={zh}
-                    busy={isSubmitting || decisionRecorded}
-                    onApprove={(options) => decide("approve_request", options)}
-                  />
-
                   <CompactCallChain
                     callChain={current.call_chain}
                     exposureReport={current.exposure_report}
@@ -820,6 +804,37 @@ export function CompactApproval(props: {
                 </div>
 
                 <footer className="compact-approval__actions">
+                  {!decisionRecorded ? (
+                    <RememberExposure
+                      key={current.id}
+                      request={{
+                        id: current.id,
+                        policy_mode: current.policy_mode ?? "manual_only",
+                        evaluation_state: current.evaluation_state,
+                        context: {
+                          resource_metadata: {
+                            ...current.resource_metadata,
+                            credential_exposure_policy_v1: JSON.stringify(
+                              current.exposure_policy ??
+                                parseExposurePolicy(
+                                  current.resource_metadata
+                                    ?.credential_exposure_policy_v1,
+                                ) ??
+                                defaultExposurePolicy(),
+                            ),
+                          },
+                        },
+                        llm_suggestion: {
+                          exposure_report: current.exposure_report,
+                        },
+                      }}
+                      zh={zh}
+                      busy={isSubmitting}
+                      onApprove={(options) =>
+                        decide("approve_request", options)
+                      }
+                    />
+                  ) : null}
                   <button
                     className="compact-approval__reject"
                     disabled={isSubmitting || decisionRecorded}
@@ -840,7 +855,7 @@ export function CompactApproval(props: {
                     type="button"
                   >
                     <Check aria-hidden="true" size={16} strokeWidth={1.75} />
-                    {zh ? "批准" : "Approve"}
+                    {zh ? "仅批准本次" : "Approve once"}
                   </button>
                   <button
                     className="compact-approval__details"

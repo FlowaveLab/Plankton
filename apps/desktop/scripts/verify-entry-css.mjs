@@ -23,6 +23,10 @@ const entryCss = (
 for (const selector of [
   ".desktop-workspace .approval-chat",
   ".desktop-workspace .request-review-progress",
+  ".approval-notification{",
+  ".approval-notification__header{",
+  ".approval-notification__footer{",
+  ".remember-exposure",
 ]) {
   if (!entryCss.includes(selector)) {
     throw new Error(`The desktop entry stylesheet is missing ${selector}.`);

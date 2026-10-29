@@ -98,6 +98,7 @@ export type CredentialExposureReport = {
       | "process_propagation";
     actual_level: number;
     evidence_state: "not_observed" | "observed" | "unknown";
+    network_destinations?: string[];
     summary: string;
     annotations: ExposureEvidenceAnnotation[];
   }>;

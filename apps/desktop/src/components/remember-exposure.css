@@ -1,34 +1,101 @@
+/* Scope controls stay beside the fixed approve/reject actions. */
 :is(.desktop-workspace, .compact-approval) .remember-exposure {
-  border: 0;
-  border-top: 1px solid var(--rule);
-  margin: 0 0 16px;
-  background: transparent;
-}
-:is(.desktop-workspace, .compact-approval)
-  .remember-exposure
-  > button.remember-exposure-toggle {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+  flex-basis: 100%;
   width: 100%;
-  border: 0;
-  padding: 12px 0;
-  background: transparent;
-  text-align: left;
+  min-width: 0;
+  margin: 0;
+  border: 1px solid var(--rule);
+  background: var(--surface);
+  padding: 12px;
+}
+:is(.desktop-workspace, .compact-approval) .remember-exposure-heading {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  color: var(--ink);
+  font-size: 12px;
+}
+:is(.desktop-workspace, .compact-approval) .remember-exposure-heading > svg {
+  flex: 0 0 auto;
+  color: var(--vermilion);
+}
+:is(.desktop-workspace, .compact-approval) .remember-exposure-heading > span {
+  margin-left: auto;
+  color: var(--muted-ink);
+  font-size: 10px;
+  font-weight: 400;
+}
+:is(.desktop-workspace, .compact-approval) .remember-exposure-preview {
+  margin: 8px 0;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+:is(.desktop-workspace, .compact-approval) .remember-exposure-preview p,
+:is(.desktop-workspace, .compact-approval) .remember-exposure-preview ul {
+  margin: 0;
+}
+:is(.desktop-workspace, .compact-approval) .remember-exposure-preview ul {
+  list-style: none;
+  padding: 0;
+  max-height: 90px;
+  overflow-y: auto;
+}
+:is(.desktop-workspace, .compact-approval) .remember-exposure-preview li {
   font-weight: 600;
 }
+:is(.desktop-workspace, .compact-approval) .remember-exposure-preview > span,
+:is(.desktop-workspace, .compact-approval) .remember-exposure-mode {
+  color: var(--muted-ink);
+  font-size: 11px;
+  line-height: 1.5;
+}
+:is(.desktop-workspace, .compact-approval) .remember-exposure-mode {
+  margin: 0 0 9px;
+}
+:is(.desktop-workspace, .compact-approval) .remember-exposure-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+:is(.desktop-workspace, .compact-approval) .remember-exposure-actions > button {
+  min-height: 34px;
+  padding: 7px 10px;
+  font-size: 12px;
+}
 :is(.desktop-workspace, .compact-approval)
-  .remember-exposure
-  > button.remember-exposure-toggle:hover {
-  color: var(--vermilion);
+  .remember-exposure-actions
+  > .remember-exposure-quick {
+  flex: 1 1 180px;
+  border: 1px solid var(--ink);
+  color: var(--surface);
+  background: var(--ink);
+  font-weight: 650;
+}
+:is(.desktop-workspace, .compact-approval)
+  .remember-exposure-actions
+  > .remember-exposure-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px solid var(--rule);
+  color: var(--ink);
   background: transparent;
+  font-weight: 500;
+}
+:is(.desktop-workspace, .compact-approval) .remember-exposure button:disabled {
+  cursor: not-allowed;
 }
 :is(.desktop-workspace, .compact-approval) .remember-exposure-body {
-  padding: 0 0 12px;
+  padding-top: 12px;
+  margin-top: 12px;
+  border-top: 1px solid var(--rule);
 }
 :is(.desktop-workspace, .compact-approval) .remember-exposure-body > p {
   margin: 0 0 10px;
-  font-size: 13px;
+  font-size: 12px;
   line-height: 1.6;
   color: var(--muted-ink);
 }
@@ -40,8 +107,7 @@
 }
 :is(.desktop-workspace, .compact-approval)
   .remember-exposure
-  .remember-exposure-body
-  > button.remember-exposure-reload {
+  button.remember-exposure-reload {
   padding: 0;
   border: 0;
   background: transparent;
@@ -53,6 +119,40 @@
 }
 :is(.desktop-workspace, .compact-approval) .remember-exposure-notice {
   padding: 0;
+}
+.compact-approval .compact-approval__actions {
+  max-height: min(calc(100% - 10px), max(280px, 48%));
+  overflow-y: auto;
+  align-content: flex-start;
+}
+.compact-approval .compact-approval__actions:has(.remember-exposure-body) {
+  flex: 0 1 auto;
+  max-height: min(calc(100% - 10px), calc(100dvh - 130px));
+  min-height: 0;
+}
+.compact-approval
+  .compact-approval__review:has(.remember-exposure-body)
+  .compact-approval__review-scroll {
+  flex-basis: 0;
+}
+.desktop-workspace .request-review-controls:has(.remember-exposure) {
+  max-height: min(100%, max(320px, 45%));
+}
+.desktop-workspace .request-review-controls:has(.remember-exposure-body) {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: calc(100% - 80px);
+}
+.desktop-workspace
+  .request-detail-frame:has(.remember-exposure-body)
+  .request-detail-scroll {
+  flex: 0 0 80px;
+  height: 80px;
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+.desktop-workspace .request-review-controls .remember-exposure {
+  margin-bottom: 2px;
 }
 :is(.desktop-workspace, .compact-approval) .request-metadata-disclosure {
   margin-top: 16px;

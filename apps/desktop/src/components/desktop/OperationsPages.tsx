@@ -2920,17 +2920,6 @@ function RequestsPage({
                   zh={zh}
                   overviewOnly
                 />
-                {humanReviewable ? (
-                  <RememberExposure
-                    key={detail.id}
-                    request={detail.request}
-                    zh={zh}
-                    busy={isSubmitting}
-                    onApprove={(options) =>
-                      decideSelected("approve_request", options)
-                    }
-                  />
-                ) : null}
                 <section
                   aria-label={zh ? "审批状态" : "Approval state"}
                   className="approval-state-rail"
@@ -3204,6 +3193,15 @@ function RequestsPage({
               </div>
               {humanReviewable ? (
                 <div className="request-review-controls">
+                  <RememberExposure
+                    key={detail.id}
+                    request={detail.request}
+                    zh={zh}
+                    busy={isSubmitting}
+                    onApprove={(options) =>
+                      decideSelected("approve_request", options)
+                    }
+                  />
                   <label>
                     <span>
                       {zh ? "审批备注（可选）" : "Review note (optional)"}
@@ -3228,8 +3226,8 @@ function RequestsPage({
                           ? "提交中…"
                           : "Submitting…"
                         : zh
-                          ? "批准"
-                          : "Approve"}
+                          ? "仅批准本次"
+                          : "Approve once"}
                     </button>
                     <button
                       disabled={isSubmitting}

@@ -445,7 +445,13 @@ function annotatedRequest(completedUnits: number): AccessRequest {
 
 beforeEach(() => {
   Object.assign(window, { __TAURI_INTERNALS__: {} });
-  invoke.mockResolvedValue(undefined);
+  invoke.mockImplementation((command: string) =>
+    Promise.resolve(
+      command === "request_current_exposure_policy"
+        ? defaultExposurePolicy()
+        : undefined,
+    ),
+  );
 });
 
 afterEach(() => {
@@ -457,6 +463,77 @@ afterEach(() => {
 });
 
 describe("RequestsPage", () => {
+  it("offers exact-scope approval in the fixed decision region without opening manual settings", async () => {
+    const request = {
+      ...annotatedRequest(6),
+      evaluation_state: "completed" as const,
+    };
+    request.llm_suggestion!.exposure_report!.surfaces =
+      request.llm_suggestion!.exposure_report!.surfaces.map((surface) => ({
+        ...surface,
+        actual_level:
+          surface.surface === "network" ||
+          surface.surface === "process_propagation"
+            ? 1
+            : 0,
+        evidence_state:
+          surface.surface === "network" ||
+          surface.surface === "process_propagation"
+            ? "observed"
+            : "not_observed",
+        network_destinations:
+          surface.surface === "network" ? ["https://api.example.com/v1"] : [],
+      }));
+    const onDecision = vi.fn(async () => {});
+    const view = render(
+      <OperationsPage
+        dashboard={{ pending_requests: [request], recent_audit_records: [] }}
+        focusedRequestId={request.id}
+        isSubmitting={false}
+        locale="zh-CN"
+        noteDraft=""
+        onDecision={onDecision}
+        onNavigate={() => {}}
+        onNoteChange={() => {}}
+        settingsController={buildSettingsController()}
+        view="requests"
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const controls = view.container.querySelector<HTMLElement>(
+      ".request-review-controls",
+    )!;
+    const quick = controls.querySelector<HTMLButtonElement>(
+      ".remember-exposure-quick",
+    )!;
+    expect(quick.textContent).toBe("应用本次范围并批准");
+    expect(quick.disabled).toBe(false);
+    expect(controls.textContent).toContain("新增允许域名： api.example.com");
+    expect(controls.querySelector(".remember-exposure-body")).toBeNull();
+    expect(controls.textContent).toContain("仅批准本次");
+    await act(async () => quick.click());
+    expect(onDecision).toHaveBeenCalledWith(request.id, "approve_request", {
+      expectedExposurePolicy: defaultExposurePolicy(),
+      exposurePolicy: {
+        ...defaultExposurePolicy(),
+        surfaces: defaultExposurePolicy().surfaces.map((surface) =>
+          surface.surface === "network"
+            ? {
+                ...surface,
+                max_level: 1,
+                network_allowlist: [
+                  { kind: "exact_domain", domain: "api.example.com" },
+                ],
+              }
+            : surface,
+        ),
+      },
+    });
+    view.unmount();
+  });
+
   it("forwards the edited scope and current policy when approving and remembering exposure", async () => {
     const request = evaluationRequest("not_required", "manual_only");
     const currentPolicy = {
@@ -483,6 +560,9 @@ describe("RequestsPage", () => {
         view="requests"
       />,
     );
+    await act(async () => {
+      await Promise.resolve();
+    });
     await act(async () =>
       view.container
         .querySelector<HTMLButtonElement>(".remember-exposure-toggle")!
@@ -740,7 +820,9 @@ describe("RequestsPage", () => {
     );
     const decisionButtons = Array.from(
       view.container.querySelectorAll("button"),
-    ).filter((button) => ["批准", "拒绝"].includes(button.textContent ?? ""));
+    ).filter((button) =>
+      ["仅批准本次", "拒绝"].includes(button.textContent ?? ""),
+    );
     expect(decisionButtons).toHaveLength(2);
     expect(decisionButtons.every((button) => !button.disabled)).toBe(true);
     view.unmount();
@@ -750,7 +832,7 @@ describe("RequestsPage", () => {
     "submits human decisions while the evaluation is %s",
     async (state) => {
       for (const mode of ["assisted", "llm_automatic"] as const) {
-        for (const label of ["Approve", "Reject"]) {
+        for (const label of ["Approve once", "Reject"]) {
           const request = evaluationRequest(state, mode);
           const onDecision = vi.fn(async () => {});
           const view = render(
@@ -777,7 +859,7 @@ describe("RequestsPage", () => {
           await act(async () => button?.click());
           expect(onDecision).toHaveBeenCalledWith(
             request.id,
-            label === "Approve" ? "approve_request" : "reject_request",
+            label === "Approve once" ? "approve_request" : "reject_request",
           );
           view.unmount();
         }
@@ -1091,7 +1173,7 @@ describe("RequestsPage", () => {
     );
     const approve = Array.from(
       view.container.querySelectorAll<HTMLButtonElement>("button"),
-    ).find((button) => button.textContent === "Approve");
+    ).find((button) => button.textContent === "Approve once");
     await act(async () => approve?.click());
     await act(async () => {});
 

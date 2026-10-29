@@ -4,7 +4,7 @@ import { act, type ReactNode } from "react";
 import ReactDOM from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { defaultExposurePolicy } from "./ExposurePolicy";
+import { defaultExposurePolicy, EXPOSURE_SURFACES } from "./ExposurePolicy";
 
 import {
   CompactApproval,
@@ -119,6 +119,69 @@ afterEach(() => {
 });
 
 describe("CompactApproval", () => {
+  it("shows the exact scope and quick approval beside decision buttons without expanding an editor", async () => {
+    const api = createApi([
+      {
+        ...firstRequest,
+        locale: "zh-CN",
+        policy_mode: "llm_automatic",
+        exposure_policy: defaultExposurePolicy(),
+        exposure_report: {
+          chain_summary: "Credential only reaches the named API.",
+          node_assessments: [],
+          surfaces: EXPOSURE_SURFACES.map((surface) => ({
+            surface,
+            actual_level:
+              surface === "network" || surface === "process_propagation"
+                ? 1
+                : 0,
+            evidence_state:
+              surface === "network" || surface === "process_propagation"
+                ? "observed"
+                : "not_observed",
+            summary: "Confirmed from the consumer.",
+            annotations: [],
+            network_destinations:
+              surface === "network" ? ["https://api.example.com/v1"] : [],
+          })),
+        },
+      },
+    ]);
+    const view = render(<CompactApproval api={api} />);
+    await flush();
+    const controls = view.container.querySelector<HTMLElement>(
+      ".compact-approval__actions",
+    )!;
+    expect(controls.querySelector(".remember-exposure-body")).toBeNull();
+    expect(controls.textContent).toContain("新增允许域名： api.example.com");
+    expect(button(controls, "仅批准本次").disabled).toBe(false);
+    expect(button(controls, "应用本次范围并批准").disabled).toBe(false);
+    await act(async () => button(controls, "应用本次范围并批准").click());
+    expect(api.decide).toHaveBeenCalledWith(
+      "request-1",
+      "approve_request",
+      null,
+      {
+        expectedExposurePolicy: defaultExposurePolicy(),
+        exposurePolicy: {
+          ...defaultExposurePolicy(),
+          surfaces: defaultExposurePolicy().surfaces.map((surface) =>
+            surface.surface === "network"
+              ? {
+                  ...surface,
+                  max_level: 1,
+                  network_allowlist: [
+                    { kind: "exact_domain", domain: "api.example.com" },
+                  ],
+                }
+              : surface,
+          ),
+        },
+      },
+    );
+    view.unmount();
+  });
+
   it("approves with the edited and expected exposure policies from the human popup", async () => {
     const api = createApi([
       { ...firstRequest, locale: "zh-CN", policy_mode: "llm_automatic" },
@@ -201,7 +264,7 @@ describe("CompactApproval", () => {
       view.container.querySelector(".compact-approval__identifiers")
         ?.textContent,
     ).toContain(firstRequest.id);
-    expect(button(view.container, "批准").disabled).toBe(false);
+    expect(button(view.container, "仅批准本次").disabled).toBe(false);
     view.unmount();
   });
   it("marks executable files alongside call-chain evidence", async () => {
@@ -487,19 +550,19 @@ describe("CompactApproval", () => {
   it.each(["queued", "running"] as const)(
     "allows human decisions while AI is %s",
     async (state) => {
-      for (const label of ["Approve", "Reject"]) {
+      for (const label of ["Approve once", "Reject"]) {
         const api = createApi([{ ...firstRequest, evaluation_state: state }]);
         const view = render(<CompactApproval api={api} />);
         await flush();
         expect(
           view.container.querySelector('[role="progressbar"]'),
         ).not.toBeNull();
-        expect(button(view.container, "Approve").disabled).toBe(false);
+        expect(button(view.container, "Approve once").disabled).toBe(false);
         expect(button(view.container, "Reject").disabled).toBe(false);
         await act(async () => button(view.container, label).click());
         expect(api.decide).toHaveBeenCalledWith(
           firstRequest.id,
-          label === "Approve" ? "approve_request" : "reject_request",
+          label === "Approve once" ? "approve_request" : "reject_request",
           null,
         );
         expect(api.close).toHaveBeenCalled();
@@ -525,7 +588,7 @@ describe("CompactApproval", () => {
     const view = render(<CompactApproval api={api} />);
     await flush();
 
-    await act(async () => button(view.container, "Approve").click());
+    await act(async () => button(view.container, "Approve once").click());
     await flush();
 
     expect(view.container.textContent).not.toContain(firstRequest.resource);
@@ -721,7 +784,7 @@ describe("CompactApproval", () => {
       note.dispatchEvent(new Event("input", { bubbles: true }));
     });
     await act(async () => {
-      button(view.container, "Approve").click();
+      button(view.container, "Approve once").click();
     });
     await flush();
 
@@ -772,14 +835,14 @@ describe("CompactApproval", () => {
     await flush();
 
     await act(async () => {
-      button(view.container, "Approve").click();
+      button(view.container, "Approve once").click();
     });
     await flush();
 
     expect(api.close).toHaveBeenCalledOnce();
     expect(
       Array.from(view.container.querySelectorAll("button")).some(
-        (candidate) => candidate.textContent?.trim() === "Approve",
+        (candidate) => candidate.textContent?.trim() === "Approve once",
       ),
     ).toBe(false);
     view.unmount();
@@ -795,7 +858,7 @@ describe("CompactApproval", () => {
     });
 
     expect(api.openFullDetails).toHaveBeenCalledWith("request-1");
-    expect(button(view.container, "Approve").disabled).toBe(false);
+    expect(button(view.container, "Approve once").disabled).toBe(false);
     expect(button(view.container, "Reject").disabled).toBe(false);
     view.unmount();
   });

@@ -24,7 +24,6 @@ pub enum NotificationStage {
     Evaluating,
     Approved,
     Rejected,
-    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -40,20 +39,28 @@ pub struct ApprovalNotification {
 }
 
 fn notification_stage(status: &ApprovalNotificationStatus) -> Option<NotificationStage> {
+    if status.policy_mode == PolicyMode::ManualOnly {
+        return None;
+    }
     match status.approval_status {
-        ApprovalStatus::Approved => Some(NotificationStage::Approved),
-        ApprovalStatus::Rejected => Some(NotificationStage::Rejected),
-        ApprovalStatus::Pending if status.policy_mode == PolicyMode::ManualOnly => None,
-        ApprovalStatus::Pending => match status.evaluation_state {
-            EvaluationState::Queued | EvaluationState::Running => {
-                Some(NotificationStage::Evaluating)
-            }
-            EvaluationState::Failed | EvaluationState::Interrupted => {
-                Some(NotificationStage::Failed)
-            }
-            // Escalation hands off to the separate, actionable approval window.
-            _ => None,
-        },
+        ApprovalStatus::Approved if status.decision_is_automatic => {
+            Some(NotificationStage::Approved)
+        }
+        ApprovalStatus::Rejected if status.decision_is_automatic => {
+            Some(NotificationStage::Rejected)
+        }
+        ApprovalStatus::Pending
+            if matches!(
+                status.evaluation_state,
+                EvaluationState::Queued | EvaluationState::Running
+            ) =>
+        {
+            Some(NotificationStage::Evaluating)
+        }
+        // Completed, failed, and interrupted pending evaluations all hand off to
+        // the actionable human window. Human results must not reopen this toast,
+        // including when the request originally used automatic policy mode.
+        _ => None,
     }
 }
 
@@ -466,6 +473,7 @@ mod tests {
             policy_mode: PolicyMode::LlmAutomatic,
             approval_status,
             evaluation_state,
+            decision_is_automatic: approval_status != ApprovalStatus::Pending,
             updated_at: Utc::now(),
         }
     }
@@ -528,11 +536,7 @@ mod tests {
         ));
         assert_eq!(state.current.as_ref().unwrap().id, id);
         assert_eq!(notification_lifetime(NotificationStage::Evaluating), None);
-        for stage in [
-            NotificationStage::Approved,
-            NotificationStage::Rejected,
-            NotificationStage::Failed,
-        ] {
+        for stage in [NotificationStage::Approved, NotificationStage::Rejected] {
             assert_eq!(notification_lifetime(stage), Some(Duration::from_secs(5)));
         }
     }
@@ -542,7 +546,7 @@ mod tests {
         let mut state = NotificationState::default();
         observe(
             &mut state,
-            &status("a", ApprovalStatus::Pending, EvaluationState::Failed),
+            &status("a", ApprovalStatus::Pending, EvaluationState::Running),
         );
         let failed_id = state.current.as_ref().unwrap().id.clone();
         observe(
@@ -558,30 +562,70 @@ mod tests {
     }
 
     #[test]
-    fn handoff_to_human_clears_progress_and_manual_results_still_notify() {
+    fn human_handoff_and_human_results_clear_notifications_for_every_policy_mode() {
+        for mode in [
+            PolicyMode::ManualOnly,
+            PolicyMode::Assisted,
+            PolicyMode::LlmAutomatic,
+        ] {
+            for decision in [ApprovalStatus::Approved, ApprovalStatus::Rejected] {
+                let mut state = NotificationState::default();
+                let mut request = status("a", ApprovalStatus::Pending, EvaluationState::Running);
+                request.policy_mode = mode;
+                observe(&mut state, &request);
+                assert_eq!(state.current.is_some(), mode != PolicyMode::ManualOnly);
+                request.evaluation_state = EvaluationState::Completed;
+                observe(&mut state, &request);
+                assert!(state.current.is_none());
+                request.approval_status = decision;
+                request.decision_is_automatic = false;
+                assert!(!observe(&mut state, &request));
+                assert!(state.current.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn human_preemption_and_failed_evaluation_immediately_remove_active_progress() {
+        for evaluation in [
+            EvaluationState::Failed,
+            EvaluationState::Interrupted,
+            EvaluationState::Superseded,
+        ] {
+            let mut state = NotificationState::default();
+            let mut request = status("a", ApprovalStatus::Pending, EvaluationState::Running);
+            observe(&mut state, &request);
+            request.evaluation_state = evaluation;
+            if evaluation == EvaluationState::Superseded {
+                request.approval_status = ApprovalStatus::Approved;
+                request.decision_is_automatic = false;
+            }
+            assert!(observe(&mut state, &request));
+            assert!(state.current.is_none());
+        }
+    }
+
+    #[test]
+    fn handoff_removes_queued_progress_without_hiding_another_automatic_result() {
         let mut state = NotificationState::default();
         observe(
             &mut state,
-            &status("a", ApprovalStatus::Pending, EvaluationState::Running),
+            &status("auto", ApprovalStatus::Approved, EvaluationState::Completed),
         );
-        assert!(observe(
+        let current_id = state.current.as_ref().unwrap().id.clone();
+        observe(
             &mut state,
-            &status("a", ApprovalStatus::Pending, EvaluationState::Completed)
-        ));
+            &status("human", ApprovalStatus::Pending, EvaluationState::Running),
+        );
+        assert_eq!(state.pending.len(), 1);
+        observe(
+            &mut state,
+            &status("human", ApprovalStatus::Pending, EvaluationState::Completed),
+        );
+        assert!(state.pending.is_empty());
+        assert_eq!(state.current.as_ref().unwrap().request_id, "auto");
+        assert!(state.dismiss(&current_id));
         assert!(state.current.is_none());
-        let mut manual = status(
-            "manual",
-            ApprovalStatus::Pending,
-            EvaluationState::NotRequired,
-        );
-        manual.policy_mode = PolicyMode::ManualOnly;
-        assert!(!observe(&mut state, &manual));
-        manual.approval_status = ApprovalStatus::Approved;
-        assert!(observe(&mut state, &manual));
-        assert_eq!(
-            state.current.as_ref().unwrap().stage,
-            NotificationStage::Approved
-        );
     }
 
     #[test]

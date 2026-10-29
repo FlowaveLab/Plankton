@@ -697,7 +697,7 @@ describe("DesktopWorkspace", () => {
     );
 
     const approve = Array.from(view.container.querySelectorAll("button")).find(
-      (button) => button.textContent === "Approve",
+      (button) => button.textContent === "Approve once",
     );
     act(() => approve?.click());
     expect(onDecision).toHaveBeenCalledWith("request-1", "approve_request");

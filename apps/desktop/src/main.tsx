@@ -7,6 +7,10 @@ import "./components/desktop/workspace.css";
 import "./components/approval-chat.css";
 import "./index.css";
 import "./styles.css";
+// Native companion windows must have their layout before a lazy surface mounts.
+// Keep these critical styles in index.html's stylesheet, not an async CSS chunk.
+import "./components/approval-notification.css";
+import "./components/remember-exposure.css";
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
 
@@ -19,29 +23,25 @@ const windowLabel = (window as Window & { __TAURI_INTERNALS__?: object })
   ? getCurrentWindow().label
   : "main";
 const surface = surfaceForWindowLabel(windowLabel);
-const surfaceModule =
-  surface === "compact"
-    ? import("./components/CompactApproval")
-    : surface === "notification"
-      ? import("./components/ApprovalNotification")
-      : surface === "password-change"
-        ? import("./components/PasswordChangeConfirmation")
-        : import("./App");
+async function loadSurface() {
+  // Keep imports in separate branches. A ternary import expression can merge
+  // Vite's preload dependencies and leave another surface's CSS unloaded.
+  if (surface === "compact") {
+    return (await import("./components/CompactApproval")).CompactApproval;
+  }
+  if (surface === "notification") {
+    return (await import("./components/ApprovalNotification"))
+      .ApprovalNotification;
+  }
+  if (surface === "password-change") {
+    return (await import("./components/PasswordChangeConfirmation"))
+      .PasswordChangeConfirmation;
+  }
+  return (await import("./App")).default;
+}
 
-void surfaceModule
-  .then((module) => {
-    const Surface =
-      surface === "compact"
-        ? (module as typeof import("./components/CompactApproval"))
-            .CompactApproval
-        : surface === "notification"
-          ? (module as typeof import("./components/ApprovalNotification"))
-              .ApprovalNotification
-          : surface === "password-change"
-            ? (
-                module as typeof import("./components/PasswordChangeConfirmation")
-              ).PasswordChangeConfirmation
-            : (module as typeof import("./App")).default;
+void loadSurface()
+  .then((Surface) => {
     ReactDOM.createRoot(appRoot).render(<Surface />);
   })
   .catch((error: unknown) => {
