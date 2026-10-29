@@ -101,6 +101,10 @@ impl EvaluationWorker {
             .store
             .recover_stale_operations(Utc::now(), chrono::Duration::zero())
             .await?;
+        self.inner
+            .store
+            .recover_interrupted_review_details(Utc::now())
+            .await?;
         Ok(())
     }
 
@@ -188,6 +192,10 @@ impl EvaluationWorker {
         self.inner
             .store
             .recover_stale_operations(Utc::now(), chrono::Duration::zero())
+            .await?;
+        self.inner
+            .store
+            .recover_interrupted_review_details(Utc::now())
             .await?;
         Ok(())
     }

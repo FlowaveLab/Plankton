@@ -1,3 +1,5 @@
+import type { CredentialExposurePolicy } from "./components/ExposurePolicy";
+
 export type StructuredCallChainNode = {
   pid?: number | null;
   ppid?: number | null;
@@ -168,6 +170,7 @@ export type ProviderTrace = {
   agent_name: string | null;
   agent_version: string | null;
   beta_headers: string[];
+  decision_attempt_errors?: string[];
   review_progress?: {
     state: "running" | "complete" | "partial" | "failed";
     completed_units: number;
@@ -258,6 +261,11 @@ export type DashboardData = {
   recent_audit_records: AuditRecord[];
 };
 
+export type RememberExposureOptions = {
+  exposurePolicy: CredentialExposurePolicy;
+  expectedExposurePolicy: CredentialExposurePolicy;
+};
+
 export type DecisionCommand = "approve_request" | "reject_request";
 
 export type AcpProfile = {
@@ -324,6 +332,7 @@ export type DesktopSettings = {
   locale: string;
   default_policy_mode: string;
   llm_approval_allow_enabled: boolean;
+  approval_popup_enabled: boolean;
   llm_approval_deny_enabled: boolean;
   llm_approval_escalate_enabled: boolean;
   llm_auto_approve_password_edits: boolean;

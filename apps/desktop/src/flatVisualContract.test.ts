@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { parse } from "postcss";
 import { describe, expect, it } from "vitest";
 
 const visualSources = [
@@ -16,6 +17,27 @@ const visualSources = [
   path,
   source: readFileSync(resolve(process.cwd(), path), "utf8"),
 }));
+
+function declarationsFor(
+  path: string,
+  selector: string,
+): Record<string, string> {
+  const source = visualSources.find((entry) => entry.path === path)?.source;
+  if (!source) throw new Error(`Missing visual source: ${path}`);
+  const declarations: Record<string, string> = {};
+  for (const node of parse(source).nodes) {
+    if (
+      node.type !== "rule" ||
+      !node.selectors.some((value) => value.replace(/\s+/g, " ") === selector)
+    ) {
+      continue;
+    }
+    for (const child of node.nodes) {
+      if (child.type === "decl") declarations[child.prop] = child.value;
+    }
+  }
+  return declarations;
+}
 
 describe("flat visual contract", () => {
   it("limits interface and chart colors to paper, white, black, and red tones", () => {
@@ -80,5 +102,62 @@ describe("flat visual contract", () => {
     expect(workspaceStyles).toMatch(
       /\.desktop-workspace select\s*{[^}]*appearance:\s*none;[^}]*background-image:\s*url\([^}]*box-shadow:\s*none;/s,
     );
+  });
+
+  it("keeps nested approval and exposure sections open instead of stacking cards", () => {
+    const workspacePath = "src/components/desktop/workspace.css";
+    const exposurePath = "src/components/desktop/password-vault.css";
+    for (const selector of [
+      ".desktop-workspace .request-review-controls",
+      ".desktop-workspace .request-dossier-entry",
+      ".desktop-workspace .request-call-chain-entry",
+      ".desktop-workspace .diagnostic-errors-section",
+    ]) {
+      expect(declarationsFor(workspacePath, selector), selector).toMatchObject({
+        border: "0",
+        background: "transparent",
+      });
+    }
+    for (const selector of [
+      ".exposure-policy-editor",
+      ".exposure-policy-summary",
+      ".exposure-policy-radar-editor",
+    ]) {
+      expect(declarationsFor(exposurePath, selector), selector).toMatchObject({
+        border: "0",
+        padding: "0",
+      });
+    }
+    expect(
+      declarationsFor(exposurePath, ".exposure-policy-workbench")[
+        "grid-template-columns"
+      ],
+    ).toBe("minmax(0, 1.1fr) minmax(0, 0.9fr)");
+    expect(
+      declarationsFor(exposurePath, ".exposure-policy-editor")[
+        "container-type"
+      ],
+    ).toBe("inline-size");
+    expect(
+      declarationsFor(
+        exposurePath,
+        ".desktop-workspace .exposure-axis-editor fieldset",
+      ),
+    ).toMatchObject({ border: "0", padding: "0" });
+  });
+
+  it("avoids duplicate section rules and keeps radar help below its title", () => {
+    expect(
+      declarationsFor(
+        "src/components/desktop/workspace.css",
+        ".desktop-workspace .settings-section > .settings-option:last-child",
+      )["border-bottom"],
+    ).toBe("0");
+    expect(
+      declarationsFor(
+        "src/components/desktop/password-vault.css",
+        ".exposure-policy-radar-editor > header",
+      ).display,
+    ).toBe("grid");
   });
 });

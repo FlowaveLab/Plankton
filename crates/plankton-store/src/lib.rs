@@ -1,4 +1,6 @@
+mod batch_review;
 mod diagnostics;
+mod exposure;
 mod migration_compatibility;
 mod password_changes;
 mod read;

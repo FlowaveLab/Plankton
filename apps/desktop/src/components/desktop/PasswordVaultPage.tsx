@@ -64,6 +64,7 @@ type PasswordVaultPageProps = {
   onEditConsumed?: () => void;
   onMigrationConsumed?: () => void;
   onVaultManagerConsumed?: () => void;
+  onUnsavedChangesChange?: (dirty: boolean) => void;
 };
 
 export type PasswordMigrationHandoff = {
@@ -195,6 +196,33 @@ type EditDraft = {
   tags: string;
   fields: EditableField[];
 };
+
+function hasUnsavedEntryChanges(draft: EditDraft | null): boolean {
+  if (!draft) return false;
+  return (
+    draft.itemId !== draft.original.item_id ||
+    draft.title !== draft.original.title ||
+    draft.description !== (draft.original.description ?? "") ||
+    draft.tags !== draft.original.tags.join(", ") ||
+    JSON.stringify(draft.defaultExposurePolicy) !==
+      JSON.stringify(
+        normalizeExposurePolicy(draft.original.default_exposure_policy),
+      ) ||
+    draft.fields.some(
+      (field) =>
+        field.removed ||
+        field.label !== field.originalLabel ||
+        field.resourceId !== field.originalResourceId ||
+        field.value !== field.originalValue ||
+        JSON.stringify(field.exposurePolicy) !==
+          JSON.stringify(
+            field.originalInheritsExposurePolicy
+              ? null
+              : field.originalExposurePolicy,
+          ),
+    )
+  );
+}
 
 type OrganizeMode = "split" | "merge" | "dedupe";
 
@@ -604,6 +632,40 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
   const itemMenuFirstActionRef = useRef<HTMLButtonElement | null>(null);
   const itemContextMenuRef = useRef<HTMLDivElement | null>(null);
   const itemContextMenuActionRef = useRef<HTMLButtonElement | null>(null);
+  const hasUnsavedChanges = hasUnsavedEntryChanges(editDraft);
+  const unsavedChangesRef = useRef(hasUnsavedChanges);
+  const deferredCatalogRefreshRef = useRef(false);
+  const unsavedChangeCallbackRef = useRef(props.onUnsavedChangesChange);
+  unsavedChangesRef.current = hasUnsavedChanges;
+  unsavedChangeCallbackRef.current = props.onUnsavedChangesChange;
+
+  useLayoutEffect(() => {
+    props.onUnsavedChangesChange?.(hasUnsavedChanges);
+  }, [hasUnsavedChanges, props.onUnsavedChangesChange]);
+
+  useEffect(() => () => unsavedChangeCallbackRef.current?.(false), []);
+
+  useEffect(() => {
+    if (!hasUnsavedChanges) return;
+    const keepUnsavedChanges = (event: BeforeUnloadEvent): void => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", keepUnsavedChanges);
+    return () => window.removeEventListener("beforeunload", keepUnsavedChanges);
+  }, [hasUnsavedChanges]);
+
+  function blockUnsavedNavigation(): boolean {
+    if (!unsavedChangesRef.current) return false;
+    setActionError(
+      caption(
+        props.locale,
+        "Your entry has unsaved changes. Save or cancel editing before switching items or filters.",
+        "当前条目有未保存的修改。请先保存或取消编辑，再切换条目或筛选。",
+      ),
+    );
+    return true;
+  }
 
   useLayoutEffect(() => {
     if (itemMenuOpen) itemMenuFirstActionRef.current?.focus();
@@ -669,11 +731,20 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
 
   const loadItems = useCallback(
     async (mode: CatalogLoadMode = "replace"): Promise<void> => {
+      if (unsavedChangesRef.current) {
+        deferredCatalogRefreshRef.current = true;
+        return;
+      }
       if (mode === "replace") setLoadState("loading");
       setLoadError(null);
       concealRevealedValues();
       try {
         const result = await loadPasswordItems();
+        if (unsavedChangesRef.current) {
+          deferredCatalogRefreshRef.current = true;
+          setLoadState("ready");
+          return;
+        }
         if (result.kind === "live") {
           setItems(result.items);
           setSelectedId((current) =>
@@ -716,6 +787,12 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
   useEffect(() => {
     void loadItems();
   }, [loadItems]);
+
+  useEffect(() => {
+    if (hasUnsavedChanges || !deferredCatalogRefreshRef.current) return;
+    deferredCatalogRefreshRef.current = false;
+    void loadItems("refresh");
+  }, [hasUnsavedChanges, loadItems]);
 
   useEffect(() => {
     const handoff = props.incomingMigration;
@@ -865,6 +942,7 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
   useEffect(() => {
     const itemId = props.incomingEditItemId;
     if (!itemId || !catalogMetadata) return;
+    if (blockUnsavedNavigation()) return;
     const metadata = catalogMetadata.items.find(
       (candidate) =>
         candidate.item_id === itemId || candidate.record_id === itemId,
@@ -904,6 +982,7 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
     props.locale,
     props.onEditConsumed,
     selected?.id,
+    hasUnsavedChanges,
   ]);
 
   function resetPage(): void {
@@ -911,6 +990,7 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
   }
 
   function clearFilters(): void {
+    if (blockUnsavedNavigation()) return;
     concealRevealedValues();
     setQuery("");
     setTagFilter("");
@@ -1005,6 +1085,8 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
     requestedLeft: number,
     requestedTop: number,
   ): void {
+    if (item.id !== selectedItemIdRef.current && blockUnsavedNavigation())
+      return;
     const menuWidth = 188;
     const menuHeight = 52;
     const viewportInset = 8;
@@ -1025,6 +1107,7 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
   }
 
   async function startEditing(item: PasswordItem): Promise<void> {
+    if (blockUnsavedNavigation()) return;
     editSessionRef.current += 1;
     concealRevealedValues();
     setActionError(null);
@@ -1710,6 +1793,7 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
       }
       setPendingConfirmation(null);
       setEditDraft(null);
+      unsavedChangesRef.current = false;
       setOrganizeDraft(null);
       setFeedback(caption(props.locale, "Changes saved.", "修改已保存。"));
       await loadItems("refresh");
@@ -1749,6 +1833,10 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
     resourceIds: string[],
     reportFailure = true,
   ): Promise<void> {
+    if (unsavedChangesRef.current) {
+      deferredCatalogRefreshRef.current = true;
+      return;
+    }
     concealRevealedValues();
     try {
       const result = await loadPasswordItems();
@@ -1787,16 +1875,19 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
     backendFilter,
     locale: props.locale,
     onTagFilterChange: (value: string) => {
+      if (blockUnsavedNavigation()) return;
       concealRevealedValues();
       setTagFilter(value);
       resetPage();
     },
     onTagModeChange: (mode: TagMode) => {
+      if (blockUnsavedNavigation()) return;
       concealRevealedValues();
       setTagMode(mode);
       resetPage();
     },
     onToggleBackend: (backend: PasswordBackend) => {
+      if (blockUnsavedNavigation()) return;
       concealRevealedValues();
       setBackendFilter((current) =>
         current.includes(backend)
@@ -1806,6 +1897,7 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
       resetPage();
     },
     onVaultFilterChange: (vault: string) => {
+      if (blockUnsavedNavigation()) return;
       concealRevealedValues();
       setVaultFilter(vault);
       resetPage();
@@ -1993,6 +2085,7 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
                         "搜索密码条目",
                       )}
                       onChange={(event) => {
+                        if (blockUnsavedNavigation()) return;
                         concealRevealedValues();
                         setQuery(event.currentTarget.value);
                         resetPage();
@@ -2074,6 +2167,11 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
                         }
                         key={result.item.id}
                         onClick={() => {
+                          if (
+                            result.item.id !== selected?.id &&
+                            blockUnsavedNavigation()
+                          )
+                            return;
                           concealRevealedValues();
                           setItemMenuOpen(false);
                           setItemContextMenu(null);
@@ -2120,6 +2218,7 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
                 label={caption(props.locale, "Password pages", "密码列表分页")}
                 nextLabel={caption(props.locale, "Next page", "下一页")}
                 onPageChange={(nextPage) => {
+                  if (blockUnsavedNavigation()) return;
                   concealRevealedValues();
                   setPage(nextPage);
                 }}
@@ -2761,7 +2860,10 @@ export function PasswordVaultPage(props: PasswordVaultPageProps): JSX.Element {
                     {editDraft ? (
                       <>
                         <button
-                          onClick={() => setEditDraft(null)}
+                          onClick={() => {
+                            setEditDraft(null);
+                            setActionError(null);
+                          }}
                           type="button"
                         >
                           {caption(props.locale, "Cancel", "取消")}

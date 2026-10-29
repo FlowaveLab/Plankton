@@ -16,6 +16,7 @@ import {
 import {
   useId,
   useRef,
+  useEffect,
   useState,
   type JSX,
   type PointerEvent as ReactPointerEvent,
@@ -516,6 +517,7 @@ export function ExposurePolicyEditor(props: {
   onChange: (value: CredentialExposurePolicy) => void;
   locale?: string;
   compact?: boolean;
+  protectedOnly?: boolean;
 }): JSX.Element {
   const editorId = useId();
   const zh = props.locale === "zh-CN";
@@ -588,6 +590,11 @@ export function ExposurePolicyEditor(props: {
           : `domain:${rule.domain}`,
     )
     .join("\n");
+  const [allowlistDraft, setAllowlistDraft] = useState(allowlistText);
+  const [editingAllowlist, setEditingAllowlist] = useState(false);
+  useEffect(() => {
+    if (!editingAllowlist) setAllowlistDraft(allowlistText);
+  }, [allowlistText, editingAllowlist]);
   const chart = exposureRadarChartModel({
     locale: props.locale,
     primary: value,
@@ -697,34 +704,37 @@ export function ExposurePolicyEditor(props: {
       className={`exposure-policy-editor${props.compact ? " is-compact" : ""}`}
     >
       <div className="exposure-policy-mode">
-        <ChoiceGroup
-          label={<>{zh ? "访问方式" : "Access mode"}</>}
-          onChange={(selected) =>
-            props.onChange({
-              ...value,
-              access_mode: selected as CredentialExposurePolicy["access_mode"],
-            })
-          }
-          value={value.access_mode}
-          options={[
-            {
-              value: "protected",
-              label: (
-                <>
-                  {zh
-                    ? "受保护（按暴露面审批）"
-                    : "Protected (exposure review)"}
-                </>
-              ),
-            },
-            {
-              value: "direct",
-              label: (
-                <>{zh ? "直接可见（无需审批）" : "Direct (no approval)"}</>
-              ),
-            },
-          ]}
-        />
+        {!props.protectedOnly ? (
+          <ChoiceGroup
+            label={<>{zh ? "访问方式" : "Access mode"}</>}
+            onChange={(selected) =>
+              props.onChange({
+                ...value,
+                access_mode:
+                  selected as CredentialExposurePolicy["access_mode"],
+              })
+            }
+            value={value.access_mode}
+            options={[
+              {
+                value: "protected",
+                label: (
+                  <>
+                    {zh
+                      ? "受保护（按暴露面审批）"
+                      : "Protected (exposure review)"}
+                  </>
+                ),
+              },
+              {
+                value: "direct",
+                label: (
+                  <>{zh ? "直接可见（无需审批）" : "Direct (no approval)"}</>
+                ),
+              },
+            ]}
+          />
+        ) : null}
         <ChoiceGroup
           label={<>{zh ? "超限动作" : "On breach"}</>}
           disabled={value.access_mode === "direct"}
@@ -862,6 +872,7 @@ export function ExposurePolicyEditor(props: {
                   activeEntry.max_level === 1 && allowlistText.length === 0
                 }
                 onChange={(event) => {
+                  setAllowlistDraft(event.currentTarget.value);
                   const rules = event.currentTarget.value
                     .split("\n")
                     .map((line) => line.trim())
@@ -882,8 +893,10 @@ export function ExposurePolicyEditor(props: {
                     });
                   updateSurface("network", { network_allowlist: rules });
                 }}
+                onFocus={() => setEditingAllowlist(true)}
+                onBlur={() => setEditingAllowlist(false)}
                 rows={4}
-                value={allowlistText}
+                value={allowlistDraft}
               />
               {activeEntry.max_level === 1 && allowlistText.length === 0 ? (
                 <small role="alert">

@@ -27,6 +27,7 @@ pub fn show<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
     window
         .unminimize()
         .context("failed to restore password change window")?;
+    crate::background::synchronize_dock_visibility(app)?;
     window
         .set_focus()
         .context("failed to focus password change window")?;

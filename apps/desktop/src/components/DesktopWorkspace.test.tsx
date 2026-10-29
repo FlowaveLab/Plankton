@@ -390,8 +390,8 @@ describe("DesktopWorkspace", () => {
     expect(progress?.style.height).toBe("auto");
     expect(progress?.style.display).toBe("grid");
     expect(progress?.style.borderRadius).toBe("0");
-    expect(edgeProgress?.style.margin).toContain("var(--space-5)");
     expect(edgeProgress?.style.margin).toContain("var(--space-4)");
+    expect(edgeProgress?.style.margin).toContain("var(--space-3)");
     expect(evidenceRow?.style.gridTemplateColumns).toContain("22px");
     expect(axisDot?.style.background).toBe("var(--red)");
     expect(activeNote?.style.boxShadow).toContain("var(--red)");

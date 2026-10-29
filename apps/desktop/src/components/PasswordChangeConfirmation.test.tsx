@@ -6,15 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const tauri = vi.hoisted(() => ({
   emit: vi.fn(),
-  hide: vi.fn(),
   invoke: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: tauri.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ emit: tauri.emit }));
-vi.mock("@tauri-apps/api/window", () => ({
-  getCurrentWindow: () => ({ hide: tauri.hide }),
-}));
 
 import { PASSWORD_CATALOG_CHANGED_EVENT } from "../passwordCatalogEvents";
 import { PasswordChangeConfirmation } from "./PasswordChangeConfirmation";
@@ -82,7 +78,6 @@ function pendingChange() {
 
 beforeEach(() => {
   tauri.emit.mockReset().mockResolvedValue(undefined);
-  tauri.hide.mockReset().mockResolvedValue(undefined);
   tauri.invoke.mockReset();
 });
 
@@ -121,6 +116,7 @@ describe("PasswordChangeConfirmation", () => {
       if (command === "confirm_password_change_command") {
         return Promise.resolve({ ...pendingChange(), state: "committed" });
       }
+      if (command === "hide_current_window") return Promise.resolve();
       return Promise.reject(new Error(`unexpected command ${command}`));
     });
     const view = render(<PasswordChangeConfirmation />);
@@ -140,7 +136,7 @@ describe("PasswordChangeConfirmation", () => {
     expect(tauri.emit).toHaveBeenCalledWith(PASSWORD_CATALOG_CHANGED_EVENT, {
       change_id: "change-1",
     });
-    expect(tauri.hide).toHaveBeenCalled();
+    expect(tauri.invoke).toHaveBeenCalledWith("hide_current_window");
     view.unmount();
   });
 });

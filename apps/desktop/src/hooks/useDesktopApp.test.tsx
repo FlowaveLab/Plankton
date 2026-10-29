@@ -40,6 +40,7 @@ const SETTINGS: DesktopSettings = {
   locale: "en",
   default_policy_mode: "assisted",
   llm_approval_allow_enabled: true,
+  approval_popup_enabled: true,
   llm_approval_deny_enabled: true,
   llm_approval_escalate_enabled: true,
   llm_auto_approve_password_edits: false,

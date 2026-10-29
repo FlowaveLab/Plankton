@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
+import { PASSWORD_CATALOG_CHANGED_EVENT } from "../passwordCatalogEvents";
 import {
   startTransition,
   useEffect,
@@ -36,6 +37,7 @@ import type {
   AuditRecord,
   DashboardData,
   DecisionCommand,
+  RememberExposureOptions,
   DesktopSettings,
 } from "../types";
 
@@ -52,6 +54,7 @@ const NUMERIC_SETTINGS_FIELDS = new Set<keyof DesktopSettings>([
 ]);
 const BOOLEAN_SETTINGS_FIELDS = new Set<keyof DesktopSettings>([
   "llm_approval_allow_enabled",
+  "approval_popup_enabled",
   "llm_approval_deny_enabled",
   "llm_approval_escalate_enabled",
   "llm_auto_approve_password_edits",
@@ -118,7 +121,11 @@ type UseDesktopAppResult = {
   selectResolvedRequest: (requestId: string) => void;
   selectResolvedAuto: (requestId: string) => void;
   setNoteDraft: (value: string) => void;
-  decide: (requestId: string, decision: DecisionCommand) => Promise<void>;
+  decide: (
+    requestId: string,
+    decision: DecisionCommand,
+    remember?: RememberExposureOptions,
+  ) => Promise<void>;
 };
 
 const INITIAL_STATE: DesktopAppState = {
@@ -267,6 +274,7 @@ function normalizeAcpProfile(profile: AcpProfile): AcpProfile {
 function normalizeSettings(settings: DesktopSettings): DesktopSettings {
   return {
     ...settings,
+    approval_popup_enabled: settings.approval_popup_enabled ?? true,
     provider_kind: normalizeProviderKind(settings.provider_kind),
     acp_profile: normalizeAcpProfile(settings.acp_profile),
   };
@@ -315,6 +323,7 @@ function areSettingsEqual(
 
   return (
     left.locale === right.locale &&
+    left.approval_popup_enabled === right.approval_popup_enabled &&
     left.default_policy_mode === right.default_policy_mode &&
     left.llm_approval_allow_enabled === right.llm_approval_allow_enabled &&
     left.llm_approval_deny_enabled === right.llm_approval_deny_enabled &&
@@ -356,6 +365,7 @@ function getSettingsFieldLabel(
 ): string {
   const labelMap: Record<keyof DesktopSettings, TranslationKey> = {
     locale: "settingsInterfaceLocale",
+    approval_popup_enabled: "settingsApprovalPopup",
     default_policy_mode: "settingsCurrentPolicy",
     llm_approval_allow_enabled: "settingsLlmDecisionAllow",
     llm_approval_deny_enabled: "settingsLlmDecisionDeny",
@@ -395,6 +405,7 @@ function getOverriddenSettingsFields(
     "locale",
     "default_policy_mode",
     "llm_approval_allow_enabled",
+    "approval_popup_enabled",
     "llm_approval_deny_enabled",
     "llm_approval_escalate_enabled",
     "llm_auto_approve_password_edits",
@@ -754,7 +765,11 @@ export function useDesktopApp(): UseDesktopAppResult {
   });
 
   const decide = useEffectEvent(
-    async (requestId: string, decision: DecisionCommand) => {
+    async (
+      requestId: string,
+      decision: DecisionCommand,
+      remember?: RememberExposureOptions,
+    ) => {
       if (!hasDesktopRuntime()) {
         setState((current) => ({
           ...current,
@@ -773,11 +788,15 @@ export function useDesktopApp(): UseDesktopAppResult {
         await invoke(decision, {
           requestId,
           note: stateRef.current.noteDraft.trim() || null,
+          ...(decision === "approve_request" ? remember : undefined),
         });
         setState((current) => ({
           ...current,
           noteDraft: "",
         }));
+        if (remember) {
+          await emit(PASSWORD_CATALOG_CHANGED_EVENT, { change_id: requestId });
+        }
         await loadDashboard();
       } catch (error) {
         setState((current) => ({

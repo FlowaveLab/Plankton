@@ -12,6 +12,7 @@ import type {
   DesktopSettings,
 } from "../../types";
 import { OperationsPage } from "./OperationsPages";
+import { defaultExposurePolicy } from "../ExposurePolicy";
 
 function chooseRadio(group: HTMLElement, value: string): void {
   const radio = Array.from(
@@ -79,6 +80,7 @@ const SETTINGS: DesktopSettings = {
   locale: "en",
   default_policy_mode: "manual_only",
   llm_approval_allow_enabled: true,
+  approval_popup_enabled: true,
   llm_approval_deny_enabled: true,
   llm_approval_escalate_enabled: true,
   llm_auto_approve_password_edits: false,
@@ -455,6 +457,99 @@ afterEach(() => {
 });
 
 describe("RequestsPage", () => {
+  it("forwards the edited scope and current policy when approving and remembering exposure", async () => {
+    const request = evaluationRequest("not_required", "manual_only");
+    const currentPolicy = {
+      ...defaultExposurePolicy(),
+      breach_action: "deny" as const,
+    };
+    const onDecision = vi.fn(async () => {});
+    invoke.mockImplementation((command: string) =>
+      command === "request_current_exposure_policy"
+        ? Promise.resolve(currentPolicy)
+        : Promise.resolve(undefined),
+    );
+    const view = render(
+      <OperationsPage
+        dashboard={{ pending_requests: [request], recent_audit_records: [] }}
+        focusedRequestId={request.id}
+        isSubmitting={false}
+        locale="en"
+        noteDraft="Approved for the named API"
+        onDecision={onDecision}
+        onNavigate={() => {}}
+        onNoteChange={() => {}}
+        settingsController={buildSettingsController()}
+        view="requests"
+      />,
+    );
+    await act(async () =>
+      view.container
+        .querySelector<HTMLButtonElement>(".remember-exposure-toggle")!
+        .click(),
+    );
+    expect(invoke).toHaveBeenCalledWith("request_current_exposure_policy", {
+      requestId: request.id,
+    });
+    const remember =
+      view.container.querySelector<HTMLElement>(".remember-exposure")!;
+    expect(remember.textContent).toContain(
+      "Saving a scope keeps that review mode in place",
+    );
+    expect(remember.querySelector('input[value="direct"]')).toBeNull();
+    const submit = () =>
+      Array.from(remember.querySelectorAll<HTMLButtonElement>("button")).find(
+        (button) => button.textContent === "Approve and remember exposure",
+      )!;
+    expect(submit().disabled).toBe(true);
+    act(() =>
+      remember
+        .querySelector<HTMLCanvasElement>("canvas")!
+        .dispatchEvent(
+          new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }),
+        ),
+    );
+    act(() =>
+      remember
+        .querySelectorAll<HTMLInputElement>(
+          '.exposure-axis-editor input[type="radio"]',
+        )[1]
+        .click(),
+    );
+    expect(submit().disabled).toBe(true);
+    const allowlist = remember.querySelector<HTMLTextAreaElement>(
+      ".exposure-network-allowlist textarea",
+    )!;
+    act(() => {
+      Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        "value",
+      )!.set!.call(allowlist, "domain:api.example.test");
+      allowlist.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(submit().disabled).toBe(false);
+    await act(async () => submit().click());
+    expect(onDecision).toHaveBeenCalledTimes(1);
+    expect(onDecision).toHaveBeenCalledWith(request.id, "approve_request", {
+      expectedExposurePolicy: currentPolicy,
+      exposurePolicy: {
+        ...currentPolicy,
+        surfaces: currentPolicy.surfaces.map((surface) =>
+          surface.surface === "network"
+            ? {
+                ...surface,
+                max_level: 1,
+                network_allowlist: [
+                  { kind: "exact_domain", domain: "api.example.test" },
+                ],
+              }
+            : surface,
+        ),
+      },
+    });
+    view.unmount();
+  });
+
   it("follows human → automatic → history and preserves an explicitly selected queue", async () => {
     const human = { ...evaluationRequest("failed"), id: "human" };
     const automatic = { ...evaluationRequest("running"), id: "automatic" };
@@ -2026,6 +2121,47 @@ describe("RequestsPage", () => {
 });
 
 describe("PoliciesPage", () => {
+  it.each(["manual_only", "assisted", "llm_automatic"])(
+    "keeps approval notifications editable and saves the changed draft in %s mode",
+    (mode) => {
+      const settings = { ...SETTINGS, default_policy_mode: mode };
+      const controller = buildSettingsController({
+        settings,
+        settingsDraft: settings,
+      });
+      const view = render(policiesPage(controller));
+      const popup = () =>
+        view.container.querySelector<HTMLInputElement>(
+          '[data-settings-field="approval_popup_enabled"]',
+        )!;
+      const save = () =>
+        view.container.querySelector<HTMLButtonElement>(
+          '[data-testid="save-settings-button"]',
+        )!;
+      expect(popup().checked).toBe(true);
+      expect(popup().disabled).toBe(false);
+      expect(save().disabled).toBe(true);
+      act(() => popup().click());
+      expect(controller.onFieldChange).toHaveBeenCalledWith(
+        "approval_popup_enabled",
+        "false",
+      );
+      const updatedController = {
+        ...controller,
+        settingsDraft: { ...settings, approval_popup_enabled: false },
+        canSave: true,
+        hasUnsavedChanges: true,
+      };
+      view.rerender(policiesPage(updatedController));
+      expect(popup().checked).toBe(false);
+      expect(save().disabled).toBe(false);
+      act(() => save().click());
+      expect(controller.onSave).toHaveBeenCalledTimes(1);
+      expect(controller.onPolicyModeChange).not.toHaveBeenCalled();
+      view.unmount();
+    },
+  );
+
   it("promotes policy controls without a settings category rail", () => {
     const controller = buildSettingsController({
       settingsDraft: { ...SETTINGS, default_policy_mode: "assisted" },

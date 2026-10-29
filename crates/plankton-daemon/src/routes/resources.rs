@@ -48,7 +48,7 @@ pub async fn search_resources(
         ));
     }
     let correlation_id = request.correlation_id;
-    let catalog = match tokio::task::spawn_blocking(list_local_secret_catalog).await {
+    let mut catalog = match tokio::task::spawn_blocking(list_local_secret_catalog).await {
         Ok(Ok(catalog)) => catalog,
         Ok(Err(error)) => {
             return Json(failure(
@@ -78,6 +78,14 @@ pub async fn search_resources(
             ));
         }
     };
+    if let Err(error) = store.apply_remembered_exposure_policies(&mut catalog).await {
+        return Json(failure(
+            correlation_id,
+            ErrorCode::StorageFailed,
+            error.to_string(),
+            true,
+        ));
+    }
     let enabled_backends = match enabled_external_backends(&store).await {
         Ok(backends) => backends,
         Err(error) => {
@@ -175,13 +183,8 @@ pub async fn access_resource(
             ));
         }
     }
-    let annotations = tokio::task::spawn_blocking({
-        let resource_id = request.payload.resource_id.clone();
-        move || resource_annotations(&resource_id)
-    })
-    .await;
-    let (tags, resource_metadata) = match annotations {
-        Ok(Ok(annotations)) => annotations,
+    let mut catalog = match tokio::task::spawn_blocking(list_local_secret_catalog).await {
+        Ok(Ok(catalog)) => catalog,
         Ok(Err(error)) => {
             return Json(failure(
                 correlation_id,
@@ -199,7 +202,29 @@ pub async fn access_resource(
             ));
         }
     };
-    let context = resource_access_context(request.payload, tags, resource_metadata);
+    let fingerprint = plankton_core::exposure::catalog_exposure_snapshots(&catalog)
+        .into_iter()
+        .find(|snapshot| snapshot.resource_id == request.payload.resource_id)
+        .map(|snapshot| snapshot.fingerprint);
+    if let Err(error) = state
+        .store
+        .apply_remembered_exposure_policies(&mut catalog)
+        .await
+    {
+        return Json(failure(
+            correlation_id,
+            ErrorCode::StorageFailed,
+            error.to_string(),
+            true,
+        ));
+    }
+    let (tags, resource_metadata) = resource_annotations(catalog, &request.payload.resource_id);
+    let mut context = resource_access_context(request.payload, tags, resource_metadata);
+    let fingerprint_key = plankton_core::exposure::EXPOSURE_CATALOG_FINGERPRINT_KEY;
+    context.metadata.remove(fingerprint_key);
+    if let Some(fingerprint) = fingerprint {
+        context.metadata.insert(fingerprint_key.into(), fingerprint);
+    }
     let settings = match state.settings.current() {
         Ok(settings) => settings,
         Err(error) => {
@@ -778,9 +803,9 @@ fn catalog_generation_for_path(path: &Path) -> io::Result<u64> {
 }
 
 fn resource_annotations(
+    catalog: LocalSecretCatalog,
     resource_id: &str,
-) -> Result<(Vec<String>, BTreeMap<String, String>), plankton_core::SecretImportError> {
-    let catalog = list_local_secret_catalog()?;
+) -> (Vec<String>, BTreeMap<String, String>) {
     if let Some(entry) = catalog
         .literals
         .into_iter()
@@ -790,7 +815,7 @@ fn resource_annotations(
         if let Some(description) = entry.description {
             metadata.insert("resource_note".into(), description);
         }
-        return Ok((entry.tags, metadata));
+        return (entry.tags, metadata);
     }
     if let Some(entry) = catalog
         .imports
@@ -801,9 +826,9 @@ fn resource_annotations(
         if let Some(description) = entry.description {
             metadata.insert("resource_note".into(), description);
         }
-        return Ok((entry.tags, metadata));
+        return (entry.tags, metadata);
     }
-    Ok((Vec::new(), BTreeMap::new()))
+    (Vec::new(), BTreeMap::new())
 }
 
 fn response_from_request(

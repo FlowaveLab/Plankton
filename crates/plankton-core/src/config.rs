@@ -43,6 +43,8 @@ pub struct PlanktonSettings {
     #[serde(default = "default_true")]
     pub llm_approval_allow_enabled: bool,
     #[serde(default = "default_true")]
+    pub approval_popup_enabled: bool,
+    #[serde(default = "default_true")]
     pub llm_approval_deny_enabled: bool,
     #[serde(default = "default_true")]
     pub llm_approval_escalate_enabled: bool,
@@ -84,6 +86,8 @@ pub struct UserSettings {
     #[serde(default = "default_true")]
     pub llm_approval_allow_enabled: bool,
     #[serde(default = "default_true")]
+    pub approval_popup_enabled: bool,
+    #[serde(default = "default_true")]
     pub llm_approval_deny_enabled: bool,
     #[serde(default = "default_true")]
     pub llm_approval_escalate_enabled: bool,
@@ -123,6 +127,7 @@ impl Default for PlanktonSettings {
             locale: DEFAULT_LOCALE.to_string(),
             default_policy_mode: PolicyMode::ManualOnly,
             llm_approval_allow_enabled: true,
+            approval_popup_enabled: true,
             llm_approval_deny_enabled: true,
             llm_approval_escalate_enabled: true,
             llm_auto_approve_password_edits: false,
@@ -159,6 +164,7 @@ impl From<&PlanktonSettings> for UserSettings {
             locale: settings.locale.clone(),
             default_policy_mode: settings.default_policy_mode,
             llm_approval_allow_enabled: settings.llm_approval_allow_enabled,
+            approval_popup_enabled: settings.approval_popup_enabled,
             llm_approval_deny_enabled: settings.llm_approval_deny_enabled,
             llm_approval_escalate_enabled: settings.llm_approval_escalate_enabled,
             llm_auto_approve_password_edits: settings.llm_auto_approve_password_edits,
@@ -193,6 +199,7 @@ impl UserSettings {
             locale: normalize_locale_value(&self.locale).to_string(),
             default_policy_mode: self.default_policy_mode,
             llm_approval_allow_enabled: self.llm_approval_allow_enabled,
+            approval_popup_enabled: self.approval_popup_enabled,
             llm_approval_deny_enabled: self.llm_approval_deny_enabled,
             llm_approval_escalate_enabled: self.llm_approval_escalate_enabled,
             llm_auto_approve_password_edits: self.llm_auto_approve_password_edits,
@@ -309,6 +316,7 @@ fn load_settings_from_path(
     let mut builder = Config::builder()
         .set_default("database_url", defaults.database_url.clone())?
         .set_default("locale", defaults.locale.clone())?
+        .set_default("approval_popup_enabled", defaults.approval_popup_enabled)?
         .set_default(
             "default_policy_mode",
             policy_mode_to_string(defaults.default_policy_mode),
@@ -672,6 +680,10 @@ fn save_user_settings_to_path(
     table.insert(
         "default_policy_mode".to_string(),
         TomlValue::String(policy_mode_to_string(normalized.default_policy_mode)),
+    );
+    table.insert(
+        "approval_popup_enabled".to_string(),
+        TomlValue::Boolean(normalized.approval_popup_enabled),
     );
     table.insert(
         "llm_approval_allow_enabled".to_string(),
@@ -1038,7 +1050,12 @@ mod tests {
             .expect("temp parent should be created");
         std::fs::write(
             &path,
-            "recent_audit_limit = 42\nrequest_template = \"keep-me\"\n",
+            concat!(
+                "recent_audit_limit = 42\n",
+                "request_template = \"keep-me\"\n",
+                "memory_enabled = true\n",
+                "memory_template = \"legacy\"\n",
+            ),
         )
         .expect("seed settings file should be written");
 
@@ -1046,6 +1063,7 @@ mod tests {
             locale: "zh-CN".to_string(),
             default_policy_mode: PolicyMode::Assisted,
             llm_approval_allow_enabled: true,
+            approval_popup_enabled: false,
             llm_approval_deny_enabled: false,
             llm_approval_escalate_enabled: true,
             llm_auto_approve_password_edits: true,
@@ -1076,6 +1094,12 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).expect("settings file should be readable");
         assert!(written.contains("recent_audit_limit = 42"));
+        assert!(written.contains("approval_popup_enabled = false"));
+        assert!(
+            !load_settings_from_path(&path, false)
+                .expect("reload notification setting")
+                .approval_popup_enabled
+        );
         assert!(written.contains("locale = \"zh-CN\""));
         assert!(written.contains("llm_approval_allow_enabled = true"));
         assert!(written.contains("llm_approval_deny_enabled = false"));
@@ -1093,6 +1117,8 @@ mod tests {
         assert!(!written.contains("acp_args"));
         assert!(!written.contains("acp_codex_program"));
         assert!(!written.contains("acp_codex_args"));
+        assert!(!written.contains("memory_enabled"));
+        assert!(!written.contains("memory_template"));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1104,6 +1130,7 @@ mod tests {
             locale: "zh-CN".to_string(),
             default_policy_mode: PolicyMode::LlmAutomatic,
             llm_approval_allow_enabled: true,
+            approval_popup_enabled: true,
             llm_approval_deny_enabled: true,
             llm_approval_escalate_enabled: false,
             llm_auto_approve_password_edits: true,

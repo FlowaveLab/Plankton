@@ -4,6 +4,7 @@ import { ChoiceGroup } from "../ChoiceGroup";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Activity,
+  Bell,
   Bot,
   Cable,
   CircleCheck,
@@ -64,12 +65,14 @@ import type {
   CredentialExposureReport,
   DashboardData,
   DecisionCommand,
+  RememberExposureOptions,
   DesktopSettings,
   ExposureEvidenceAnnotation,
   ExposureEvidenceTarget,
   ProviderTrace,
   StructuredCallChainNode,
 } from "../../types";
+import { RememberExposure } from "../RememberExposure";
 import { ApprovalChat } from "../ApprovalChat";
 import { ApprovalMarkdown } from "../ApprovalMarkdown";
 import {
@@ -114,7 +117,11 @@ type OperationsPageProps = {
   focusedRequestId: string | null;
   isSubmitting: boolean;
   noteDraft: string;
-  onDecision: (requestId: string, decision: DecisionCommand) => Promise<void>;
+  onDecision: (
+    requestId: string,
+    decision: DecisionCommand,
+    remember?: RememberExposureOptions,
+  ) => Promise<void>;
   view: Exclude<WorkspaceView, "passwords">;
   onNavigate: (view: WorkspaceView) => void;
   onNoteChange: (note: string) => void;
@@ -1995,6 +2002,30 @@ function LlmApprovalEvidence({
   return (
     <div className="request-llm-evidence">
       {!hideOverview ? overview : null}
+      {providerTrace?.decision_attempt_errors?.length ? (
+        <details className="request-llm-recovery">
+          <summary>
+            {suggestion?.error
+              ? zh
+                ? "自动审批重试后仍未完成"
+                : "Automatic review could not recover"
+              : zh
+                ? "自动审批已在一次重试后恢复"
+                : "Automatic review recovered after one retry"}
+          </summary>
+          <p>
+            {zh
+              ? "第一次会话已取消，使用新会话重新独立评估。"
+              : "The first session was cancelled before a fresh independent review."}
+          </p>
+          <ul>
+            {providerTrace.decision_attempt_errors.map((message, index) => (
+              <li key={index}>{message}</li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+
       <details className="request-technical-details">
         <summary>
           {zh ? "技术与来源信息" : "Technical details and provenance"}
@@ -2325,7 +2356,11 @@ function RequestsPage({
   focusedRequestId: string | null;
   isSubmitting: boolean;
   noteDraft: string;
-  onDecision: (requestId: string, decision: DecisionCommand) => Promise<void>;
+  onDecision: (
+    requestId: string,
+    decision: DecisionCommand,
+    remember?: RememberExposureOptions,
+  ) => Promise<void>;
   initialHistory?: "grouped";
   onNoteChange: (note: string) => void;
   zh: boolean;
@@ -2342,7 +2377,9 @@ function RequestsPage({
   const [historyView, setHistoryView] = useState<
     "requests" | "grouped" | "raw"
   >(initialHistory ?? "requests");
-  function onOpenAudit(): void {
+  const [auditRequestId, setAuditRequestId] = useState<string | null>(null);
+  function onOpenAudit(requestId?: string): void {
+    setAuditRequestId(requestId ?? null);
     setStatusFilter("completed");
     setHistoryView("grouped");
     setPage(1);
@@ -2596,12 +2633,19 @@ function RequestsPage({
     setSelected("");
   }
 
-  async function decideSelected(decision: DecisionCommand): Promise<void> {
+  async function decideSelected(
+    decision: DecisionCommand,
+    remember?: RememberExposureOptions,
+  ): Promise<void> {
     if (!detail) return;
     const keepVisible =
       detail.request.llm_suggestion?.provider_trace?.review_progress?.state ===
       "running";
-    await onDecision(detail.id, decision);
+    if (remember) {
+      await onDecision(detail.id, decision, remember);
+    } else {
+      await onDecision(detail.id, decision);
+    }
     if (keepVisible) {
       setQuery("");
       setStatusFilter("completed");
@@ -2714,6 +2758,7 @@ function RequestsPage({
           zh={zh}
           embedded
           displayMode={historyView}
+          initialRequestId={auditRequestId}
         />
       </section>
     );
@@ -2772,7 +2817,7 @@ function RequestsPage({
           icon={noHistory ? History : Search}
           action={
             noHistory ? (
-              <button onClick={onOpenAudit} type="button">
+              <button onClick={() => onOpenAudit()} type="button">
                 <GitBranch aria-hidden="true" size={16} />
                 {zh ? "查看审批流程" : "Open audit"}
               </button>
@@ -2869,6 +2914,17 @@ function RequestsPage({
                   zh={zh}
                   overviewOnly
                 />
+                {humanReviewable ? (
+                  <RememberExposure
+                    key={detail.id}
+                    request={detail.request}
+                    zh={zh}
+                    busy={isSubmitting}
+                    onApprove={(options) =>
+                      decideSelected("approve_request", options)
+                    }
+                  />
+                ) : null}
                 <section
                   aria-label={zh ? "审批状态" : "Approval state"}
                   className="approval-state-rail"
@@ -2959,6 +3015,18 @@ function RequestsPage({
                     </div>
                     <span>{`${displayedCallChain.length} ${zh ? "层" : displayedCallChain.length === 1 ? "step" : "steps"}`}</span>
                   </div>
+                  <p className="request-capture-summary">
+                    {zh
+                      ? "进程链来自系统采集；stdin 内容和管道的其他消费进程不一定包含在其中。"
+                      : "The process chain comes from system collection; stdin content and other pipe consumers may not be included."}
+                    {detail.request.context.metadata.script_path_source ===
+                    "declared_consumer"
+                      ? (zh
+                          ? " 消费脚本由调用者声明："
+                          : " Caller-declared consumer script: ") +
+                        detail.request.context.script_path
+                      : ""}
+                  </p>
                   <RequestCallChain
                     callChain={displayedCallChain}
                     inlineSources={
@@ -2968,17 +3036,19 @@ function RequestsPage({
                     report={detail.request.llm_suggestion?.exposure_report}
                     zh={zh}
                   />
-                  <h4>{zh ? "请求元数据" : "Request metadata"}</h4>
-                  <pre>
-                    {JSON.stringify(
-                      {
-                        ...detail.request.context.metadata,
-                        ...detail.request.context.resource_metadata,
-                      },
-                      null,
-                      2,
-                    )}
-                  </pre>
+                  <details className="request-metadata-disclosure">
+                    <summary>{zh ? "请求元数据" : "Request metadata"}</summary>
+                    <pre>
+                      {JSON.stringify(
+                        {
+                          ...detail.request.context.metadata,
+                          ...detail.request.context.resource_metadata,
+                        },
+                        null,
+                        2,
+                      )}
+                    </pre>
+                  </details>
                 </section>
                 <section className="request-chain-dossier request-detail-section">
                   <div className="request-call-chain-title">
@@ -3111,7 +3181,11 @@ function RequestsPage({
                   </p>
                 ) : null}
                 <ApprovalChat requestId={detail.id} zh={zh} />
-                <button className="ghost" onClick={onOpenAudit} type="button">
+                <button
+                  className="ghost"
+                  onClick={() => onOpenAudit(detail.id)}
+                  type="button"
+                >
                   {zh ? "打开完整审计记录" : "Open full audit record"}
                 </button>
               </div>
@@ -4916,17 +4990,57 @@ function condensedAuditEvents(
 
 function AuditPage({
   dashboard,
+  initialRequestId,
   zh,
   embedded = false,
   displayMode,
 }: {
   dashboard?: DashboardData | null;
+  initialRequestId?: string | null;
   zh: boolean;
   embedded?: boolean;
   displayMode?: "grouped" | "raw";
 }): JSX.Element {
   type AuditRecord = DashboardData["recent_audit_records"][number];
-  const records = dashboard?.recent_audit_records ?? [];
+  const [requestRecords, setRequestRecords] = useState<AuditRecord[]>([]);
+  const [auditLoadError, setAuditLoadError] = useState<string | null>(null);
+  const records = useMemo(
+    () =>
+      Array.from(
+        new Map(
+          [...(dashboard?.recent_audit_records ?? []), ...requestRecords].map(
+            (record) => [record.id, record],
+          ),
+        ).values(),
+      ),
+    [dashboard, requestRecords],
+  );
+  useEffect(() => {
+    if (
+      !initialRequestId ||
+      !(window as Window & { __TAURI_INTERNALS__?: object }).__TAURI_INTERNALS__
+    )
+      return;
+    let active = true;
+    void invoke<AuditRecord[]>("request_audit_records", {
+      requestId: initialRequestId,
+    })
+      .then((loaded) => {
+        if (active) {
+          setRequestRecords(loaded);
+          setAuditLoadError(null);
+        }
+      })
+      .catch((reason: unknown) => {
+        if (active)
+          setAuditLoadError(
+            reason instanceof Error ? reason.message : String(reason),
+          );
+      });
+    return () => {
+      active = false;
+    };
+  }, [initialRequestId]);
   const groups = useMemo(() => buildAuditApprovalGroups(records), [records]);
   const [viewMode, setViewMode] = useState<"grouped" | "raw">("grouped");
   useEffect(() => {
@@ -4936,14 +5050,14 @@ function AuditPage({
       setResultFilter("all");
     }
   }, [displayMode]);
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(initialRequestId ?? "");
   const [actorFilter, setActorFilter] = useState("all");
   const [actionFilter, setActionFilter] = useState("all");
   const [resultFilter, setResultFilter] = useState("all");
   const [timeFilter, setTimeFilter] = useState("all");
   const [page, setPage] = useState(1);
   const [expandedRequestId, setExpandedRequestId] = useState<string | null>(
-    null,
+    initialRequestId ?? null,
   );
   const [selected, setSelected] = useState<AuditRecord | null>(null);
   const [requestEvidenceById, setRequestEvidenceById] = useState<
@@ -4970,35 +5084,42 @@ function AuditPage({
 
   useEffect(() => {
     if (!desktopRuntime || !expandedRequestId || !evidenceRefreshKey) return;
-    const generation = requestEvidenceGenerationRef.current + 1;
-    requestEvidenceGenerationRef.current = generation;
+    const generation = ++requestEvidenceGenerationRef.current;
+    let timer: number | undefined;
     setRequestEvidenceLoadingId(expandedRequestId);
     setRequestEvidenceError(null);
-    void invoke<AccessRequest>("request_evidence", {
-      requestId: expandedRequestId,
-    })
-      .then((request) => {
+    const load = async (): Promise<void> => {
+      try {
+        const request = await invoke<AccessRequest>("request_evidence", {
+          requestId: expandedRequestId,
+        });
         if (requestEvidenceGenerationRef.current !== generation) return;
         setRequestEvidenceById((current) => ({
           ...current,
           [expandedRequestId]: request,
         }));
-      })
-      .catch((reason: unknown) => {
-        if (requestEvidenceGenerationRef.current !== generation) return;
-        setRequestEvidenceError(
-          reason instanceof Error ? reason.message : String(reason),
-        );
-      })
-      .finally(() => {
-        if (requestEvidenceGenerationRef.current === generation) {
-          setRequestEvidenceLoadingId(null);
+        if (
+          request.llm_suggestion?.provider_trace?.review_progress?.state ===
+          "running"
+        ) {
+          timer = window.setTimeout(() => void load(), 2000);
         }
-      });
-    return () => {
-      if (requestEvidenceGenerationRef.current === generation) {
-        requestEvidenceGenerationRef.current += 1;
+      } catch (reason) {
+        if (requestEvidenceGenerationRef.current === generation) {
+          setRequestEvidenceError(
+            reason instanceof Error ? reason.message : String(reason),
+          );
+        }
+      } finally {
+        if (requestEvidenceGenerationRef.current === generation)
+          setRequestEvidenceLoadingId(null);
       }
+    };
+    void load();
+    return () => {
+      window.clearTimeout(timer);
+      if (requestEvidenceGenerationRef.current === generation)
+        requestEvidenceGenerationRef.current += 1;
     };
   }, [desktopRuntime, evidenceRefreshKey, expandedRequestId]);
 
@@ -5158,6 +5279,11 @@ function AuditPage({
           eyebrow="IMMUTABLE TRAIL"
           title={zh ? "审计" : "Audit"}
         />
+      ) : null}
+      {auditLoadError ? (
+        <p className="workspace-alert" role="alert">
+          {auditLoadError}
+        </p>
       ) : null}
       {records.length === 0 ? (
         <EmptyState
@@ -5331,9 +5457,12 @@ function AuditPage({
                     const exposureReport = exposureReportFromAudit(
                       group.events,
                     );
-                    const reviewProgress = reviewProgressFromAudit(
-                      group.events,
-                    );
+                    const requestEvidence =
+                      requestEvidenceById[group.request_id] ?? null;
+                    const reviewProgress =
+                      requestEvidence?.llm_suggestion?.provider_trace
+                        ?.review_progress ??
+                      reviewProgressFromAudit(group.events);
                     const exposurePolicy = exposurePolicyFromAudit(
                       group.events,
                     );
@@ -5356,8 +5485,6 @@ function AuditPage({
                             surface.evidence_state === "observed"
                           ),
                       ) ?? [];
-                    const requestEvidence =
-                      requestEvidenceById[group.request_id] ?? null;
                     const evidenceLoading =
                       requestEvidenceLoadingId === group.request_id;
                     return (
@@ -6554,11 +6681,12 @@ function SettingsToggle(props: {
   checked: boolean;
   controller: SettingsPageController;
   description: string;
-  field: PasswordAutoApprovalField;
+  field: PasswordAutoApprovalField | "approval_popup_enabled";
   label: string;
   policyEnabled: boolean;
 }): JSX.Element {
   const Icon = {
+    approval_popup_enabled: Bell,
     llm_auto_approve_password_edits: Pencil,
     llm_auto_approve_password_renames: TextCursorInput,
     llm_auto_approve_password_refreshes: RefreshCw,
@@ -6689,6 +6817,28 @@ function PolicySettings(props: {
     settings.default_policy_mode === "llm_automatic";
   return (
     <>
+      <SettingsSection
+        description={
+          locale === "zh-CN"
+            ? "有新的待审批请求时，在屏幕右上角提醒你。关闭提醒后仍可从请求列表处理。"
+            : "Show a small notification in the upper-right corner for new approvals. Requests remain available in the inbox when notifications are off."
+        }
+        testId="settings-notifications-section"
+        title={locale === "zh-CN" ? "审批提醒" : "Approval notifications"}
+      >
+        <SettingsToggle
+          checked={settings.approval_popup_enabled ?? true}
+          controller={controller}
+          description={
+            locale === "zh-CN"
+              ? "不抢占当前窗口焦点；点击查看详情后进入审批。"
+              : "Keeps your current window focused. Open details when you are ready to review."
+          }
+          field="approval_popup_enabled"
+          label={t(locale, "settingsApprovalPopup")}
+          policyEnabled
+        />
+      </SettingsSection>
       <SettingsSection
         description={t(locale, "settingsPolicyHelp")}
         testId="settings-policy-section"

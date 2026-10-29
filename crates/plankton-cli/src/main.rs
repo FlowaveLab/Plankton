@@ -1,3 +1,4 @@
+mod consumer_script;
 mod desktop_handoff;
 mod onepassword_import;
 mod skill_install;
@@ -349,6 +350,12 @@ struct GetArgs {
     reason: String,
     #[arg(long, help = "Requester identity; defaults to the OS user")]
     requested_by: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Declare a credential-free consumer script for review; does not execute or bind the consumer"
+    )]
+    consumer_script: Option<PathBuf>,
     #[arg(
         long = "env",
         value_name = "KEY=VALUE",
@@ -953,7 +960,11 @@ async fn run_get(output: OutputFormat, args: GetArgs) -> Result<ExitCode> {
     for (key, value) in parse_key_values("env", args.env_vars)? {
         metadata.insert(format!("env.{key}"), value);
     }
-    let script_path = derive_script_path(&call_chain);
+    let script_path = consumer_script::prepare_script_context(
+        derive_script_path(&call_chain),
+        args.consumer_script.as_deref(),
+        &mut metadata,
+    )?;
     let call_chain_details = resource_access_call_chain(&call_chain);
     let call_chain = prompt_call_chain_paths(&call_chain);
 
@@ -1755,6 +1766,28 @@ mod tests {
             transferred[0].resolved_file_path.as_deref(),
             Some("/workspace/analyze.sh")
         );
+    }
+
+    #[test]
+    fn parses_declared_consumer_script_without_consuming_standard_input() {
+        let cli = Cli::try_parse_from([
+            "plankton",
+            "get",
+            "secret/service-token",
+            "--reason",
+            "Call the declared API client",
+            "--consumer-script",
+            "/workspace/api-client.py",
+        ])
+        .expect("consumer script option");
+        let Commands::Get(args) = cli.command else {
+            panic!("expected get");
+        };
+        assert_eq!(
+            args.consumer_script,
+            Some(PathBuf::from("/workspace/api-client.py"))
+        );
+        assert!(args.metadata.is_empty());
     }
 
     #[test]

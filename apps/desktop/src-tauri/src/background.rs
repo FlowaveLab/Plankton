@@ -13,92 +13,187 @@ pub fn request_explicit_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
 
 pub fn handle_window_event<R: Runtime>(window: &tauri::Window<R>, event: &WindowEvent) {
     if let WindowEvent::CloseRequested { api, .. } = event {
-        match close_action(window.label(), EXPLICIT_QUIT.load(Ordering::SeqCst)) {
-            CloseAction::Hide { hide_dock } => {
-                api.prevent_close();
-                match window.hide() {
-                    Ok(()) if hide_dock => hide_dock_icon(window.app_handle()),
-                    Ok(()) => {}
-                    Err(error) => error!(
-                        window = window.label(),
-                        error = %error,
-                        "failed to hide persistent Plankton window"
-                    ),
-                }
+        if !EXPLICIT_QUIT.load(Ordering::SeqCst) {
+            api.prevent_close();
+            let result = if window.label() == crate::approval_window::APPROVAL_LABEL {
+                crate::approval_window::dismiss_popup(window.app_handle())
+            } else {
+                window.hide().map_err(anyhow::Error::from).and_then(|()| {
+                    synchronize_dock_visibility(window.app_handle()).map_err(anyhow::Error::from)
+                })
+            };
+            if let Err(error) = result {
+                error!(window = window.label(), %error, "failed to hide persistent Plankton window");
             }
-            CloseAction::Exit => {}
         }
     }
 }
 
 pub fn show_main_window<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
-    show_dock_icon(app)?;
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         window.show()?;
         window.unminimize()?;
+        synchronize_dock_visibility(app)?;
         window.set_focus()?;
     }
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CloseAction {
-    Hide { hide_dock: bool },
-    Exit,
+fn close_target<'a>(windows: &[(&'a str, bool, bool)]) -> Option<&'a str> {
+    windows
+        .iter()
+        .find(|(_, visible, focused)| *visible && *focused)
+        .or_else(|| {
+            windows
+                .iter()
+                .find(|(label, visible, _)| *visible && *label == MAIN_WINDOW_LABEL)
+        })
+        .or_else(|| windows.iter().find(|(_, visible, _)| *visible))
+        .map(|(label, _, _)| *label)
 }
 
-fn close_action(window_label: &str, explicit_quit: bool) -> CloseAction {
-    if explicit_quit {
-        CloseAction::Exit
-    } else {
-        CloseAction::Hide {
-            hide_dock: window_label == MAIN_WINDOW_LABEL,
+pub fn hide_current_user_window<R: Runtime>(app: &tauri::AppHandle<R>) -> anyhow::Result<()> {
+    let windows = app.webview_windows();
+    let states = windows
+        .iter()
+        .map(|(label, window)| Ok((label.as_str(), window.is_visible()?, window.is_focused()?)))
+        .collect::<tauri::Result<Vec<_>>>()?;
+    if let Some(label) = close_target(&states) {
+        if label == crate::approval_window::APPROVAL_LABEL {
+            crate::approval_window::dismiss_popup(app)?;
+        } else if let Some(window) = windows.get(label) {
+            window.hide()?;
+        }
+    }
+    synchronize_dock_visibility(app)?;
+    Ok(())
+}
+
+fn keep_running_after_exit_request(explicit_quit: bool, code: Option<i32>) -> bool {
+    !explicit_quit && code.is_none()
+}
+
+pub fn handle_run_event<R: Runtime>(app: &tauri::AppHandle<R>, event: tauri::RunEvent) {
+    if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+        if keep_running_after_exit_request(EXPLICIT_QUIT.load(Ordering::SeqCst), code) {
+            api.prevent_exit();
+            if let Err(error) = hide_current_user_window(app) {
+                error!(%error, "failed to close current window while keeping Plankton running");
+            }
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn hide_dock_icon<R: Runtime>(app: &tauri::AppHandle<R>) {
-    if let Err(error) = app.set_dock_visibility(false) {
-        error!(%error, "failed to hide Plankton Dock icon");
-    }
+pub fn setup_application_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItemBuilder, SubmenuBuilder};
+    let close = MenuItemBuilder::with_id("plankton.close-current", "Close current window")
+        .accelerator("Cmd+Q")
+        .build(app)?;
+    let app_menu = SubmenuBuilder::new(app, "Plankton")
+        .about(None)
+        .separator()
+        .services()
+        .separator()
+        .hide()
+        .hide_others()
+        .separator()
+        .item(&close)
+        .text("plankton.explicit-quit", "Quit Plankton")
+        .build()?;
+    // Retain native Edit, View, Window and Help actions, but replace the app
+    // menu so its predefined Cmd+Q quit cannot bypass the background workflow.
+    let menu = Menu::default(app)?;
+    menu.remove_at(0)?;
+    menu.insert(&app_menu, 0)?;
+    app.set_menu(menu)?;
+    app.on_menu_event(|app, event| match event.id().as_ref() {
+        "plankton.close-current" => {
+            if let Err(error) = hide_current_user_window(app) {
+                error!(%error, "failed to close current window from Command-Q");
+            }
+        }
+        "plankton.explicit-quit" => request_explicit_quit(app),
+        _ => {}
+    });
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn hide_dock_icon<R: Runtime>(_app: &tauri::AppHandle<R>) {}
+pub fn setup_application_menu<R: Runtime>(_app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+    Ok(())
+}
 
+fn window_needs_dock(label: &str, visible: bool) -> bool {
+    visible && label != crate::approval_window::APPROVAL_LABEL
+}
+
+/// Dock presence follows all user windows, including confirmations. Passive
+/// approval notifications never make a background Plankton app appear in Dock.
 #[cfg(target_os = "macos")]
-fn show_dock_icon<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
-    app.set_dock_visibility(true)
+pub fn synchronize_dock_visibility<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+    let mut visible_user_window = false;
+    for (label, window) in app.webview_windows() {
+        if window_needs_dock(&label, window.is_visible()?) {
+            visible_user_window = true;
+            break;
+        }
+    }
+    app.set_activation_policy(if visible_user_window {
+        tauri::ActivationPolicy::Regular
+    } else {
+        tauri::ActivationPolicy::Accessory
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn show_dock_icon<R: Runtime>(_app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+pub fn synchronize_dock_visibility<R: Runtime>(_app: &tauri::AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{close_action, CloseAction};
+    use super::{close_target, keep_running_after_exit_request, window_needs_dock};
 
     #[test]
-    fn ordinary_main_close_hides_window_and_dock() {
+    fn command_q_closes_only_the_focused_window_including_notifications() {
         assert_eq!(
-            close_action("main", false),
-            CloseAction::Hide { hide_dock: true }
+            close_target(&[("main", true, false), ("approval", true, true)]),
+            Some("approval")
         );
+        assert_eq!(
+            close_target(&[("main", true, false), ("password-change", true, true)]),
+            Some("password-change")
+        );
+        assert_eq!(
+            close_target(&[("main", true, false), ("approval", true, false)]),
+            Some("main")
+        );
+        assert_eq!(close_target(&[("main", false, false)]), None);
     }
 
     #[test]
-    fn auxiliary_window_close_does_not_change_dock_visibility() {
-        assert_eq!(
-            close_action("compact-approval", false),
-            CloseAction::Hide { hide_dock: false }
-        );
+    fn default_quit_keeps_running_but_explicit_quit_and_restart_exit() {
+        assert!(keep_running_after_exit_request(false, None));
+        assert!(!keep_running_after_exit_request(true, None));
+        assert!(!keep_running_after_exit_request(true, Some(0)));
+        assert!(!keep_running_after_exit_request(
+            false,
+            Some(tauri::RESTART_EXIT_CODE)
+        ));
     }
 
     #[test]
-    fn explicit_quit_exits_from_any_window() {
-        assert_eq!(close_action("main", true), CloseAction::Exit);
+    fn passive_notifications_do_not_need_a_dock_icon() {
+        assert!(!window_needs_dock("approval", true));
+        assert!(!window_needs_dock("approval", false));
+    }
+
+    #[test]
+    fn any_visible_user_window_keeps_the_dock_icon() {
+        assert!(window_needs_dock("main", true));
+        assert!(window_needs_dock("password-change", true));
+        assert!(!window_needs_dock("main", false));
+        assert!(!window_needs_dock("password-change", false));
     }
 }

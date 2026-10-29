@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useState, type JSX } from "react";
 
 import { PASSWORD_CATALOG_CHANGED_EVENT } from "../passwordCatalogEvents";
@@ -105,14 +104,14 @@ export function PasswordChangeConfirmation(): JSX.Element {
 
   useEffect(() => {
     if (!isLoading && changes.length === 0 && !errorMessage) {
-      void getCurrentWindow().hide();
+      void invoke("hide_current_window");
     }
   }, [changes.length, errorMessage, isLoading]);
 
   async function closeWhenEmpty(): Promise<void> {
     const remaining = await load();
     if (remaining.length === 0) {
-      await getCurrentWindow().hide();
+      await invoke("hide_current_window");
     }
   }
 
@@ -189,7 +188,10 @@ export function PasswordChangeConfirmation(): JSX.Element {
       {!isLoading && !current && !errorMessage ? (
         <section className="empty">
           <h2>没有等待确认的变更</h2>
-          <button onClick={() => void getCurrentWindow().hide()} type="button">
+          <button
+            onClick={() => void invoke("hide_current_window")}
+            type="button"
+          >
             关闭
           </button>
         </section>

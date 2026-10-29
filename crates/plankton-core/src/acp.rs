@@ -38,6 +38,8 @@ const ACP_STDERR_BUFFER_BYTES: usize = 8 * 1024;
 const ACP_STDERR_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const ACP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
 const ACP_ENRICHMENT_TIMEOUT: Duration = Duration::from_secs(120);
+const ACP_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+const ACP_DECISION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_SESSION_REPLAY_QUIET_PERIOD: Duration = Duration::from_millis(50);
 pub(crate) const ACP_REVIEW_CHAIN_PATH: &str = "/plankton-review/chain.md";
 pub(crate) const ACP_REVIEW_NODES_PATH: &str = "/plankton-review/nodes.json";
@@ -603,8 +605,25 @@ pub struct AcpPromptResult {
 pub struct AcpStagedReview {
     pub decision: AcpPromptResult,
     pub enrichment_chunks: mpsc::UnboundedReceiver<String>,
-    enrichment_result: oneshot::Receiver<Result<AcpPromptResult, ProviderError>>,
+    enrichment_result: oneshot::Receiver<AcpStagedCompletion>,
     cancel_on_drop: AcpCancelOnDrop,
+}
+
+#[derive(Debug)]
+struct AcpStagedCompletion {
+    result: Result<AcpPromptResult, ProviderError>,
+    cleanup: Result<(), ProviderError>,
+}
+
+impl AcpStagedCompletion {
+    fn without_session() -> Self {
+        Self {
+            result: Err(ProviderError::Transport(
+                "ACP review ended before enrichment".to_string(),
+            )),
+            cleanup: Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -658,6 +677,20 @@ impl AcpCancelOnDrop {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn request_cancel(&mut self) -> Result<(), ProviderError> {
+        self.commands
+            .send(AcpSupervisorCommand::Cancel {
+                request_id: self.request_id.clone(),
+            })
+            .map_err(|_| {
+                ProviderError::Transport(
+                    "ACP decision cleanup could not reach the supervisor".to_string(),
+                )
+            })?;
+        self.disarm();
+        Ok(())
+    }
 }
 
 impl Drop for AcpCancelOnDrop {
@@ -670,12 +703,46 @@ impl Drop for AcpCancelOnDrop {
     }
 }
 
+async fn cancel_staged_request_and_wait(
+    cancellation: &mut AcpCancelOnDrop,
+    completion: &mut oneshot::Receiver<AcpStagedCompletion>,
+    cleanup_timeout: Duration,
+) -> Result<(), ProviderError> {
+    cancellation.request_cancel()?;
+    // Staged completion records the close acknowledgement independently of the
+    // model response. Only a failed decision's retry path requires this proof;
+    // ordinary enrichment keeps its prior best-effort cleanup semantics.
+    let completion = timeout(cleanup_timeout, completion)
+        .await
+        .map_err(|_| {
+            ProviderError::Transport(
+                "ACP decision cleanup did not finish within its deadline; automatic retry stopped"
+                    .to_string(),
+            )
+        })?
+        .map_err(|_| {
+            ProviderError::Transport(
+                "ACP decision cleanup was not acknowledged; automatic retry stopped".to_string(),
+            )
+        })?;
+    completion.cleanup
+}
+
 impl AcpStagedReview {
+    pub async fn cancel_and_wait(mut self) -> Result<(), ProviderError> {
+        cancel_staged_request_and_wait(
+            &mut self.cancel_on_drop,
+            &mut self.enrichment_result,
+            ACP_DECISION_CLEANUP_TIMEOUT,
+        )
+        .await
+    }
+
     pub async fn finish_enrichment(mut self) -> Result<AcpPromptResult, ProviderError> {
         match timeout(ACP_ENRICHMENT_TIMEOUT, &mut self.enrichment_result).await {
-            Ok(Ok(result)) => {
+            Ok(Ok(completion)) => {
                 self.cancel_on_drop.disarm();
-                result
+                completion.result
             }
             Ok(Err(_)) => Err(ProviderError::Transport(
                 "ACP supervisor stopped before enrichment completed".to_string(),
@@ -1039,7 +1106,7 @@ enum AcpSupervisorCommand {
         allowed_read_files: Vec<String>,
         decision_response: oneshot::Sender<Result<AcpPromptResult, ProviderError>>,
         enrichment_chunks: mpsc::UnboundedSender<String>,
-        enrichment_response: oneshot::Sender<Result<AcpPromptResult, ProviderError>>,
+        enrichment_response: oneshot::Sender<AcpStagedCompletion>,
     },
     ChatPrompt {
         request_id: String,
@@ -1073,7 +1140,7 @@ enum PendingAcpReview {
         allowed_read_files: Vec<String>,
         decision_response: oneshot::Sender<Result<AcpPromptResult, ProviderError>>,
         enrichment_chunks: mpsc::UnboundedSender<String>,
-        enrichment_response: oneshot::Sender<Result<AcpPromptResult, ProviderError>>,
+        enrichment_response: oneshot::Sender<AcpStagedCompletion>,
     },
 }
 
@@ -1090,8 +1157,11 @@ impl PendingAcpReview {
                 let _ = response.send(Err(error));
             }
             Self::StagedPrompt {
-                decision_response, ..
+                decision_response,
+                enrichment_response,
+                ..
             } => {
+                let _ = enrichment_response.send(AcpStagedCompletion::without_session());
                 let _ = decision_response.send(Err(error));
             }
         }
@@ -1200,7 +1270,7 @@ async fn acp_supervisor_staged_request(
     let request_id = Uuid::new_v4().to_string();
     let (decision_response, decision_rx) = oneshot::channel();
     let (enrichment_chunks, enrichment_chunks_rx) = mpsc::unbounded_channel();
-    let (enrichment_response, enrichment_rx) = oneshot::channel();
+    let (enrichment_response, mut enrichment_rx) = oneshot::channel();
     commands
         .send(AcpSupervisorCommand::StagedPrompt {
             request_id: request_id.clone(),
@@ -1212,29 +1282,55 @@ async fn acp_supervisor_staged_request(
             enrichment_response,
         })
         .map_err(|_| ProviderError::Transport("ACP supervisor stopped".to_string()))?;
-    let cancel_on_drop = AcpCancelOnDrop::new(commands, request_id.clone());
-    let decision = match timeout(config.timeout, decision_rx).await {
-        Ok(Ok(result)) => result?,
-        Ok(Err(_)) => {
-            return Err(ProviderError::Transport(
-                "ACP supervisor stopped before returning a decision".to_string(),
-            ));
-        }
-        Err(_) => {
-            let message = format!(
-                "ACP decision exceeded its total {} second deadline; cancellation was requested",
-                config.timeout.as_secs()
-            );
-            let trace = fs::read(decision_evidence_path(&config, &request_id))
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<ProviderTrace>(&bytes).ok());
-            return Err(match trace {
-                Some(trace) => ProviderError::DecisionFailed {
-                    message,
-                    trace: Box::new(trace),
-                },
-                None => ProviderError::Transport(message),
-            });
+    let mut cancel_on_drop = AcpCancelOnDrop::new(commands, request_id.clone());
+    let decision_result = match timeout(config.timeout, decision_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(ProviderError::Transport(
+            "ACP supervisor stopped before returning a decision".to_string(),
+        )),
+        Err(_) => Err(ProviderError::Transport(format!(
+            "ACP decision exceeded its total {} second deadline; cancellation was requested",
+            config.timeout.as_secs()
+        ))),
+    };
+    let decision = match decision_result {
+        Ok(decision) => decision,
+        Err(error) => {
+            let cleanup = cancel_staged_request_and_wait(
+                &mut cancel_on_drop,
+                &mut enrichment_rx,
+                ACP_DECISION_CLEANUP_TIMEOUT,
+            )
+            .await;
+            // Read after cancellation so any final response and validation failure
+            // persisted by the worker are included in the timeout evidence.
+            let error = match error {
+                ProviderError::Transport(message) => {
+                    let trace = fs::read(decision_evidence_path(&config, &request_id))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<ProviderTrace>(&bytes).ok());
+                    match trace {
+                        Some(trace) => ProviderError::DecisionFailed {
+                            message,
+                            trace: Box::new(trace),
+                        },
+                        None => ProviderError::Transport(message),
+                    }
+                }
+                error => error,
+            };
+            if let Err(cleanup) = cleanup {
+                return Err(match error {
+                    ProviderError::DecisionFailed { message, trace } => {
+                        ProviderError::DecisionFailed {
+                            message: format!("{message}; {cleanup}"),
+                            trace,
+                        }
+                    }
+                    error => ProviderError::Transport(format!("{error}; {cleanup}")),
+                });
+            }
+            return Err(error);
         }
     };
     Ok(AcpStagedReview {
@@ -1397,6 +1493,7 @@ async fn run_acp_supervisor(
         agent_version,
         beta_headers: Vec::new(),
         review_progress: None,
+        decision_attempt_errors: Vec::new(),
     };
 
     let active_sessions = Rc::new(RefCell::new(HashMap::<String, acp::SessionId>::new()));
@@ -1544,7 +1641,11 @@ async fn run_acp_supervisor(
                 }
                 let session_id = active_sessions.borrow().get(&request_id).cloned();
                 if let Some(session_id) = session_id {
-                    let _ = conn.cancel(acp::CancelNotification::new(session_id)).await;
+                    let _ = timeout(
+                        ACP_CANCEL_TIMEOUT,
+                        conn.cancel(acp::CancelNotification::new(session_id)),
+                    )
+                    .await;
                 }
             }
             AcpSupervisorCommand::Prewarmed(result) => {
@@ -1619,8 +1720,11 @@ async fn reject_acp_supervisor_commands(
                 let _ = response.send(Err(ProviderError::Transport(message.clone())));
             }
             AcpSupervisorCommand::StagedPrompt {
-                decision_response, ..
+                decision_response,
+                enrichment_response,
+                ..
             } => {
+                let _ = enrichment_response.send(AcpStagedCompletion::without_session());
                 let _ = decision_response.send(Err(ProviderError::Transport(message.clone())));
             }
             AcpSupervisorCommand::ChatPrompt { response, .. } => {
@@ -1897,7 +2001,7 @@ async fn run_supervised_acp_staged_prompt(
     mut cancellation: watch::Receiver<bool>,
     decision_response: oneshot::Sender<Result<AcpPromptResult, ProviderError>>,
     enrichment_chunks: mpsc::UnboundedSender<String>,
-    enrichment_response: oneshot::Sender<Result<AcpPromptResult, ProviderError>>,
+    enrichment_response: oneshot::Sender<AcpStagedCompletion>,
 ) {
     let session = match prepared {
         Some(session) => Ok(session),
@@ -1911,6 +2015,7 @@ async fn run_supervised_acp_staged_prompt(
     let session = match session {
         Ok(session) => session,
         Err(error) => {
+            let _ = enrichment_response.send(AcpStagedCompletion::without_session());
             let _ = decision_response.send(Err(error));
             return;
         }
@@ -1921,7 +2026,14 @@ async fn run_supervised_acp_staged_prompt(
         .insert(request_id.to_string(), session_id.clone());
     let handler = AcpClientHandler::with_allowed_read_files(allowed_read_files, false);
     if let Err(error) = multiplex.register(session_id.to_string(), handler.clone()) {
-        close_acp_session(conn, multiplex, &session_id).await;
+        complete_staged_cleanup(
+            conn,
+            multiplex,
+            &session_id,
+            enrichment_response,
+            AcpStagedCompletion::without_session().result,
+        )
+        .await;
         let _ = decision_response.send(Err(error));
         return;
     }
@@ -1929,7 +2041,14 @@ async fn run_supervised_acp_staged_prompt(
         let _ = decision_response.send(Err(ProviderError::Transport(
             "ACP review was cancelled before prompting".to_string(),
         )));
-        close_acp_session(conn, multiplex, &session_id).await;
+        complete_staged_cleanup(
+            conn,
+            multiplex,
+            &session_id,
+            enrichment_response,
+            AcpStagedCompletion::without_session().result,
+        )
+        .await;
         return;
     }
 
@@ -1946,28 +2065,46 @@ async fn run_supervised_acp_staged_prompt(
     )
     .await;
     if decision_result.is_err() {
-        close_acp_session(conn, multiplex, &session_id).await;
+        complete_staged_cleanup(
+            conn,
+            multiplex,
+            &session_id,
+            enrichment_response,
+            AcpStagedCompletion::without_session().result,
+        )
+        .await;
         let _ = decision_response.send(decision_result);
         return;
     }
     if decision_response.send(decision_result).is_err() {
-        let _ = conn
-            .cancel(acp::CancelNotification::new(session_id.clone()))
-            .await;
-        close_acp_session(conn, multiplex, &session_id).await;
+        let _ = cancel_acp_prompt(config, conn, session_id.clone()).await;
+        complete_staged_cleanup(
+            conn,
+            multiplex,
+            &session_id,
+            enrichment_response,
+            AcpStagedCompletion::without_session().result,
+        )
+        .await;
         return;
     }
 
     if let Err(error) = handler.reset_for_next_turn(Some(enrichment_chunks), None) {
-        let _ = enrichment_response.send(Err(error));
-        close_acp_session(conn, multiplex, &session_id).await;
+        complete_staged_cleanup(
+            conn,
+            multiplex,
+            &session_id,
+            enrichment_response,
+            Err(error),
+        )
+        .await;
         return;
     }
     let mut enrichment_config = config.clone();
     enrichment_config.timeout = ACP_ENRICHMENT_TIMEOUT;
     let enrichment_turn = tokio::select! {
         _ = cancellation.changed() => {
-            let _ = conn.cancel(acp::CancelNotification::new(session_id.clone())).await;
+            let _ = cancel_acp_prompt(config, conn, session_id.clone()).await;
             Err(ProviderError::Transport("ACP review enrichment was cancelled".to_string()))
         }
         result = run_acp_prompt_turn(
@@ -1985,8 +2122,14 @@ async fn run_supervised_acp_staged_prompt(
         trace.audit_events = raw_client_events(&state);
         acp_prompt_result_from_state(state, provider_model, trace, session_id.clone(), request_id)
     });
-    close_acp_session(conn, multiplex, &session_id).await;
-    let _ = enrichment_response.send(enrichment_result);
+    complete_staged_cleanup(
+        conn,
+        multiplex,
+        &session_id,
+        enrichment_response,
+        enrichment_result,
+    )
+    .await;
 }
 
 fn decision_evidence_path(config: &AcpSessionConfig, request_id: &str) -> PathBuf {
@@ -2073,7 +2216,7 @@ async fn run_acp_decision_with_repair(
         remaining_config.timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
         let result = tokio::select! {
             _ = cancellation.changed() => {
-                let _ = conn.cancel(acp::CancelNotification::new(session_id.clone())).await;
+                let _ = cancel_acp_prompt(config, conn, session_id.clone()).await;
                 Err(ProviderError::Transport("ACP decision cancelled".into()))
             }
             result = run_acp_prompt_turn(&remaining_config, conn, session_id.clone(), prompt.clone(), "decision") => result,
@@ -2319,6 +2462,31 @@ fn continuation_prompt(kind: AcpContinuationKind, user_prompt: &str) -> (String,
             "detail repair",
         ),
     }
+}
+
+async fn complete_staged_cleanup(
+    conn: &acp::ClientSideConnection,
+    multiplex: &AcpMultiplexHandler,
+    session_id: &acp::SessionId,
+    completion: oneshot::Sender<AcpStagedCompletion>,
+    result: Result<AcpPromptResult, ProviderError>,
+) {
+    let local_cleanup = multiplex.unregister(&session_id.to_string());
+    let remote_cleanup = timeout(
+        ACP_SESSION_CLOSE_TIMEOUT,
+        conn.close_session(acp::CloseSessionRequest::new(session_id.clone())),
+    )
+    .await;
+    let cleanup = local_cleanup.and_then(|()| match remote_cleanup {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(ProviderError::Transport(format!(
+            "ACP decision cleanup could not confirm session closure: {error}; automatic retry stopped",
+        ))),
+        Err(_) => Err(ProviderError::Transport(
+            "ACP decision cleanup could not confirm session closure before its deadline; automatic retry stopped".to_string(),
+        )),
+    });
+    let _ = completion.send(AcpStagedCompletion { result, cleanup });
 }
 
 async fn close_acp_session(
@@ -3492,6 +3660,7 @@ async fn run_acp_prompt_requests(
             agent_version,
             beta_headers: Vec::new(),
             review_progress: None,
+            decision_attempt_errors: Vec::new(),
         },
     })
 }
@@ -3560,7 +3729,7 @@ async fn cancel_acp_prompt(
     session_id: acp::SessionId,
 ) -> Result<(), ProviderError> {
     timeout(
-        config.timeout,
+        config.timeout.min(ACP_CANCEL_TIMEOUT),
         conn.cancel(acp::CancelNotification::new(session_id)),
     )
     .await
@@ -3590,6 +3759,115 @@ fn build_provider_model(agent_name: Option<&str>, agent_version: Option<&str>) -
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn staged_cleanup_cancels_then_waits_for_session_completion() {
+        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+        let mut cancellation = super::AcpCancelOnDrop::new(commands, "old-session-request".into());
+        let cleanup = tokio::spawn(async move {
+            super::cancel_staged_request_and_wait(
+                &mut cancellation,
+                &mut completion_rx,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+        });
+        let command = received.recv().await.expect("cancellation command");
+        assert!(
+            matches!(command, super::AcpSupervisorCommand::Cancel { request_id } if request_id == "old-session-request")
+        );
+        assert!(
+            !cleanup.is_finished(),
+            "must not allow another attempt before the old session completes"
+        );
+        completion_tx
+            .send(super::AcpStagedCompletion {
+                result: Err(crate::ProviderError::Transport("cancelled".into())),
+                cleanup: Ok(()),
+            })
+            .unwrap();
+        cleanup.await.unwrap().unwrap();
+        assert!(
+            received.try_recv().is_err(),
+            "the disarmed drop guard must not cancel twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_cleanup_requires_an_acknowledged_remote_close_for_retry() {
+        let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
+        let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+        let mut cancellation = super::AcpCancelOnDrop::new(commands, "unsupported-close".into());
+        completion_tx
+            .send(super::AcpStagedCompletion {
+                result: Err(crate::ProviderError::EmptyResponse),
+                cleanup: Err(crate::ProviderError::Transport(
+                    "ACP decision cleanup could not confirm session closure: unsupported".into(),
+                )),
+            })
+            .unwrap();
+        let error = super::cancel_staged_request_and_wait(
+            &mut cancellation,
+            &mut completion_rx,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("could not confirm session closure"));
+    }
+
+    #[tokio::test]
+    async fn normal_enrichment_does_not_fail_when_optional_session_close_is_unsupported() {
+        let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
+        let (_chunks, chunks_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let result = super::AcpPromptResult {
+            content: "completed details".into(),
+            provider_model: None,
+            trace: crate::ProviderTrace::default(),
+            validated_exposure_report: None,
+        };
+        let staged = super::AcpStagedReview {
+            decision: result.clone(),
+            enrichment_chunks: chunks_rx,
+            enrichment_result: completion_rx,
+            cancel_on_drop: super::AcpCancelOnDrop::new(commands, "completed".into()),
+        };
+        completion_tx
+            .send(super::AcpStagedCompletion {
+                result: Ok(result),
+                cleanup: Err(crate::ProviderError::Transport(
+                    "session close unsupported".into(),
+                )),
+            })
+            .unwrap();
+        assert_eq!(
+            staged.finish_enrichment().await.unwrap().content,
+            "completed details"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_cleanup_deadline_is_non_retryable() {
+        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (_completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+        let mut cancellation = super::AcpCancelOnDrop::new(commands, "stuck-request".into());
+        let error = super::cancel_staged_request_and_wait(
+            &mut cancellation,
+            &mut completion_rx,
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cleanup did not finish"));
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            super::AcpSupervisorCommand::Cancel { .. }
+        ));
+    }
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -4282,7 +4560,7 @@ mod tests {
                         Err(oneshot::error::TryRecvError::Empty)
                     ));
                     run.await;
-                    let second = details_rx.await.unwrap().unwrap();
+                    let second = details_rx.await.unwrap().result.unwrap();
                     assert_eq!(first.trace.session_id, second.trace.session_id);
                     assert_eq!(sessions.get(), 1);
                     assert_eq!(prompts.get() as usize, 2 + failures);

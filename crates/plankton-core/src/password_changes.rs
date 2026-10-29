@@ -32,6 +32,76 @@ pub fn preview_password_changes(
     preview_password_changes_at(local_secret_catalog_path().as_path(), operations)
 }
 
+/// Preview edits against the policies the user actually sees, including remembered approvals.
+/// The revision still belongs to the on-disk catalog and is checked by the normal commit path.
+pub fn preview_password_changes_with_exposure_policies(
+    operations: &[PasswordChangeOperation],
+    policies: &BTreeMap<String, plankton_protocol::exposure::CredentialExposurePolicy>,
+) -> Result<(String, PasswordChangeDiff), SecretImportError> {
+    preview_password_changes_with_exposure_policies_at(
+        local_secret_catalog_path().as_path(),
+        operations,
+        policies,
+    )
+}
+
+fn preview_password_changes_with_exposure_policies_at(
+    path: &Path,
+    operations: &[PasswordChangeOperation],
+    policies: &BTreeMap<String, plankton_protocol::exposure::CredentialExposurePolicy>,
+) -> Result<(String, PasswordChangeDiff), SecretImportError> {
+    let mut catalog = load_secret_catalog_file_optional(path)?;
+    let base_revision = catalog_revision(&catalog);
+    for (resource, policy) in policies {
+        let metadata = field_metadata_mut(&mut catalog, resource)?;
+        let inherits = inherits_exposure_policy(metadata);
+        store_exposure_policy(metadata, policy).map_err(invalid_exposure_policy)?;
+        metadata.insert(
+            EXPOSURE_INHERITANCE_METADATA_KEY.into(),
+            if inherits { "inherit" } else { "custom" }.into(),
+        );
+    }
+    let before = project_password_catalog(&catalog);
+    apply_operations(&mut catalog, operations, false)?;
+    let after = project_password_catalog(&catalog);
+    Ok((base_revision, catalog_diff(&before, &after, operations)))
+}
+
+/// Explicit field edits and inherited item-default edits replace remembered field approvals.
+/// Walk the proposed operations in order so preceding moves and renames use the right owners.
+pub fn replaced_exposure_policy_resources(
+    operations: &[PasswordChangeOperation],
+) -> Result<Vec<String>, SecretImportError> {
+    let mut catalog = load_secret_catalog_file_optional(local_secret_catalog_path().as_path())?;
+    let mut resources = BTreeSet::new();
+    for operation in operations {
+        match operation {
+            PasswordChangeOperation::SetFieldExposurePolicy { resource_id, .. }
+            | PasswordChangeOperation::InheritFieldExposurePolicy { resource_id }
+            | PasswordChangeOperation::UpdateField {
+                resource_id,
+                exposure_policy: Some(_),
+                ..
+            } => {
+                resources.insert(resource_id.clone());
+            }
+            PasswordChangeOperation::SetItemExposurePolicy { item_id, .. } => {
+                let projection = project_password_catalog(&catalog);
+                let item = matching_item(&projection, item_id)?;
+                resources.extend(
+                    item.fields
+                        .iter()
+                        .filter(|field| field.inherits_exposure_policy)
+                        .map(|field| field.resource_id.clone()),
+                );
+            }
+            _ => {}
+        }
+        apply_operations(&mut catalog, std::slice::from_ref(operation), false)?;
+    }
+    Ok(resources.into_iter().collect())
+}
+
 pub fn apply_password_changes(
     operations: &[PasswordChangeOperation],
     expected_revision: &str,

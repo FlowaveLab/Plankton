@@ -3,8 +3,65 @@ use std::collections::BTreeMap;
 use plankton_protocol::exposure::CredentialExposureSurface;
 use plankton_protocol::exposure::{CredentialAccessMode, CredentialExposurePolicy};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const EXPOSURE_POLICY_METADATA_KEY: &str = "credential_exposure_policy_v1";
+pub const EXPOSURE_CATALOG_FINGERPRINT_KEY: &str = "plankton_catalog_fingerprint";
+
+/// A value-free identity for a catalog field and its configured policy. Remembered approvals
+/// are valid only for this identity, so changing the source or the catalog policy revokes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogExposureSnapshot {
+    pub resource_id: String,
+    pub fingerprint: String,
+    pub policy: CredentialExposurePolicy,
+}
+
+pub fn catalog_exposure_snapshots(
+    catalog: &crate::LocalSecretCatalog,
+) -> Vec<CatalogExposureSnapshot> {
+    let literals = catalog.literals.iter().map(|entry| {
+        exposure_snapshot(
+            &entry.resource,
+            &entry.metadata,
+            serde_json::json!("literal"),
+        )
+    });
+    let imports = catalog.imports.iter().map(|entry| {
+        exposure_snapshot(
+            &entry.resource,
+            &entry.metadata,
+            serde_json::json!({
+                "source": entry.source_locator,
+                "imported_at": entry.imported_at,
+            }),
+        )
+    });
+    literals.chain(imports).collect()
+}
+
+fn exposure_snapshot(
+    resource_id: &str,
+    metadata: &BTreeMap<String, String>,
+    identity: serde_json::Value,
+) -> CatalogExposureSnapshot {
+    let policy = exposure_policy_from_metadata(metadata);
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "resource_id": resource_id,
+        "identity": identity,
+        // Preserve absent vs explicit policy, including an explicit reset to the default.
+        "configured_policy": metadata.get(EXPOSURE_POLICY_METADATA_KEY),
+        "inherits_policy": inherits_exposure_policy(metadata),
+        "inherited_default": inherits_exposure_policy(metadata)
+            .then(|| metadata.get(ITEM_EXPOSURE_POLICY_METADATA_KEY)),
+    }))
+    .expect("catalog policy identity serializes");
+    CatalogExposureSnapshot {
+        resource_id: resource_id.to_string(),
+        fingerprint: format!("{:x}", Sha256::digest(encoded)),
+        policy,
+    }
+}
 
 pub const ITEM_EXPOSURE_POLICY_METADATA_KEY: &str = "credential_item_exposure_policy_v1";
 pub const EXPOSURE_INHERITANCE_METADATA_KEY: &str = "credential_exposure_source_v1";
@@ -284,6 +341,66 @@ fn network_destination_allowed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_fingerprint_excludes_values_and_display_metadata_but_binds_policy() {
+        let mut catalog = crate::LocalSecretCatalog {
+            catalog_path: "unused-test-catalog".into(),
+            imports: Vec::new(),
+            literals: vec![crate::LocalSecretLiteralEntry {
+                resource: "secret/token".into(),
+                value: "fixture-only".into(),
+                display_name: None,
+                description: None,
+                tags: Vec::new(),
+                metadata: BTreeMap::new(),
+            }],
+        };
+        let before = catalog_exposure_snapshots(&catalog);
+        catalog.literals[0].value = "rotated-fixture-only".into();
+        catalog.literals[0].display_name = Some("New display title".into());
+        catalog.literals[0].tags.push("new-tag".into());
+        assert_eq!(catalog_exposure_snapshots(&catalog), before);
+        store_exposure_policy(
+            &mut catalog.literals[0].metadata,
+            &CredentialExposurePolicy::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            catalog_exposure_snapshots(&catalog)[0].fingerprint,
+            before[0].fingerprint
+        );
+        assert_eq!(
+            catalog_exposure_snapshots(&catalog)[0].policy,
+            before[0].policy
+        );
+    }
+
+    #[test]
+    fn catalog_fingerprint_tracks_inheritance_without_invalidating_custom_fields_for_default_edits()
+    {
+        let mut metadata = BTreeMap::new();
+        let protected = CredentialExposurePolicy::default();
+        store_item_exposure_policy(&mut metadata, &protected, None).unwrap();
+        let before = exposure_snapshot("secret/token", &metadata, serde_json::json!("literal"));
+        metadata.insert(
+            ITEM_EXPOSURE_POLICY_METADATA_KEY.into(),
+            serde_json::to_string(&CredentialExposurePolicy::direct()).unwrap(),
+        );
+        let inherited = exposure_snapshot("secret/token", &metadata, serde_json::json!("literal"));
+        assert_ne!(before.fingerprint, inherited.fingerprint);
+        store_item_exposure_policy(&mut metadata, &protected, Some(&protected)).unwrap();
+        let custom = exposure_snapshot("secret/token", &metadata, serde_json::json!("literal"));
+        assert_ne!(before.fingerprint, custom.fingerprint);
+        metadata.insert(
+            ITEM_EXPOSURE_POLICY_METADATA_KEY.into(),
+            serde_json::to_string(&CredentialExposurePolicy::direct()).unwrap(),
+        );
+        assert_eq!(
+            custom.fingerprint,
+            exposure_snapshot("secret/token", &metadata, serde_json::json!("literal")).fingerprint
+        );
+    }
 
     #[test]
     fn network_rules_match_parsed_hosts_not_url_text() {

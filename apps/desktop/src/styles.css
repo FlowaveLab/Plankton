@@ -313,10 +313,10 @@ button:disabled {
 }
 
 .desktop-workspace .detail-section {
-  border: var(--border-width) solid var(--color-line);
-  border-radius: var(--radius-sm);
-  padding: var(--space-2);
-  background: var(--color-surface);
+  border: 0;
+  border-top: 1px solid var(--rule);
+  padding: var(--space-3) 0;
+  background: transparent;
 }
 
 .desktop-workspace .detail-section-wide {
@@ -328,7 +328,7 @@ button:disabled {
 }
 
 .desktop-workspace .detail-section-low {
-  background: var(--color-surface-muted);
+  background: transparent;
 }
 
 .field-label {

@@ -3,6 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useState, type JSX, type ReactNode } from "react";
 
 import { ImportedSecretCatalogPanel } from "./ImportedSecretCatalogPanel";
+import {
+  ExposurePolicyEditor,
+  defaultExposurePolicy,
+  exposurePolicyNeedsNetworkAllowlist,
+  type CredentialExposurePolicy,
+} from "./ExposurePolicy";
 import { getBrowserStorage } from "../browserStorage";
 import { formatTimestamp } from "../formatters";
 import { t, translateCode, type Locale } from "../i18n";
@@ -38,13 +44,26 @@ type CommonImportDraft = {
   metadata: string;
 };
 
-type ManualSecretDraft = {
-  title: string;
+type ManualSecretFieldDraft = {
+  id: string;
   value: string;
   fieldLabel: string;
+  resource: string;
+  exposurePolicy: CredentialExposurePolicy;
+  showPolicy: boolean;
+};
+
+type ManualSecretDraft = {
+  title: string;
+  fields: ManualSecretFieldDraft[];
   description: string;
   tags: string;
-  resource: string;
+  nextFieldNumber: number;
+};
+
+type PreparedManualSecretField = {
+  draft: ManualSecretFieldDraft;
+  key: string;
 };
 
 type OnePasswordDraft = {
@@ -196,14 +215,26 @@ const EMPTY_COMMON_DRAFT: CommonImportDraft = {
   metadata: "",
 };
 
-const EMPTY_MANUAL_SECRET_DRAFT: ManualSecretDraft = {
-  title: "",
-  value: "",
-  fieldLabel: "Password",
-  description: "",
-  tags: "",
-  resource: "",
-};
+function createManualSecretField(fieldNumber: number): ManualSecretFieldDraft {
+  return {
+    id: `manual-field-${fieldNumber}`,
+    value: "",
+    fieldLabel: fieldNumber === 1 ? "Password" : `Password ${fieldNumber}`,
+    resource: "",
+    exposurePolicy: defaultExposurePolicy(),
+    showPolicy: false,
+  };
+}
+
+function createEmptyManualSecretDraft(): ManualSecretDraft {
+  return {
+    title: "",
+    fields: [createManualSecretField(1)],
+    description: "",
+    tags: "",
+    nextFieldNumber: 2,
+  };
+}
 
 const EMPTY_ONEPASSWORD_DRAFT: OnePasswordDraft = {
   account: "",
@@ -441,6 +472,24 @@ function normalizeResourceSegment(value: string): string | null {
 
   const trimmed = normalized.replace(/^[-_.]+|[-_.]+$/g, "");
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function prepareManualSecretFields(
+  fields: ManualSecretFieldDraft[],
+): PreparedManualSecretField[] {
+  const usedKeys = new Set<string>();
+  return fields.map((draft, index) => {
+    const baseKey =
+      normalizeResourceSegment(draft.fieldLabel) ?? `value-${index + 1}`;
+    let key = baseKey;
+    let suffix = 2;
+    while (usedKeys.has(key)) {
+      key = `${baseKey}-${suffix}`;
+      suffix += 1;
+    }
+    usedKeys.add(key);
+    return { draft, key };
+  });
 }
 
 function normalizeResourcePath(value: string): string {
@@ -1100,8 +1149,8 @@ export function PasswordManagementView(
 ): JSX.Element {
   const surface = props.surface ?? "full";
   const [entryMode, setEntryMode] = useState<PasswordEntryMode>("manual");
-  const [manualDraft, setManualDraft] = useState<ManualSecretDraft>(
-    EMPTY_MANUAL_SECRET_DRAFT,
+  const [manualDraft, setManualDraft] = useState<ManualSecretDraft>(() =>
+    createEmptyManualSecretDraft(),
   );
   const [isSavingManual, setIsSavingManual] = useState(false);
   const [providerKind, setProviderKind] =
@@ -1323,19 +1372,17 @@ export function PasswordManagementView(
     explicitResource,
   );
   const metadataDraft = parseMetadataDraft(commonDraft.metadata);
-  const manualItemSegment = normalizeResourceSegment(manualDraft.title);
-  const manualFieldSegment = normalizeResourceSegment(manualDraft.fieldLabel);
-  const generatedManualResource =
-    manualItemSegment && manualFieldSegment
-      ? `plankton://field/${manualItemSegment}/${manualFieldSegment}`
-      : "";
-  const resolvedManualResource =
-    manualDraft.resource.trim() || generatedManualResource;
+  const preparedManualFields = prepareManualSecretFields(manualDraft.fields);
+  const manualPolicyNeedsAllowlist = manualDraft.fields.some((field) =>
+    exposurePolicyNeedsNetworkAllowlist(field.exposurePolicy),
+  );
   const canSaveManual =
     manualDraft.title.trim().length > 0 &&
-    manualDraft.value.length > 0 &&
-    manualDraft.fieldLabel.trim().length > 0 &&
-    resolvedManualResource.length > 0;
+    preparedManualFields.length > 0 &&
+    manualDraft.fields.every(
+      (field) => field.value.length > 0 && field.fieldLabel.trim().length > 0,
+    ) &&
+    !manualPolicyNeedsAllowlist;
 
   let plannedSpecs: SecretImportSpec[] = [];
   let planBlockerMessage: string | null = null;
@@ -1941,6 +1988,40 @@ export function PasswordManagementView(
     }
   }
 
+  function updateManualSecretField(
+    fieldId: string,
+    update: Partial<ManualSecretFieldDraft>,
+  ): void {
+    setManualDraft((current) => ({
+      ...current,
+      fields: current.fields.map((field) =>
+        field.id === fieldId ? { ...field, ...update } : field,
+      ),
+    }));
+  }
+
+  function addManualSecretField(): void {
+    setManualDraft((current) => ({
+      ...current,
+      fields: [
+        ...current.fields,
+        createManualSecretField(current.nextFieldNumber),
+      ],
+      nextFieldNumber: current.nextFieldNumber + 1,
+    }));
+  }
+
+  function removeManualSecretField(fieldId: string): void {
+    setManualDraft((current) =>
+      current.fields.length === 1
+        ? current
+        : {
+            ...current,
+            fields: current.fields.filter((field) => field.id !== fieldId),
+          },
+    );
+  }
+
   async function submitManualSecret(): Promise<void> {
     if (!canSaveManual) {
       return;
@@ -1956,30 +2037,40 @@ export function PasswordManagementView(
           input: {
             descriptor: {
               kind: "environment",
-              names: [manualFieldSegment ?? "value"],
+              names: preparedManualFields.map((field) => field.key),
             },
-            entries: [
-              {
-                key: manualFieldSegment ?? "value",
-                value: manualDraft.value,
-              },
-            ],
+            entries: preparedManualFields.map(({ draft, key }) => ({
+              key,
+              value: draft.value,
+            })),
             suggested_item_title: manualDraft.title.trim(),
             suggested_destination: null,
             suggested_layout: {
               description: optionalValue(manualDraft.description),
               tags: parseTags(manualDraft.tags),
-              field_labels: {
-                [manualFieldSegment ?? "value"]: manualDraft.fieldLabel.trim(),
-              },
-              field_resources: {
-                [manualFieldSegment ?? "value"]: resolvedManualResource,
-              },
+              field_labels: Object.fromEntries(
+                preparedManualFields.map(({ draft, key }) => [
+                  key,
+                  draft.fieldLabel.trim(),
+                ]),
+              ),
+              field_resources: Object.fromEntries(
+                preparedManualFields.flatMap(({ draft, key }) => {
+                  const resource = draft.resource.trim();
+                  return resource ? [[key, resource]] : [];
+                }),
+              ),
+              field_exposure_policies: Object.fromEntries(
+                preparedManualFields.map(({ draft, key }) => [
+                  key,
+                  draft.exposurePolicy,
+                ]),
+              ),
             },
           },
         },
       );
-      setManualDraft(EMPTY_MANUAL_SECRET_DRAFT);
+      setManualDraft(createEmptyManualSecretDraft());
       props.onDraftCreated?.(draft.draft_id);
       if (!props.onDraftCreated) {
         setNoticeMessage(
@@ -3038,12 +3129,12 @@ export function PasswordManagementView(
             <p>
               {sectionCaption(
                 props.locale,
-                "Give it a recognizable name and value. Technical identifiers are generated automatically.",
-                "填写容易识别的名称和值；技术标识会自动生成。",
+                "Give the item a recognizable name, then add one or more password fields.",
+                "填写容易识别的名称，再添加一个或多个密码项。",
               )}
             </p>
           </header>
-          <div className="manual-secret-form">
+          <div className="manual-secret-form manual-secret-item-form">
             <label className="settings-field">
               <span className="field-label">
                 {sectionCaption(props.locale, "Name", "名称")}
@@ -3065,43 +3156,6 @@ export function PasswordManagementView(
                   "GitHub 生产账号",
                 )}
                 value={manualDraft.title}
-              />
-            </label>
-            <label className="settings-field manual-secret-value-field">
-              <span className="field-label">
-                {sectionCaption(props.locale, "Password or value", "密码或值")}
-              </span>
-              <SecretInput
-                locale={props.locale}
-                fieldName={sectionCaption(props.locale, "value", "值")}
-                autoComplete="new-password"
-                className="settings-input"
-                data-testid="manual-secret-value"
-                onChange={(event) => {
-                  const value = event.currentTarget.value;
-                  setManualDraft((current) => ({
-                    ...current,
-                    value,
-                  }));
-                }}
-                value={manualDraft.value}
-              />
-            </label>
-            <label className="settings-field">
-              <span className="field-label">
-                {sectionCaption(props.locale, "Field label", "字段名称")}
-              </span>
-              <input
-                className="settings-input"
-                data-testid="manual-secret-field-label"
-                onChange={(event) => {
-                  const fieldLabel = event.currentTarget.value;
-                  setManualDraft((current) => ({
-                    ...current,
-                    fieldLabel,
-                  }));
-                }}
-                value={manualDraft.fieldLabel}
               />
             </label>
             <label className="settings-field">
@@ -3153,42 +3207,249 @@ export function PasswordManagementView(
               />
             </label>
           </div>
-          <details className="manual-secret-advanced">
-            <summary>
+          <section className="manual-secret-fields-section">
+            <header className="manual-secret-fields-heading">
+              <div>
+                <h3>
+                  {sectionCaption(props.locale, "Password fields", "密码项")}
+                </h3>
+                <p>
+                  {sectionCaption(
+                    props.locale,
+                    "Each field keeps its own value, exposure policy, and optional identifier.",
+                    "每一项分别保存值、暴露面策略和可选资源标识。",
+                  )}
+                </p>
+              </div>
+              <button
+                className="ghost manual-secret-add-field"
+                data-testid="manual-secret-add-field"
+                onClick={addManualSecretField}
+                type="button"
+              >
+                {sectionCaption(props.locale, "+ Add field", "+ 添加一项")}
+              </button>
+            </header>
+            <ol className="manual-secret-field-list">
+              {preparedManualFields.map(({ draft, key }, index) => {
+                const isDirect = draft.exposurePolicy.access_mode === "direct";
+                const needsAllowlist = exposurePolicyNeedsNetworkAllowlist(
+                  draft.exposurePolicy,
+                );
+                return (
+                  <li
+                    className="manual-secret-field-card"
+                    data-testid={`manual-secret-entry-${index}`}
+                    key={draft.id}
+                  >
+                    <header className="manual-secret-field-card-heading">
+                      <span className="manual-secret-field-number">
+                        {String(index + 1).padStart(2, "0")}
+                      </span>
+                      <div>
+                        <strong>
+                          {draft.fieldLabel.trim() ||
+                            sectionCaption(
+                              props.locale,
+                              `Field ${index + 1}`,
+                              `第 ${index + 1} 项`,
+                            )}
+                        </strong>
+                        <code>{key}</code>
+                      </div>
+                      {manualDraft.fields.length > 1 ? (
+                        <button
+                          aria-label={sectionCaption(
+                            props.locale,
+                            `Remove field ${index + 1}`,
+                            `移除第 ${index + 1} 项`,
+                          )}
+                          className="ghost manual-secret-remove-field"
+                          data-testid={`manual-secret-remove-field-${index}`}
+                          onClick={() => removeManualSecretField(draft.id)}
+                          type="button"
+                        >
+                          {sectionCaption(props.locale, "Remove", "移除")}
+                        </button>
+                      ) : null}
+                    </header>
+                    <div className="manual-secret-field-grid">
+                      <label className="settings-field">
+                        <span className="field-label">
+                          {sectionCaption(
+                            props.locale,
+                            "Field label",
+                            "字段名称",
+                          )}
+                        </span>
+                        <input
+                          className="settings-input"
+                          data-testid={
+                            index === 0
+                              ? "manual-secret-field-label"
+                              : `manual-secret-field-label-${index}`
+                          }
+                          onChange={(event) =>
+                            updateManualSecretField(draft.id, {
+                              fieldLabel: event.currentTarget.value,
+                            })
+                          }
+                          value={draft.fieldLabel}
+                        />
+                      </label>
+                      <label className="settings-field manual-secret-value-field">
+                        <span className="field-label">
+                          {sectionCaption(
+                            props.locale,
+                            "Password or value",
+                            "密码或值",
+                          )}
+                        </span>
+                        <SecretInput
+                          locale={props.locale}
+                          fieldName={
+                            draft.fieldLabel.trim() ||
+                            sectionCaption(props.locale, "value", "值")
+                          }
+                          autoComplete="new-password"
+                          className="settings-input"
+                          data-testid={
+                            index === 0
+                              ? "manual-secret-value"
+                              : `manual-secret-value-${index}`
+                          }
+                          onChange={(event) =>
+                            updateManualSecretField(draft.id, {
+                              value: event.currentTarget.value,
+                            })
+                          }
+                          value={draft.value}
+                        />
+                      </label>
+                      <div className="settings-field manual-secret-policy-field">
+                        <span className="field-label">
+                          {sectionCaption(
+                            props.locale,
+                            "Exposure policy",
+                            "暴露面策略",
+                          )}
+                        </span>
+                        <button
+                          aria-expanded={draft.showPolicy}
+                          className={`manual-secret-policy-toggle${
+                            needsAllowlist ? " needs-attention" : ""
+                          }`}
+                          data-testid={`manual-secret-policy-toggle-${index}`}
+                          onClick={() =>
+                            updateManualSecretField(draft.id, {
+                              showPolicy: !draft.showPolicy,
+                            })
+                          }
+                          type="button"
+                        >
+                          <span>
+                            {isDirect
+                              ? sectionCaption(
+                                  props.locale,
+                                  "Direct",
+                                  "直接可见",
+                                )
+                              : sectionCaption(
+                                  props.locale,
+                                  "Protected",
+                                  "受保护",
+                                )}
+                          </span>
+                          <span aria-hidden="true">
+                            {draft.showPolicy ? "−" : "+"}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+                    {draft.showPolicy ? (
+                      <div
+                        className="manual-secret-policy-editor"
+                        data-testid={`manual-secret-policy-editor-${index}`}
+                      >
+                        <ExposurePolicyEditor
+                          compact
+                          locale={props.locale}
+                          onChange={(exposurePolicy) =>
+                            updateManualSecretField(draft.id, {
+                              exposurePolicy,
+                            })
+                          }
+                          value={draft.exposurePolicy}
+                        />
+                      </div>
+                    ) : null}
+                    <details className="manual-secret-advanced">
+                      <summary>
+                        {sectionCaption(
+                          props.locale,
+                          "Advanced identifier",
+                          "高级标识设置",
+                        )}
+                      </summary>
+                      <label className="settings-field">
+                        <span className="field-label">
+                          {t(props.locale, "resourceId")}
+                        </span>
+                        <input
+                          className="settings-input"
+                          data-testid={
+                            index === 0
+                              ? "manual-secret-resource"
+                              : `manual-secret-resource-${index}`
+                          }
+                          onChange={(event) =>
+                            updateManualSecretField(draft.id, {
+                              resource: event.currentTarget.value,
+                            })
+                          }
+                          placeholder={sectionCaption(
+                            props.locale,
+                            "Generated uniquely after saving",
+                            "保存后自动生成唯一标识",
+                          )}
+                          value={draft.resource}
+                        />
+                        <span className="field-hint">
+                          {draft.resource.trim() ||
+                            sectionCaption(
+                              props.locale,
+                              "Leave blank to generate a unique identifier.",
+                              "留空将自动生成唯一标识。",
+                            )}
+                        </span>
+                      </label>
+                    </details>
+                  </li>
+                );
+              })}
+            </ol>
+            <button
+              className="ghost manual-secret-add-field manual-secret-add-field-footer"
+              onClick={addManualSecretField}
+              type="button"
+            >
               {sectionCaption(
                 props.locale,
-                "Advanced identifier",
-                "高级标识设置",
+                "+ Add another field",
+                "+ 再添加一项",
               )}
-            </summary>
-            <label className="settings-field">
-              <span className="field-label">
-                {t(props.locale, "resourceId")}
-              </span>
-              <input
-                className="settings-input"
-                data-testid="manual-secret-resource"
-                onChange={(event) => {
-                  const resource = event.currentTarget.value;
-                  setManualDraft((current) => ({
-                    ...current,
-                    resource,
-                  }));
-                }}
-                placeholder={generatedManualResource}
-                value={manualDraft.resource}
-              />
-              <span className="field-hint">
-                {resolvedManualResource ||
-                  sectionCaption(
-                    props.locale,
-                    "Generated after a name is entered",
-                    "填写名称后自动生成",
-                  )}
-              </span>
-            </label>
-          </details>
+            </button>
+          </section>
           <div className="password-actions manual-secret-actions">
+            {manualPolicyNeedsAllowlist ? (
+              <p className="manual-secret-validation" role="alert">
+                {sectionCaption(
+                  props.locale,
+                  "A controlled network policy needs at least one allowlisted destination.",
+                  "受控网络策略需要至少配置一个允许的目标。",
+                )}
+              </p>
+            ) : null}
             <button
               className="primary"
               data-testid="manual-secret-submit"

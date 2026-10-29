@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use plankton_core::{apply_password_changes, preview_password_changes};
+use plankton_core::{apply_password_changes, list_local_secret_catalog};
 use plankton_protocol::password_changes::{
     ConfirmPasswordChangeRequest, PasswordChangeDiff, PasswordChangeState, PasswordChangeStatus,
     RejectPasswordChangeRequest, SubmitPasswordChangeRequest, SubmitPasswordChangeResponse,
@@ -76,7 +76,7 @@ impl PasswordChangeCoordinator {
         let previous_diff = change.status.diff.clone();
         change.operations.push(request.operation);
         change.operation_ids.push(request.operation_id);
-        let (base_revision, diff) = preview_operations(change.operations.clone()).await?;
+        let (base_revision, diff) = preview_operations(store, change.operations.clone()).await?;
         if diff.items.is_empty() || diff == previous_diff {
             anyhow::bail!("password change operation produced no changes");
         }
@@ -125,7 +125,12 @@ impl PasswordChangeCoordinator {
         let confirmed_len = request.confirmed_version as usize;
         let remainder_operations = change.operations.split_off(confirmed_len);
         let remainder_operation_ids = change.operation_ids.split_off(confirmed_len);
-        let (_, confirmed_diff) = preview_operations(change.operations.clone()).await?;
+        let (_, confirmed_diff) = preview_operations(store, change.operations.clone()).await?;
+        let policy_operations = change.operations.clone();
+        let replaced_policies = tokio::task::spawn_blocking(move || {
+            plankton_core::password_changes::replaced_exposure_policy_resources(&policy_operations)
+        })
+        .await??;
         let now = Utc::now();
         change.status.version = request.confirmed_version;
         change.status.confirmed_version = Some(request.confirmed_version);
@@ -135,6 +140,11 @@ impl PasswordChangeCoordinator {
         change.status.updated_at = now;
         store.save_password_change(&change).await?;
 
+        // An explicit policy edit replaces remembered authorization even when it resets to the
+        // catalog's original policy. Revoking first is fail-closed if the file commit fails.
+        store
+            .forget_remembered_exposure_policies(&replaced_policies)
+            .await?;
         let operations = change.operations.clone();
         let base_revision = change.base_revision.clone();
         let commit = tokio::task::spawn_blocking(move || {
@@ -142,11 +152,17 @@ impl PasswordChangeCoordinator {
         })
         .await?;
         match commit {
-            Ok(diff) => {
+            Ok(_diff) => {
                 change.status.state = PasswordChangeState::Committed;
-                change.status.diff = diff;
                 change.status.committed_at = Some(Utc::now());
                 change.status.updated_at = Utc::now();
+                let snapshots = tokio::task::spawn_blocking(|| {
+                    list_local_secret_catalog().map(|catalog| {
+                        plankton_core::exposure::catalog_exposure_snapshots(&catalog)
+                    })
+                })
+                .await??;
+                store.prune_remembered_exposure_policies(&snapshots).await?;
             }
             Err(plankton_core::value_resolver::SecretImportError::CatalogConflict {
                 expected,
@@ -231,7 +247,7 @@ impl PasswordChangeCoordinator {
             parent.status.reason.clone(),
             parent.status.requested_by.clone(),
         )?;
-        let (base_revision, diff) = preview_operations(operations.clone()).await?;
+        let (base_revision, diff) = preview_operations(store, operations.clone()).await?;
         successor.base_revision = base_revision;
         successor.operations = operations;
         successor.operation_ids = operation_ids;
@@ -298,9 +314,22 @@ fn new_change(
 }
 
 async fn preview_operations(
+    store: &SqliteStore,
     operations: Vec<plankton_protocol::password_changes::PasswordChangeOperation>,
 ) -> anyhow::Result<(String, PasswordChangeDiff)> {
-    Ok(tokio::task::spawn_blocking(move || preview_password_changes(&operations)).await??)
+    let snapshots = tokio::task::spawn_blocking(|| {
+        list_local_secret_catalog()
+            .map(|catalog| plankton_core::exposure::catalog_exposure_snapshots(&catalog))
+    })
+    .await??;
+    let policies = store.effective_exposure_policies(&snapshots).await?;
+    Ok(tokio::task::spawn_blocking(move || {
+        plankton_core::password_changes::preview_password_changes_with_exposure_policies(
+            &operations,
+            &policies,
+        )
+    })
+    .await??)
 }
 
 #[cfg(test)]
@@ -353,6 +382,136 @@ mod tests {
                 metadata: None,
             },
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn catalog_edit_can_reset_a_remembered_policy_to_the_original_default() {
+        assert_catalog_edit_resets_remembered_policy("field").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn item_default_edit_can_reset_a_remembered_inherited_policy() {
+        assert_catalog_edit_resets_remembered_policy("item").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inherit_field_edit_can_reset_a_remembered_policy() {
+        assert_catalog_edit_resets_remembered_policy("inherit").await;
+    }
+
+    async fn assert_catalog_edit_resets_remembered_policy(kind: &str) {
+        use plankton_core::{exposure::catalog_exposure_snapshots, PolicyMode, RequestContext};
+        use plankton_protocol::exposure::{
+            CredentialExposurePolicy, CredentialExposureSurface, NetworkDestinationRule,
+        };
+
+        let _test_lock = SECRET_FILE_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let catalog_path = directory.path().join("secrets.toml");
+        std::fs::write(
+            &catalog_path,
+            "[secrets]\n\"secret/test\" = \"test-value\"\n",
+        )
+        .unwrap();
+        let _secret_file = SecretFileOverride::set(&catalog_path);
+        let settings = PlanktonSettings {
+            database_url: format!("sqlite://{}", directory.path().join("store.db").display()),
+            ..PlanktonSettings::default()
+        };
+        let store = SqliteStore::new(&settings).await.unwrap();
+        let catalog = plankton_core::list_local_secret_catalog().unwrap();
+        let snapshot = catalog_exposure_snapshots(&catalog).remove(0);
+        let request = store
+            .submit_request(
+                &settings,
+                RequestContext::new("secret/test".into(), "test".into(), "tester".into()),
+                PolicyMode::ManualOnly,
+            )
+            .await
+            .unwrap();
+        let mut policy = CredentialExposurePolicy::default();
+        let network = policy
+            .surfaces
+            .iter_mut()
+            .find(|surface| surface.surface == CredentialExposureSurface::Network)
+            .unwrap();
+        network.max_level = 1;
+        network
+            .network_allowlist
+            .push(NetworkDestinationRule::ExactDomain {
+                domain: "api.example.test".into(),
+            });
+        store
+            .approve_and_remember_exposure(
+                &request.id,
+                &snapshot,
+                &snapshot.policy,
+                &policy,
+                "reviewer",
+                None,
+            )
+            .await
+            .unwrap();
+        let coordinator = PasswordChangeCoordinator::default();
+        let mut reset = update("reset-policy", "unused");
+        reset.operation = match kind {
+            "field" => PasswordChangeOperation::SetFieldExposurePolicy {
+                resource_id: "secret/test".into(),
+                policy: CredentialExposurePolicy::default(),
+            },
+            "inherit" => PasswordChangeOperation::InheritFieldExposurePolicy {
+                resource_id: "secret/test".into(),
+            },
+            "item" => PasswordChangeOperation::SetItemExposurePolicy {
+                item_id: plankton_core::password_catalog_metadata().unwrap().items[0]
+                    .item_id
+                    .clone(),
+                policy: CredentialExposurePolicy::default(),
+            },
+            _ => unreachable!(),
+        };
+        let staged = coordinator.submit(&store, reset).await.unwrap();
+        let diff = staged
+            .status
+            .diff
+            .items
+            .iter()
+            .flat_map(|item| &item.entries)
+            .find(|entry| entry.path.ends_with("/exposure_policy"))
+            .unwrap();
+        assert_eq!(
+            diff.before.as_deref(),
+            Some(serde_json::to_string(&policy).unwrap().as_str())
+        );
+        let committed = coordinator
+            .confirm(
+                &store,
+                ConfirmPasswordChangeRequest {
+                    change_id: staged.effective_change_id,
+                    confirmed_version: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            committed.state,
+            plankton_protocol::password_changes::PasswordChangeState::Committed
+        );
+        assert!(!committed.diff.items.is_empty());
+        assert!(store
+            .effective_exposure_policies(&[snapshot])
+            .await
+            .unwrap()
+            .is_empty());
+        let mut effective = plankton_core::list_local_secret_catalog().unwrap();
+        store
+            .apply_remembered_exposure_policies(&mut effective)
+            .await
+            .unwrap();
+        assert_eq!(
+            plankton_core::exposure_policy_from_metadata(&effective.literals[0].metadata),
+            CredentialExposurePolicy::default()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

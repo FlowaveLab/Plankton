@@ -296,6 +296,7 @@ afterEach(() => {
 describe("PasswordVaultPage pagination and filtering", () => {
   it("edits a persisted collection default without turning inherited fields into overrides", async () => {
     const item = passwordItem(1);
+    const onUnsavedChangesChange = vi.fn();
     loadPasswordItems.mockResolvedValue({ kind: "live", items: [item] });
     resolvePasswordValue.mockResolvedValue("test-only");
     invoke.mockImplementation((command: string) => {
@@ -332,6 +333,7 @@ describe("PasswordVaultPage pagination and filtering", () => {
         incomingDraftId={null}
         locale="en"
         onDraftConsumed={() => {}}
+        onUnsavedChangesChange={onUnsavedChangesChange}
       />,
     );
     expect(
@@ -346,6 +348,7 @@ describe("PasswordVaultPage pagination and filtering", () => {
     expect(
       view.container.querySelector(".field-exposure-profile canvas"),
     ).toBeNull();
+    expect(onUnsavedChangesChange).toHaveBeenLastCalledWith(false);
     await act(async () =>
       view.container
         .querySelector<HTMLInputElement>(
@@ -353,6 +356,7 @@ describe("PasswordVaultPage pagination and filtering", () => {
         )
         ?.click(),
     );
+    expect(onUnsavedChangesChange).toHaveBeenLastCalledWith(true);
     expect(
       view.container.querySelector<HTMLInputElement>(
         '[aria-label="Password password value"]',
@@ -383,6 +387,157 @@ describe("PasswordVaultPage pagination and filtering", () => {
         ],
       }),
     );
+    view.unmount();
+  });
+
+  it("preserves dirty entry edits when changing selection or filters and releases them on cancel", async () => {
+    const items = [passwordItem(1), passwordItem(2)];
+    const onUnsavedChangesChange = vi.fn();
+    loadPasswordItems.mockResolvedValue({ kind: "live", items });
+    invoke.mockImplementation((command: string) => {
+      if (command === "list_password_catalog_metadata_command") {
+        return Promise.resolve({
+          revision: "edit-guard-revision",
+          items: items.map((item) => ({
+            record_id: `record-${item.id}`,
+            item_id: item.id,
+            title: item.title,
+            description: item.notes,
+            tags: item.tags,
+            metadata: {},
+            fields: item.fields.map((field) => ({
+              resource_id: field.resourceId,
+              label: field.label,
+              provider_kind: "local_literal",
+              has_value: true,
+            })),
+          })),
+        });
+      }
+      return Promise.reject(new Error(`unexpected command ${command}`));
+    });
+    const view = await render(
+      <PasswordVaultPage
+        incomingDraftId={null}
+        locale="en"
+        onDraftConsumed={() => {}}
+        onUnsavedChangesChange={onUnsavedChangesChange}
+      />,
+    );
+    const button = (label: string): HTMLButtonElement | undefined =>
+      Array.from(
+        view.container.querySelectorAll<HTMLButtonElement>("button"),
+      ).find((candidate) => candidate.textContent === label);
+    await act(async () => button("Edit entry")?.click());
+    expect(onUnsavedChangesChange).toHaveBeenLastCalledWith(false);
+    // Opening an editor alone must not interrupt ordinary navigation.
+    await act(async () =>
+      view.container
+        .querySelectorAll<HTMLButtonElement>(".password-row")[1]
+        ?.click(),
+    );
+    expect(view.container.querySelector(".password-inline-editor")).toBeNull();
+    await act(async () => button("Edit entry")?.click());
+    const title = view.container.querySelector<HTMLInputElement>(
+      ".password-inline-editor input",
+    );
+    expect(title).not.toBeNull();
+    await act(async () => {
+      if (title) setInputValue(title, "Unsaved API title");
+    });
+    expect(onUnsavedChangesChange).toHaveBeenLastCalledWith(true);
+    await act(async () =>
+      view.container
+        .querySelectorAll<HTMLButtonElement>(".password-row")[0]
+        ?.click(),
+    );
+    expect(
+      view.container.querySelector<HTMLInputElement>(
+        ".password-inline-editor input",
+      )?.value,
+    ).toBe("Unsaved API title");
+    expect(view.container.textContent).toContain(
+      "Save or cancel editing before switching",
+    );
+    const search = view.container.querySelector<HTMLInputElement>(
+      '[aria-label="Search password items"]',
+    );
+    await act(async () => {
+      if (search) setInputValue(search, "Password 1");
+    });
+    expect(search?.value).toBe("");
+    expect(
+      view.container.querySelector<HTMLInputElement>(
+        ".password-inline-editor input",
+      )?.value,
+    ).toBe("Unsaved API title");
+    await act(async () => button("Cancel")?.click());
+    expect(onUnsavedChangesChange).toHaveBeenLastCalledWith(false);
+    await act(async () =>
+      view.container
+        .querySelectorAll<HTMLButtonElement>(".password-row")[0]
+        ?.click(),
+    );
+    expect(
+      view.container.querySelector(".item-detail-pane h2")?.textContent,
+    ).toBe("Password 1");
+    view.unmount();
+  });
+
+  it("defers an external catalog refresh until unsaved entry changes are cancelled", async () => {
+    const item = passwordItem(1);
+    loadPasswordItems.mockResolvedValue({ kind: "live", items: [item] });
+    invoke.mockImplementation((command: string) => {
+      if (command === "list_password_catalog_metadata_command")
+        return Promise.resolve({
+          revision: "edit-refresh-revision",
+          items: [
+            {
+              record_id: "record-1",
+              item_id: item.id,
+              title: item.title,
+              description: item.notes,
+              tags: [],
+              metadata: {},
+              fields: [
+                {
+                  resource_id: item.fields[0].resourceId,
+                  label: "Password",
+                  provider_kind: "local_literal",
+                  has_value: true,
+                },
+              ],
+            },
+          ],
+        });
+      return Promise.reject(new Error(`unexpected command ${command}`));
+    });
+    const view = await render(
+      <PasswordVaultPage
+        incomingDraftId={null}
+        locale="en"
+        onDraftConsumed={() => {}}
+      />,
+    );
+    const button = (label: string): HTMLButtonElement | undefined =>
+      Array.from(
+        view.container.querySelectorAll<HTMLButtonElement>("button"),
+      ).find((candidate) => candidate.textContent === label);
+    await act(async () => button("Edit entry")?.click());
+    const title = view.container.querySelector<HTMLInputElement>(
+      ".password-inline-editor input",
+    );
+    await act(async () => {
+      if (title) setInputValue(title, "Still editing");
+    });
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    });
+    expect(loadPasswordItems).toHaveBeenCalledTimes(1);
+    expect(title?.value).toBe("Still editing");
+    await act(async () => button("Cancel")?.click());
+    expect(loadPasswordItems).toHaveBeenCalledTimes(2);
     view.unmount();
   });
 
@@ -2838,8 +2993,9 @@ describe("PasswordManagementView information architecture", () => {
           description: null,
           tags: ["production", "shared"],
           field_labels: { password: "Password" },
-          field_resources: {
-            password: "plankton://field/github-production/password",
+          field_resources: {},
+          field_exposure_policies: {
+            password: defaultExposurePolicy(),
           },
         },
       },
@@ -2851,6 +3007,233 @@ describe("PasswordManagementView information architecture", () => {
         ?.getAttribute("type"),
     ).toBe("password");
     expect(view.container.textContent).not.toContain("secret-value");
+    view.unmount();
+  });
+
+  it("adds multiple fields under one title with independent exposure policies", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "list_backend_connections") {
+        return Promise.resolve([]);
+      }
+      if (command === "create_password_draft_command") {
+        return Promise.resolve({ draft_id: "multi-field-draft" });
+      }
+      return Promise.reject(new Error(`unexpected command ${command}`));
+    });
+    const view = await render(
+      <PasswordManagementView locale="en" surface="import" />,
+    );
+
+    await act(async () => {
+      view.container
+        .querySelector<HTMLButtonElement>(
+          '[data-testid="manual-secret-add-field"]',
+        )
+        ?.click();
+    });
+    expect(
+      view.container.querySelectorAll('[data-testid^="manual-secret-entry-"]'),
+    ).toHaveLength(2);
+
+    await act(async () => {
+      setInputValue(
+        view.container.querySelector<HTMLInputElement>(
+          '[data-testid="manual-secret-title"]',
+        )!,
+        "Shared service",
+      );
+      setInputValue(
+        view.container.querySelector<HTMLInputElement>(
+          '[data-testid="manual-secret-value"]',
+        )!,
+        "first-value",
+      );
+      setInputValue(
+        view.container.querySelector<HTMLInputElement>(
+          '[data-testid="manual-secret-field-label-1"]',
+        )!,
+        "Token",
+      );
+      setInputValue(
+        view.container.querySelector<HTMLInputElement>(
+          '[data-testid="manual-secret-value-1"]',
+        )!,
+        "second-value",
+      );
+      view.container
+        .querySelector<HTMLButtonElement>(
+          '[data-testid="manual-secret-policy-toggle-1"]',
+        )
+        ?.click();
+    });
+
+    const secondPolicy = view.container.querySelector<HTMLElement>(
+      '[data-testid="manual-secret-policy-editor-1"]',
+    );
+    expect(secondPolicy).not.toBeNull();
+    await act(async () => {
+      secondPolicy!
+        .querySelector<HTMLInputElement>('input[value="direct"]')!
+        .click();
+      view.container
+        .querySelector<HTMLButtonElement>('button[aria-label="Show Token"]')!
+        .click();
+    });
+    expect(
+      view.container.querySelector<HTMLInputElement>(
+        '[data-testid="manual-secret-value-1"]',
+      )!.type,
+    ).toBe("text");
+    expect(
+      view.container.querySelector<HTMLInputElement>(
+        '[data-testid="manual-secret-value"]',
+      )!.type,
+    ).toBe("password");
+    await act(async () => {
+      view.container
+        .querySelector<HTMLButtonElement>(
+          '[data-testid="manual-secret-submit"]',
+        )
+        ?.click();
+    });
+
+    const directPolicy = {
+      ...defaultExposurePolicy(),
+      access_mode: "direct",
+    };
+    expect(invoke).toHaveBeenCalledWith("create_password_draft_command", {
+      input: {
+        descriptor: { kind: "environment", names: ["password", "token"] },
+        entries: [
+          { key: "password", value: "first-value" },
+          { key: "token", value: "second-value" },
+        ],
+        suggested_item_title: "Shared service",
+        suggested_destination: null,
+        suggested_layout: {
+          description: null,
+          tags: [],
+          field_labels: { password: "Password", token: "Token" },
+          field_resources: {},
+          field_exposure_policies: {
+            password: defaultExposurePolicy(),
+            token: directPolicy,
+          },
+        },
+      },
+    });
+    view.unmount();
+  });
+
+  it("removes an added manual password field without removing the last one", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "list_backend_connections") {
+        return Promise.resolve([]);
+      }
+      return Promise.reject(new Error(`unexpected command ${command}`));
+    });
+    const view = await render(
+      <PasswordManagementView locale="en" surface="import" />,
+    );
+
+    await act(async () => {
+      view.container
+        .querySelector<HTMLButtonElement>(
+          '[data-testid="manual-secret-add-field"]',
+        )
+        ?.click();
+    });
+    await act(async () => {
+      view.container
+        .querySelector<HTMLButtonElement>(
+          '[data-testid="manual-secret-remove-field-1"]',
+        )
+        ?.click();
+    });
+
+    expect(
+      view.container.querySelectorAll('[data-testid^="manual-secret-entry-"]'),
+    ).toHaveLength(1);
+    expect(
+      view.container.querySelector(
+        '[data-testid="manual-secret-remove-field-0"]',
+      ),
+    ).toBeNull();
+    view.unmount();
+  });
+
+  it("creates separate drafts when manually entered passwords share a title", async () => {
+    const onDraftCreated = vi.fn();
+    let draftNumber = 0;
+    invoke.mockImplementation((command: string) => {
+      if (command === "list_backend_connections") {
+        return Promise.resolve([]);
+      }
+      if (command === "create_password_draft_command") {
+        draftNumber += 1;
+        return Promise.resolve({ draft_id: `manual-draft-${draftNumber}` });
+      }
+      if (command === "list_secret_catalog_metadata") {
+        return Promise.resolve({
+          catalog_path: "/tmp/plankton-secrets.toml",
+          imports: [],
+          literals: [],
+        });
+      }
+      return Promise.reject(new Error(`unexpected command ${command}`));
+    });
+    const view = await render(
+      <PasswordManagementView
+        locale="en"
+        onDraftCreated={onDraftCreated}
+        surface="import"
+      />,
+    );
+
+    for (const value of ["first-value", "second-value"]) {
+      await act(async () => {
+        setInputValue(
+          view.container.querySelector<HTMLInputElement>(
+            '[data-testid="manual-secret-title"]',
+          )!,
+          "Shared title",
+        );
+        setInputValue(
+          view.container.querySelector<HTMLInputElement>(
+            '[data-testid="manual-secret-value"]',
+          )!,
+          value,
+        );
+      });
+      await act(async () => {
+        view.container
+          .querySelector<HTMLButtonElement>(
+            '[data-testid="manual-secret-submit"]',
+          )
+          ?.click();
+      });
+    }
+
+    const draftCalls = invoke.mock.calls.filter(
+      ([command]) => command === "create_password_draft_command",
+    );
+    expect(draftCalls).toHaveLength(2);
+    expect(
+      draftCalls.map(
+        ([, payload]) =>
+          (
+            payload as {
+              input: {
+                suggested_layout: {
+                  field_resources: Record<string, string>;
+                };
+              };
+            }
+          ).input.suggested_layout.field_resources,
+      ),
+    ).toEqual([{}, {}]);
+    expect(onDraftCreated).toHaveBeenNthCalledWith(1, "manual-draft-1");
+    expect(onDraftCreated).toHaveBeenNthCalledWith(2, "manual-draft-2");
     view.unmount();
   });
 

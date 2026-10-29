@@ -4,7 +4,11 @@ import { Menu } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type JSX } from "react";
 
 import type { Locale } from "../i18n";
-import type { DashboardData, DecisionCommand } from "../types";
+import type {
+  DashboardData,
+  DecisionCommand,
+  RememberExposureOptions,
+} from "../types";
 import { BrandMark, workspaceIcons } from "./desktop/icons";
 import {
   OperationsPage,
@@ -25,7 +29,11 @@ type DesktopWorkspaceProps = {
   isSubmitting: boolean;
   noteDraft: string;
   onDismissError: () => void;
-  onDecision: (requestId: string, decision: DecisionCommand) => Promise<void>;
+  onDecision: (
+    requestId: string,
+    decision: DecisionCommand,
+    remember?: RememberExposureOptions,
+  ) => Promise<void>;
   onLocaleChange: (locale: Locale) => void;
   onNoteChange: (note: string) => void;
   settingsController: SettingsPageController;
@@ -47,11 +55,23 @@ export function DesktopWorkspace(props: DesktopWorkspaceProps): JSX.Element {
   const [incomingVaultManager, setIncomingVaultManager] = useState(false);
   const [draftError, setDraftError] = useState<string | null>(null);
   const workspaceContentRef = useRef<HTMLDivElement>(null);
+  const unsavedPasswordChanges = useRef(false);
   const zh = props.locale === "zh-CN";
-  const navigateTo = useCallback((view: WorkspaceView): void => {
-    setActiveView(view);
-    setNavigationOpen(false);
-  }, []);
+  const navigateTo = useCallback(
+    (view: WorkspaceView): void => {
+      if (view !== "passwords" && unsavedPasswordChanges.current) {
+        setDraftError(
+          props.locale === "zh-CN"
+            ? "请先保存或取消密码编辑，再切换页面。"
+            : "Save or cancel your password changes before leaving this page.",
+        );
+        return;
+      }
+      setActiveView(view);
+      setNavigationOpen(false);
+    },
+    [props.locale],
+  );
 
   useEffect(() => {
     if (workspaceContentRef.current) {
@@ -340,6 +360,9 @@ export function DesktopWorkspace(props: DesktopWorkspaceProps): JSX.Element {
             incomingMigration={incomingMigration}
             incomingVaultManager={incomingVaultManager}
             locale={props.locale}
+            onUnsavedChangesChange={(dirty) => {
+              unsavedPasswordChanges.current = dirty;
+            }}
             onDraftConsumed={() => setIncomingDraftId(null)}
             onEditConsumed={() => setIncomingEditItemId(null)}
             onMigrationConsumed={() => setIncomingMigration(null)}

@@ -1035,6 +1035,17 @@ impl PasswordWriteLayout {
     }
 }
 
+fn password_field_resource(
+    layout: &PasswordWriteLayout,
+    draft_id: uuid::Uuid,
+    key: &str,
+) -> String {
+    layout
+        .field_resource(key)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("plankton://field/{draft_id}/{}", safe_identifier(key)))
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct DiagnosticView {
     error: PlanktonError,
@@ -1306,12 +1317,6 @@ fn focus_main_window<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-fn dispatch_full_handoff_request<R: Runtime>(app: &AppHandle<R>, request_id: String) -> Result<()> {
-    store_pending_handoff_request(app, &request_id);
-    app.emit_to("main", HANDOFF_EVENT, DesktopHandoff { request_id })
-        .context("failed to emit request handoff")
-}
-
 fn schedule_handoff_request<R: Runtime>(app: &AppHandle<R>, request_id: String) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -1352,10 +1357,6 @@ fn present_human_review_request<R: Runtime>(
     human_review_required: bool,
 ) -> Result<()> {
     match approval_window::present_request(app, request_id, human_review_required)? {
-        approval_window::PresentationResult::FullMain => {
-            dispatch_full_handoff_request(app, request_id.to_string())?;
-            schedule_tray_activity(app, tray::TrayActivity::Attention);
-        }
         approval_window::PresentationResult::Compact => {
             schedule_tray_activity(app, tray::TrayActivity::Attention);
         }
@@ -1607,6 +1608,22 @@ async fn list_resolved_requests(
         page,
         page_size,
     })
+}
+
+#[tauri::command]
+async fn request_audit_records(
+    request_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<plankton_core::AuditRecord>, String> {
+    let mut view = state
+        .store
+        .get_request(&request_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    for record in &mut view.audit_records {
+        record.payload = sanitize_audit_payload_for_display(&record.payload);
+    }
+    Ok(view.audit_records)
 }
 
 #[tauri::command]
@@ -2068,11 +2085,15 @@ async fn set_default_policy_mode(
 
 #[tauri::command]
 async fn save_desktop_settings(
+    app: AppHandle,
     settings: UserSettings,
     state: State<'_, AppState>,
 ) -> Result<UserSettings, String> {
     save_user_settings(&settings).map_err(|error| error.to_string())?;
-    reload_runtime_settings(&state)
+    let saved = reload_runtime_settings(&state)?;
+    approval_window::set_popup_enabled(&app, saved.approval_popup_enabled)
+        .map_err(|error| error.to_string())?;
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -2189,7 +2210,9 @@ async fn resolve_human_secret(resource: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn list_secret_catalog_metadata() -> Result<LocalSecretCatalog, String> {
+async fn list_secret_catalog_metadata(
+    state: State<'_, AppState>,
+) -> Result<LocalSecretCatalog, String> {
     let mut catalog = list_local_secret_catalog().map_err(|error| error.to_string())?;
     for literal in &mut catalog.literals {
         literal.value.clear();
@@ -2197,15 +2220,39 @@ async fn list_secret_catalog_metadata() -> Result<LocalSecretCatalog, String> {
     for reference in &mut catalog.imports {
         reference.value = None;
     }
+    state
+        .store
+        .apply_remembered_exposure_policies(&mut catalog)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(catalog)
 }
 
 #[tauri::command]
-async fn list_password_catalog_metadata_command() -> Result<PasswordCatalogMetadata, String> {
-    task::spawn_blocking(password_catalog_metadata)
+async fn list_password_catalog_metadata_command(
+    state: State<'_, AppState>,
+) -> Result<PasswordCatalogMetadata, String> {
+    let (mut metadata, snapshots) = task::spawn_blocking(|| {
+        let catalog = list_local_secret_catalog()?;
+        Ok::<_, plankton_core::SecretImportError>((
+            password_catalog_metadata()?,
+            plankton_core::exposure::catalog_exposure_snapshots(&catalog),
+        ))
+    })
+    .await
+    .map_err(|error| format!("password metadata task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+    let policies = state
+        .store
+        .effective_exposure_policies(&snapshots)
         .await
-        .map_err(|error| format!("password metadata task failed: {error}"))?
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    for field in metadata.items.iter_mut().flat_map(|item| &mut item.fields) {
+        if let Some(policy) = policies.get(&field.resource_id) {
+            field.exposure_policy = policy.clone();
+        }
+    }
+    Ok(metadata)
 }
 
 #[tauri::command]
@@ -2482,33 +2529,108 @@ fn inspect_dotenv_file_command(file_path: String) -> Result<DotenvInspection, St
 }
 
 #[tauri::command]
+async fn request_current_exposure_policy(
+    request_id: String,
+    state: State<'_, AppState>,
+) -> Result<CredentialExposurePolicy, String> {
+    let resource = state
+        .store
+        .get_request(&request_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .request
+        .context
+        .resource;
+    let snapshot = task::spawn_blocking(move || {
+        let catalog = list_local_secret_catalog().map_err(|error| error.to_string())?;
+        plankton_core::exposure::catalog_exposure_snapshots(&catalog)
+            .into_iter()
+            .find(|snapshot| snapshot.resource_id == resource)
+            .ok_or_else(|| "the credential no longer exists; refresh the catalog".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    let policies = state
+        .store
+        .effective_exposure_policies(std::slice::from_ref(&snapshot))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(policies
+        .get(&snapshot.resource_id)
+        .cloned()
+        .unwrap_or(snapshot.policy))
+}
+
+#[tauri::command]
 async fn approve_request(
     app: AppHandle,
     request_id: String,
     note: Option<String>,
+    exposure_policy: Option<CredentialExposurePolicy>,
+    expected_exposure_policy: Option<CredentialExposurePolicy>,
     state: State<'_, AppState>,
 ) -> Result<AccessRequest, String> {
     let settings = {
         let settings = lock_settings(&state)?;
         settings.clone()
     };
-    let request = state
-        .store
-        .record_decision(
-            &settings,
-            &request_id,
-            Decision::Allow,
-            "desktop-reviewer",
-            note,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    let request = match (exposure_policy, expected_exposure_policy) {
+        (Some(policy), Some(expected)) => {
+            let resource = state
+                .store
+                .get_request(&request_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .request
+                .context
+                .resource;
+            let snapshot = task::spawn_blocking(move || {
+                let catalog = list_local_secret_catalog().map_err(|error| error.to_string())?;
+                plankton_core::exposure::catalog_exposure_snapshots(&catalog)
+                    .into_iter()
+                    .find(|snapshot| snapshot.resource_id == resource)
+                    .ok_or_else(|| {
+                        "the credential no longer exists; refresh the catalog".to_string()
+                    })
+            })
+            .await
+            .map_err(|error| format!("credential policy task failed: {error}"))??;
+            state
+                .store
+                .approve_and_remember_exposure(
+                    &request_id,
+                    &snapshot,
+                    &expected,
+                    &policy,
+                    "desktop-reviewer",
+                    note,
+                )
+                .await
+        }
+        (None, None) => {
+            state
+                .store
+                .record_decision(
+                    &settings,
+                    &request_id,
+                    Decision::Allow,
+                    "desktop-reviewer",
+                    note,
+                )
+                .await
+        }
+        _ => {
+            return Err(
+                "exposurePolicy and expectedExposurePolicy must be supplied together".into(),
+            )
+        }
+    }
+    .map_err(|error| error.to_string())?;
     if !request_review_is_running(&request) && !state.approval_chat.is_running(&request_id) {
         let _ = state.approval_chat.release_if_idle(&request_id)?;
-        if let Err(error) = approval_window::resolve_request(&app, &request_id) {
-            record_approval_presentation_failure(&state.store, &request_id, error.to_string())
-                .await;
-        }
+    }
+    if let Err(error) = approval_window::resolve_request(&app, &request_id) {
+        record_approval_presentation_failure(&state.store, &request_id, error.to_string()).await;
     }
     Ok(request)
 }
@@ -2537,12 +2659,22 @@ async fn reject_request(
         .map_err(|error| error.to_string())?;
     if !request_review_is_running(&request) && !state.approval_chat.is_running(&request_id) {
         let _ = state.approval_chat.release_if_idle(&request_id)?;
-        if let Err(error) = approval_window::resolve_request(&app, &request_id) {
-            record_approval_presentation_failure(&state.store, &request_id, error.to_string())
-                .await;
-        }
+    }
+    if let Err(error) = approval_window::resolve_request(&app, &request_id) {
+        record_approval_presentation_failure(&state.store, &request_id, error.to_string()).await;
     }
     Ok(request)
+}
+
+#[tauri::command]
+fn dismiss_approval_popup(app: AppHandle) -> Result<(), String> {
+    approval_window::dismiss_popup(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn hide_current_window(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
+    window.hide().map_err(|error| error.to_string())?;
+    background::synchronize_dock_visibility(&app).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -5456,10 +5588,7 @@ async fn persist_confirmed_to_local_kdbx(
         {
             return Err(cleanup_path_after_error(&staging, error));
         }
-        let resource = layout
-            .field_resource(&entry.key)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("plankton://field/{draft_id}/{safe_key}"));
+        let resource = password_field_resource(layout, draft_id, &entry.key);
         let mut metadata = std::collections::BTreeMap::from([
             ("vault".to_string(), safe_vault_id.clone()),
             ("item_id".to_string(), draft_id.to_string()),
@@ -5702,10 +5831,7 @@ async fn persist_confirmed_to_onepassword(
         .iter()
         .map(|entry| {
             let safe_key = safe_identifier(&entry.key);
-            let resource = layout
-                .field_resource(&entry.key)
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| format!("plankton://field/{draft_id}/{safe_key}"));
+            let resource = password_field_resource(layout, draft_id, &entry.key);
             let mut metadata = std::collections::BTreeMap::from([
                 ("vault".to_string(), vault_name.clone()),
                 ("item_id".to_string(), draft_id.to_string()),
@@ -5823,15 +5949,7 @@ async fn persist_confirmed_to_bitwarden(
         .entries
         .iter()
         .map(|entry| {
-            let resource = layout
-                .field_resource(&entry.key)
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| {
-                    format!(
-                        "plankton://field/{draft_id}/{}",
-                        safe_identifier(&entry.key)
-                    )
-                });
+            let resource = password_field_resource(layout, draft_id, &entry.key);
             let mut metadata = std::collections::BTreeMap::from([
                 ("vault".to_string(), vault_id.to_string()),
                 ("item_id".to_string(), draft_id.to_string()),
@@ -6280,6 +6398,13 @@ fn run() -> Result<()> {
         history_error: Some(error),
         ..ApprovalChatRuntime::default()
     });
+    let popup_enabled = settings.approval_popup_enabled;
+    let existing_approval_ids = tauri::async_runtime::block_on(store.list_pending_requests())
+        .context("failed to seed existing approvals")?
+        .into_iter()
+        .filter(|request| request.human_review_required())
+        .map(|request| request.id)
+        .collect::<Vec<_>>();
     let initial_handoff_request_id =
         extract_handoff_request_id(&std::env::args().collect::<Vec<_>>());
     let initial_password_draft_id =
@@ -6353,8 +6478,18 @@ fn run() -> Result<()> {
         .manage(approval_window::ApprovalRuntime::default())
         .manage(tray::TrayRuntime::default())
         .setup(move |app| {
+            approval_window::set_popup_enabled(app.handle(), popup_enabled)?;
+            approval_window::seed_existing_requests(
+                app.handle(),
+                existing_approval_ids
+                    .iter()
+                    .filter(|id| Some(id.as_str()) != initial_handoff_for_setup.as_deref())
+                    .cloned(),
+            )?;
             refresh_frontend_cache(app).context("failed to refresh frontend cache")?;
             tray::setup(app).context("failed to create persistent tray icon")?;
+            background::setup_application_menu(app.handle())
+                .context("failed to set up application menu")?;
             let app_handle = app.handle().clone();
             app.listen(DEEP_LINK_EVENT, move |event| {
                 handle_deep_link_payload(&app_handle, event.payload());
@@ -6407,6 +6542,7 @@ fn run() -> Result<()> {
             approval_chat_history,
             create_approval_chat,
             rename_approval_chat,
+            request_audit_records,
             approval_chat_snapshot,
             send_approval_chat_message,
             update_approval_chat_options,
@@ -6444,8 +6580,11 @@ fn run() -> Result<()> {
             pick_dotenv_file_command,
             inspect_dotenv_file_command,
             approve_request,
+            request_current_exposure_policy,
             reject_request,
             compact_approval_requests,
+            dismiss_approval_popup,
+            hide_current_window,
             open_full_request_details,
             consume_handoff_request,
             consume_password_draft,
@@ -6479,8 +6618,9 @@ fn run() -> Result<()> {
             tray::set_tray_reduced_motion
         ])
         .on_window_event(background::handle_window_event)
-        .run(tauri::generate_context!())
-        .context("failed to run Tauri application")?;
+        .build(tauri::generate_context!())
+        .context("failed to build Tauri application")?
+        .run(background::handle_run_event);
 
     Ok(())
 }
@@ -6588,27 +6728,7 @@ fn start_approval_monitor(app: AppHandle, store: SqliteStore) {
             let mut current_error: Option<String> = None;
             match store.list_human_review_request_ids().await {
                 Ok(human_review_ids) => {
-                    let mut active_ids = human_review_ids.clone();
-                    if let Ok(compact_ids) = approval_window::compact_request_ids(&app) {
-                        for request_id in compact_ids {
-                            if active_ids.contains(&request_id) {
-                                continue;
-                            }
-                            let retained = match store.get_request(&request_id).await {
-                                Ok(view) => {
-                                    let chat_running =
-                                        app.try_state::<AppState>().is_some_and(|state| {
-                                            state.approval_chat.is_running(&request_id)
-                                        });
-                                    request_review_is_running(&view.request) || chat_running
-                                }
-                                Err(_) => false,
-                            };
-                            if retained {
-                                active_ids.push(request_id);
-                            }
-                        }
-                    }
+                    let active_ids = human_review_ids.clone();
                     if let Err(error) = approval_window::reconcile_active_requests(&app, active_ids)
                     {
                         let message = error.to_string();
@@ -6784,13 +6904,13 @@ mod tests {
         extract_password_edit_item_id_from_url, extract_password_migration_from_url,
         extract_request_id_from_url, finalize_staged_vault, frontend_cache_requires_reset,
         has_fresh_active_evaluation, local_vault_options_in, password_change_monitor_transition,
-        password_source_metadata, prepare_git_sync_repository_inner, process_is_running,
-        recover_stale_daemon_state, redact_sync_state, rollback_staged_vault, startup_actions,
-        sync_credential_resource, validate_git_repository_url,
+        password_field_resource, password_source_metadata, prepare_git_sync_repository_inner,
+        process_is_running, recover_stale_daemon_state, redact_sync_state, rollback_staged_vault,
+        startup_actions, sync_credential_resource, validate_git_repository_url,
         validate_local_vault_unlock_material, validate_sync_config,
         validate_sync_credential_reference, ApprovalChatMessageKind, ApprovalChatRuntime,
-        ApprovalChatState, PasswordMigrationMode, StartupAction, SyncOperationGuard,
-        DESKTOP_PASSWORD_CHANGE_REASON,
+        ApprovalChatState, PasswordMigrationMode, PasswordWriteLayout, StartupAction,
+        SyncOperationGuard, DESKTOP_PASSWORD_CHANGE_REASON,
     };
     use plankton_core::{passwords::ParsedPasswordSource, resources::BackendKind};
     use plankton_core::{
@@ -6800,6 +6920,7 @@ mod tests {
     use plankton_protocol::{
         acp::{AcpProfile, AgentKind, VersionMode},
         daemon::DaemonState,
+        exposure::CredentialExposurePolicy,
     };
     use plankton_store::{
         BackendBindingRecord, InterruptedOperation, OperationStatus, SyncStateRecord,
@@ -6992,6 +7113,54 @@ mod tests {
         std::fs::write(&path, "broken").unwrap();
         assert!(ApprovalChatRuntime::open(path.clone()).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "broken");
+    }
+
+    #[test]
+    fn generated_password_resources_are_unique_across_same_title_drafts() {
+        let layout = PasswordWriteLayout {
+            item_title: "Shared title".to_string(),
+            section: "Credentials".to_string(),
+            description: None,
+            tags: Vec::new(),
+            field_labels: std::collections::BTreeMap::new(),
+            field_resources: std::collections::BTreeMap::new(),
+            default_exposure_policy: CredentialExposurePolicy::default(),
+            field_exposure_policies: std::collections::BTreeMap::new(),
+        };
+        let first = uuid::Uuid::from_u128(1);
+        let second = uuid::Uuid::from_u128(2);
+
+        assert_ne!(
+            password_field_resource(&layout, first, "password"),
+            password_field_resource(&layout, second, "password")
+        );
+        assert_eq!(
+            password_field_resource(&layout, first, "password"),
+            format!("plankton://field/{first}/password")
+        );
+    }
+
+    #[test]
+    fn explicit_password_resource_is_preserved() {
+        let resource = "secret/custom/shared-title";
+        let layout = PasswordWriteLayout {
+            item_title: "Shared title".to_string(),
+            section: "Credentials".to_string(),
+            description: None,
+            tags: Vec::new(),
+            field_labels: std::collections::BTreeMap::new(),
+            field_resources: std::collections::BTreeMap::from([(
+                "password".to_string(),
+                resource.to_string(),
+            )]),
+            default_exposure_policy: CredentialExposurePolicy::default(),
+            field_exposure_policies: std::collections::BTreeMap::new(),
+        };
+
+        assert_eq!(
+            password_field_resource(&layout, uuid::Uuid::from_u128(1), "password"),
+            resource
+        );
     }
 
     #[test]

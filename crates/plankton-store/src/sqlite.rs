@@ -22,6 +22,8 @@ use sqlx::{
 };
 use tracing::instrument;
 
+use crate::exposure::RememberedExposureUpdate;
+
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pub(crate) pool: SqlitePool,
@@ -66,6 +68,10 @@ pub enum StoreError {
     InconsistentSearchGeneration,
     #[error("limit must be between 1 and {maximum}, received {received}")]
     InvalidLimit { maximum: u16, received: u16 },
+    #[error("invalid exposure policy: {0}")]
+    InvalidExposurePolicy(String),
+    #[error("the credential exposure policy changed; reload the request before remembering it")]
+    ExposurePolicyConflict,
 }
 
 async fn find_matching_batch_ticket(
@@ -138,27 +144,7 @@ pub(crate) async fn refresh_shared_review(
     pool: &SqlitePool,
     request: &mut AccessRequest,
 ) -> Result<(), StoreError> {
-    let Some(source_id) = request
-        .automatic_decision
-        .as_ref()
-        .and_then(|trace| trace.batch_source_request_id.as_deref())
-    else {
-        return Ok(());
-    };
-    let encoded = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT llm_suggestion_json FROM access_requests WHERE id = ?",
-    )
-    .bind(source_id)
-    .fetch_optional(pool)
-    .await?
-    .flatten();
-    let shared = parse_optional_json::<LlmSuggestion>(encoded)?;
-    if let (Some(shared), Some(current)) = (shared, request.llm_suggestion.as_mut()) {
-        current.exposure_report = shared.exposure_report;
-        current.provider_trace = shared.provider_trace;
-        current.usage = shared.usage;
-    }
-    Ok(())
+    crate::batch_review::project_batch_reviews(pool, std::slice::from_mut(request)).await
 }
 
 async fn insert_batch_tickets(
@@ -391,7 +377,8 @@ impl SqliteStore {
         let request_row =
             request_row.ok_or_else(|| StoreError::NotFound(request_id.to_string()))?;
         let mut request = decode_request(&request_row)?;
-        refresh_shared_review(&self.pool, &mut request).await?;
+        crate::batch_review::project_batch_reviews(&self.pool, std::slice::from_mut(&mut request))
+            .await?;
 
         let audit_rows = sqlx::query(
             r#"
@@ -451,7 +438,12 @@ impl SqliteStore {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.iter().map(decode_request).collect()
+        let mut requests = rows
+            .iter()
+            .map(decode_request)
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::batch_review::project_batch_reviews(&self.pool, &mut requests).await?;
+        Ok(requests)
     }
 
     #[instrument(skip(self))]
@@ -553,7 +545,12 @@ impl SqliteStore {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.iter().map(decode_request).collect()
+        let mut requests = rows
+            .iter()
+            .map(decode_request)
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::batch_review::project_batch_reviews(&self.pool, &mut requests).await?;
+        Ok(requests)
     }
 
     #[instrument(skip(self))]
@@ -650,7 +647,7 @@ impl SqliteStore {
         actor: &str,
         note: Option<String>,
     ) -> Result<AccessRequest, StoreError> {
-        self.record_decision_internal(request_id, decision, actor, note)
+        self.record_decision_internal(request_id, decision, actor, note, None)
             .await
     }
 
@@ -662,27 +659,28 @@ impl SqliteStore {
         actor: &str,
         note: Option<String>,
     ) -> Result<AccessRequest, StoreError> {
-        self.record_decision_internal(request_id, Decision::Allow, actor, note)
+        self.record_decision_internal(request_id, Decision::Allow, actor, note, None)
             .await
     }
 
-    async fn record_decision_internal(
+    pub(crate) async fn record_decision_internal(
         &self,
         request_id: &str,
         decision: Decision,
         actor: &str,
         note: Option<String>,
+        remembered: Option<RememberedExposureUpdate<'_>>,
     ) -> Result<AccessRequest, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let row = sqlx::query(
             r#"
-            SELECT
+            UPDATE access_requests SET id = id
+            WHERE id = ?
+            RETURNING
                 id, resource, policy_mode, approval_status, evaluation_state, final_decision,
                 provider_kind, rendered_prompt, provider_input_json, llm_suggestion_json,
                 automatic_decision_json, context_json, created_at, updated_at, resolved_at
-            FROM access_requests
-            WHERE id = ?
             "#,
         )
         .bind(request_id)
@@ -691,7 +689,56 @@ impl SqliteStore {
 
         let row = row.ok_or_else(|| StoreError::NotFound(request_id.to_string()))?;
         let mut request = decode_request(&row)?;
-        let audits = request.apply_manual_decision(decision, actor.to_string(), note)?;
+        let mut audits = request.apply_manual_decision(decision, actor.to_string(), note)?;
+        if let Some(update) = remembered {
+            if request.context.resource != update.snapshot.resource_id {
+                return Err(StoreError::InvalidExposurePolicy(
+                    "policy resource does not match the pending request".into(),
+                ));
+            }
+            if request
+                .context
+                .metadata
+                .get(plankton_core::exposure::EXPOSURE_CATALOG_FINGERPRINT_KEY)
+                .is_some_and(|fingerprint| fingerprint != &update.snapshot.fingerprint)
+            {
+                return Err(StoreError::ExposurePolicyConflict);
+            }
+            let previous: Option<String> = sqlx::query_scalar(
+                "SELECT policy_json FROM remembered_exposure_policies WHERE resource_id = ? AND catalog_fingerprint = ?",
+            )
+            .bind(&update.snapshot.resource_id)
+            .bind(&update.snapshot.fingerprint)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let effective = match previous {
+                Some(encoded) => serde_json::from_str(&encoded)?,
+                None => update.snapshot.policy.clone(),
+            };
+            if &effective != update.expected_policy {
+                return Err(StoreError::ExposurePolicyConflict);
+            }
+            sqlx::query(
+                "INSERT INTO remembered_exposure_policies (resource_id, catalog_fingerprint, policy_json, source_request_id, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(resource_id) DO UPDATE SET catalog_fingerprint = excluded.catalog_fingerprint, policy_json = excluded.policy_json, source_request_id = excluded.source_request_id, updated_at = excluded.updated_at",
+            )
+            .bind(&update.snapshot.resource_id)
+            .bind(&update.snapshot.fingerprint)
+            .bind(serde_json::to_string(update.policy)?)
+            .bind(&request.id)
+            .bind(request.updated_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+            for audit in &mut audits {
+                if audit.action == plankton_core::AuditAction::ApprovalRecorded {
+                    audit.payload["exposure_policy_change"] = serde_json::json!({
+                        "resource": update.snapshot.resource_id,
+                        "before": effective,
+                        "after": update.policy,
+                        "catalog_fingerprint": update.snapshot.fingerprint,
+                    });
+                }
+            }
+        }
         sqlx::query(
             r#"
             UPDATE access_requests
@@ -2842,6 +2889,225 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn human_completion_after_automatic_escalation_emits_no_legacy_memory_audit() {
+        let settings = test_settings();
+        let store = SqliteStore::new(&settings)
+            .await
+            .expect("store should initialize");
+        let request = store
+            .submit_request(
+                &settings,
+                RequestContext::new(
+                    "secret/human-review".into(),
+                    "Require a human decision".into(),
+                    "alice".into(),
+                ),
+                PolicyMode::LlmAutomatic,
+            )
+            .await
+            .expect("request should be queued");
+        let running = store
+            .claim_evaluation(&request.id, chrono::Utc::now())
+            .await
+            .expect("claim should succeed")
+            .expect("request should be queued");
+        let mut suggestion = suggestion_for(&running, None);
+        suggestion.suggested_decision = SuggestedDecision::Escalate;
+        let escalated = store
+            .finalize_evaluation(&request.id, suggestion)
+            .await
+            .expect("evaluation should escalate");
+        assert_eq!(escalated.approval_status, ApprovalStatus::Pending);
+
+        store
+            .record_decision(
+                &settings,
+                &request.id,
+                Decision::Allow,
+                "reviewer",
+                Some("human approval".into()),
+            )
+            .await
+            .expect("human decision should persist");
+
+        let legacy_audit_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_records WHERE request_id = ? AND action = 'memory_evaluated'",
+        )
+        .bind(&request.id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("legacy audit query should succeed");
+        assert_eq!(legacy_audit_count, 0);
+    }
+
+    #[tokio::test]
+    async fn batch_reads_follow_source_review_progress_without_changing_key_decisions() {
+        let settings = test_settings();
+        let store = SqliteStore::new(&settings).await.unwrap();
+        let source = store
+            .submit_request(
+                &settings,
+                batch_context("SECRET_ID", "shared note", 10, "command-a"),
+                PolicyMode::LlmAutomatic,
+            )
+            .await
+            .unwrap();
+        let running = store
+            .claim_evaluation(&source.id, chrono::Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut suggestion = suggestion_for(&running, None);
+        suggestion.provider_trace = Some(review_trace(LlmReviewDetailState::Running, 0, 6));
+        suggestion.batch_decisions = vec![
+            BatchResourceDecision {
+                resource_selector: "SECRET_KEY".into(),
+                suggested_decision: SuggestedDecision::Allow,
+                rationale_summary: "key-specific allow".into(),
+                risk_score: 18,
+            },
+            BatchResourceDecision {
+                resource_selector: "REVIEW_KEY".into(),
+                suggested_decision: SuggestedDecision::Escalate,
+                rationale_summary: "key-specific review".into(),
+                risk_score: 67,
+            },
+        ];
+        store
+            .finalize_evaluation(&source.id, suggestion.clone())
+            .await
+            .unwrap();
+        let reused = store
+            .submit_request(
+                &settings,
+                batch_context("SECRET_KEY", "shared note", 11, "command-a"),
+                PolicyMode::LlmAutomatic,
+            )
+            .await
+            .unwrap();
+        let pending = store
+            .submit_request(
+                &settings,
+                batch_context("REVIEW_KEY", "shared note", 12, "command-a"),
+                PolicyMode::LlmAutomatic,
+            )
+            .await
+            .unwrap();
+        assert!(reused.llm_suggestion.is_some());
+        let projected = store.get_request(&reused.id).await.unwrap().request;
+        let mut stale = projected.llm_suggestion.unwrap();
+        assert_eq!(stale.risk_score, 18);
+        assert_eq!(stale.suggested_decision, SuggestedDecision::Allow);
+        assert_eq!(
+            stale
+                .provider_trace
+                .as_ref()
+                .unwrap()
+                .review_progress
+                .as_ref()
+                .unwrap()
+                .state,
+            LlmReviewDetailState::Running
+        );
+        stale.rationale_summary = "stored per-key rationale".into();
+        sqlx::query("UPDATE access_requests SET llm_suggestion_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&stale).unwrap())
+            .bind(&reused.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        suggestion.provider_trace = Some(review_trace(LlmReviewDetailState::Complete, 6, 6));
+        suggestion.exposure_report = Some(plankton_core::CredentialExposureReport {
+            chain_summary: "Final shared evidence".into(),
+            node_assessments: Vec::new(),
+            surfaces: plankton_protocol::exposure::CredentialExposureSurface::ALL
+                .into_iter()
+                .map(|surface| plankton_core::ExposureSurfaceAssessment {
+                    surface,
+                    actual_level: 0,
+                    evidence_state: plankton_core::ExposureEvidenceState::NotObserved,
+                    network_destinations: Vec::new(),
+                    summary: "not observed".into(),
+                    annotations: Vec::new(),
+                })
+                .collect(),
+        });
+        store
+            .update_evaluation_details(&source.id, suggestion)
+            .await
+            .unwrap();
+        let from_get = store.get_request(&reused.id).await.unwrap().request;
+        let from_history = store
+            .list_resolved_requests("", 100, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.id == reused.id)
+            .unwrap();
+        let read = crate::SqliteReadStore::new(&settings).await.unwrap();
+        let from_read = read.get_status(&reused.id).await.unwrap().request;
+        for request in [from_get, from_history, from_read] {
+            assert_eq!(request.final_decision, reused.final_decision);
+            assert_eq!(request.automatic_decision, reused.automatic_decision);
+            let details = request.llm_suggestion.unwrap();
+            assert_eq!(details.suggested_decision, SuggestedDecision::Allow);
+            assert_eq!(details.risk_score, 18);
+            assert_eq!(details.rationale_summary, "stored per-key rationale");
+            assert_eq!(
+                details
+                    .provider_trace
+                    .unwrap()
+                    .review_progress
+                    .unwrap()
+                    .state,
+                LlmReviewDetailState::Complete
+            );
+            assert_eq!(
+                details.exposure_report.unwrap().chain_summary,
+                "Final shared evidence"
+            );
+        }
+        let pending_view = store
+            .list_pending_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.id == pending.id)
+            .unwrap();
+        assert_eq!(pending_view.approval_status, ApprovalStatus::Pending);
+        assert_eq!(pending_view.final_decision, None);
+        assert_eq!(
+            pending_view
+                .llm_suggestion
+                .as_ref()
+                .unwrap()
+                .suggested_decision,
+            SuggestedDecision::Escalate
+        );
+        assert_eq!(
+            pending_view
+                .llm_suggestion
+                .unwrap()
+                .provider_trace
+                .unwrap()
+                .review_progress
+                .unwrap()
+                .state,
+            LlmReviewDetailState::Complete
+        );
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT llm_suggestion_json FROM access_requests WHERE id = ?")
+                .bind(&reused.id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<LlmSuggestion>(&stored.unwrap()).unwrap(),
+            stale
+        );
+    }
+
+    #[tokio::test]
     async fn batch_requests_share_the_source_session_and_latest_audit() {
         let settings = test_settings();
         let store = SqliteStore::new(&settings).await.unwrap();
@@ -3211,6 +3477,7 @@ mod tests {
             decision_attempts: Vec::new(),
             audit_events: Vec::new(),
             session_configuration: None,
+            decision_attempt_errors: Vec::new(),
             rendered_prompt: None,
             transport: Some("stdio".into()),
             protocol: Some("acp".into()),

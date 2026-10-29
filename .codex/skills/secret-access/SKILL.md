@@ -108,9 +108,11 @@ exposure flags retain the protected defaults.
 
 ```bash
 plankton password create \
-  --title "Example service credentials" \
+  --title "Service API credentials" \
   --key CLIENT_ID \
   --key CLIENT_SECRET \
+  --network-domain api.example.com \
+  --exposure-note 'network=Authenticate only to this service API' \
   --wait
 ```
 
@@ -119,6 +121,70 @@ plankton password create \
   resource needed by the downstream process with the ordinary `plankton get`
   flow shown below. Creation confirmation is not read approval: every later
   `get` must still receive its normal policy decision or human approval.
+
+## Configure the intended exposure when creating credentials
+
+Before submitting `password create`, identify the actual consuming program,
+destination hostnames, and whether the authorized task needs storage or logging.
+Propose that scope in the same draft so the human can confirm it with the values.
+Replace the example hostname with the service's verified hostname. Do not create
+a network credential with the default network-denied profile when its known
+purpose is API authentication, then repeatedly request exceptions.
+
+- Keep `--access-mode protected`. It allows automatic decisions within the
+  configured scope. `direct` skips review and is not a fix for missing evidence.
+- Use repeatable `--network-domain HOST` for exact hosts. This sets network level
+  1 when `--network` is omitted. Hosts have no scheme, port, or path. Use
+  `--network-subdomains HOST` only when the task needs those subdomains; it does
+  not include the apex host. Avoid regex or `--network 2` unless the user needs
+  that broader scope.
+- The other defaults are `--llm-context 0 --local-persistence 0 --terminal-log 0
+  --process-propagation 1`: keep values out of model context, disk, and logs;
+  allow delivery to the declared local consumer. Propose persistence only when
+  the user's task requires it, with an `--exposure-note local_persistence=...`
+  explaining the destination and purpose. Notes explain scope; they do not
+  override numeric levels or allowlists.
+- `password create` applies one default policy to the new group. If fields need
+  different scopes, describe that in the draft and let the human adjust each
+  field. Do not quietly apply the widest field policy to the whole group.
+- For an existing or imported field, propose a metadata-only change:
+
+```bash
+plankton password edit-field secret/api-token \
+  --access-mode protected --network-domain api.example.com \
+  --llm-context 0 --local-persistence 0 --terminal-log 0 --process-propagation 1 \
+  --exposure-note 'network=Authenticate to the service API' \
+  --reason "Remember the verified API destination for this field"
+```
+
+Exposure flags on `edit-field` replace the whole exposure profile, with omitted
+options returning to defaults. Inspect the current field policy in Plankton and
+preserve its other intended domains, levels, and notes. Reuse `--change-id` when
+proposing changes to several fields. `password add` support varies by installed
+version; inspect its help before using exposure flags, or set the profile in the
+import dialog / propose `edit-field` after import. No secret value is needed.
+
+Policy confirmation can remove repeat human approvals for matching, sufficiently
+evidenced requests. Unknown consumers, new destinations, policy violations, or
+review failures can still require human review. A one-time approval does not
+change the saved policy. Do not retry a denied request with a weaker profile.
+
+## Provide inspectable consumer evidence
+
+Plankton collects the caller's process ancestry. A pipeline's sibling consumer,
+a Python program supplied over stdin, or a heredoc body may not be recoverable
+from those process arguments. A detailed `--reason` helps explain intent but
+does not substitute for source evidence.
+
+When the consumer is a local script, keep that script free of credential values
+and declare it with `get --consumer-script PATH`. Plankton validates a readable
+text file (complete preview up to 64 KiB) and makes its path available to the
+reviewer. It does not execute the script, consume stdin, capture the secret, or
+prove that every downstream process has been collected. Keep the file available
+and unchanged until the review finishes; execute the same consumer you declare.
+If the installed CLI lacks this option (`plankton get --help`), use an inspectable
+wrapper script that invokes Plankton and hands the value to its consumer, or
+report the missing capability instead of inventing unsupported options.
 
 - To propose catalog management changes, use the metadata-only commands. Every
   new change requires an audit reason and opens desktop confirmation:
@@ -167,13 +233,14 @@ plankton password change CHANGE_ID --wait --timeout 300
 set +x
 set -o pipefail
 plankton get secret/api-token \
-  --reason "为完成当前开发联调，需要临时获取目标服务凭证，仅通过标准输入交给下游进程，不写入文件或日志" \
+  --consumer-script ./api-client.py \
+  --reason "Authenticate api-client.py to api.example.com; pass via stdin without logging or persistence" \
   --requested-by agent |
-  downstream-command --token-stdin
+  python3 ./api-client.py --token-stdin
 ```
 
 - `password add` never writes a password manager directly. The human confirms the exact draft in the desktop app and chooses Plankton KDBX or an enabled external backend.
-- `password create` sends only an editable title, key names, and destination suggestion. It never accepts password values from CLI arguments or stdin; the human supplies them in one aggregated desktop popup. With `--wait`, successful output contains resource IDs but no values.
+- `password create` sends an editable title, key names, destination, and suggested exposure policy. It never accepts password values from CLI arguments or stdin; the human supplies them in one aggregated desktop popup. With `--wait`, successful output contains resource IDs but no values.
 - Password management commands never return secret values. They submit metadata-only operations and return a change ID, cumulative diff, state, and optional successor change ID.
 - `move-field` and `merge` preserve resource keys while changing password-item membership. `dedupe-field` compares two existing stored values locally and refuses deletion unless they match; neither value is returned.
 - A confirmed change ID is immutable. Calls that arrive afterward are accepted under a successor change ID in the same batch instead of being rejected.
@@ -204,6 +271,8 @@ plankton get secret/api-token \
 - Asking the user to paste a missing secret into chat instead of creating a `password add` draft.
 - Creating one empty draft per key when the keys belong to the same credential group; use one `password create` call with repeated `--key` options.
 - Treating confirmation of `password create` as approval for `get`, or attempting to bypass the normal access request after creation.
+- Leaving a known API destination out of the creation draft, or using `direct` / unrestricted network access to suppress repeated approvals.
+- Assuming a pipe or heredoc is automatically visible in the ancestor call chain, or describing declared consumer source as proof that the consumer actually executed.
 - Treating a trusted computer as permission to bypass desktop confirmation.
 - Passing a value to a management command. There is deliberately no `--value`
   option on `edit`, `rename-field`, `refresh`, `move-field`, `merge`,

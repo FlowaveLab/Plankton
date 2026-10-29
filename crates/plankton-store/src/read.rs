@@ -75,7 +75,7 @@ impl SqliteReadStore {
             .connect_with(options)
             .await?;
 
-        sqlx::migrate!("./migrations").run(&pool).await?;
+        crate::migration_compatibility::run(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -121,7 +121,8 @@ impl SqliteReadStore {
         let request_row =
             request_row.ok_or_else(|| StoreError::NotFound(request_id.to_string()))?;
         let mut request = decode_access_request(&request_row)?;
-        crate::sqlite::refresh_shared_review(&self.pool, &mut request).await?;
+        crate::batch_review::project_batch_reviews(&self.pool, std::slice::from_mut(&mut request))
+            .await?;
 
         let audit_rows = sqlx::query(
             r#"

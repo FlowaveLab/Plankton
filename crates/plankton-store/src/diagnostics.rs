@@ -67,6 +67,33 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Called only when the owning daemon starts or has stopped its workers.
+    /// A completed decision can still have unfinished evidence enrichment.
+    pub async fn recover_interrupted_review_details(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE access_requests
+            SET llm_suggestion_json = json_set(
+                llm_suggestion_json,
+                '$.provider_trace.review_progress.state',
+                CASE WHEN COALESCE(json_extract(llm_suggestion_json, '$.provider_trace.review_progress.completed_units'), 0) > 0 THEN 'partial' ELSE 'failed' END,
+                '$.provider_trace.review_progress.error', 'Evidence collection was interrupted when the approval service stopped',
+                '$.provider_trace.review_progress.updated_at', ?
+            ), updated_at = ?
+            WHERE CASE WHEN json_valid(llm_suggestion_json) THEN json_extract(llm_suggestion_json, '$.provider_trace.review_progress.state') = 'running' ELSE 0 END
+              AND COALESCE(json_extract(CASE WHEN json_valid(automatic_decision_json) THEN automatic_decision_json END, '$.decision_source'), '') != 'batch_ticket'
+            "#,
+        )
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn list_diagnostic_errors(
         &self,
         include_acknowledged: bool,
@@ -765,5 +792,271 @@ mod tests {
             .finish_operation("evaluation-1", OperationStatus::Completed, now)
             .await
             .expect("repeated finish should be idempotent");
+    }
+    async fn evaluation_fixture() -> (tempfile::TempDir, SqliteStore, String) {
+        let temp = tempdir().expect("temporary directory");
+        let settings = plankton_core::PlanktonSettings {
+            database_url: format!("sqlite://{}", temp.path().join("store.db").display()),
+            provider_kind: "mock".into(),
+            ..Default::default()
+        };
+        let store = SqliteStore::new(&settings).await.expect("store");
+        let request = store
+            .submit_request(
+                &settings,
+                plankton_core::RequestContext::new(
+                    "secret/test".into(),
+                    "Review".into(),
+                    "tester".into(),
+                ),
+                plankton_core::PolicyMode::Assisted,
+            )
+            .await
+            .expect("request");
+        (temp, store, request.id)
+    }
+
+    #[tokio::test]
+    async fn evaluation_failures_are_diagnostic_and_acknowledgement_survives_repeated_updates() {
+        let (_temp, store, id) = evaluation_fixture().await;
+        let suggestion = serde_json::json!({
+            "error": "ACP decision exceeded its total 60 second deadline; cancellation was requested",
+            "generated_at": Utc::now().to_rfc3339()
+        }).to_string();
+        for _ in 0..2 {
+            sqlx::query("UPDATE access_requests SET llm_suggestion_json = ? WHERE id = ?")
+                .bind(&suggestion)
+                .bind(&id)
+                .execute(&store.pool)
+                .await
+                .expect("record failure");
+        }
+        let errors = store
+            .list_diagnostic_errors(true, 20)
+            .await
+            .expect("diagnostics");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].error.code, ErrorCode::Timeout);
+        assert_eq!(errors[0].error.public_context.get("request_id"), Some(&id));
+        store
+            .acknowledge_diagnostic_error(errors[0].error.correlation_id, Utc::now())
+            .await
+            .expect("acknowledge");
+        sqlx::query("UPDATE access_requests SET llm_suggestion_json = ? WHERE id = ?")
+            .bind(&suggestion)
+            .bind(&id)
+            .execute(&store.pool)
+            .await
+            .expect("repeat");
+        assert!(store
+            .list_diagnostic_errors(false, 20)
+            .await
+            .expect("unacknowledged")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_evidence_reports_failures_only_for_its_source() {
+        let (_temp, store, source_id) = evaluation_fixture().await;
+        let batch = store
+            .submit_request(
+                &plankton_core::PlanktonSettings::default(),
+                plankton_core::RequestContext::new(
+                    "secret/batch".into(),
+                    "Review".into(),
+                    "tester".into(),
+                ),
+                plankton_core::PolicyMode::ManualOnly,
+            )
+            .await
+            .unwrap();
+        let suggestion = serde_json::json!({
+            "error":null,
+            "provider_trace": {
+                "decision_attempt_errors":["first decision timed out"],
+                "review_progress":{"state":"failed","error":"invalid detail response"}
+            }
+        })
+        .to_string();
+        sqlx::query("UPDATE access_requests SET llm_suggestion_json = ? WHERE id = ?")
+            .bind(&suggestion)
+            .bind(&source_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE access_requests SET llm_suggestion_json = ?, automatic_decision_json = ? WHERE id = ?")
+            .bind(&suggestion)
+            .bind(serde_json::json!({"decision_source":"batch_ticket", "batch_source_request_id": source_id}).to_string())
+            .bind(&batch.id).execute(&store.pool).await.unwrap();
+        for backfill in [false, true] {
+            if backfill {
+                for trigger in [
+                    "evaluation_diagnostic_after_insert",
+                    "evaluation_diagnostic_after_update",
+                    "evaluation_retry_diagnostic_after_insert",
+                    "evaluation_retry_diagnostic_after_update",
+                ] {
+                    sqlx::query(&format!("DROP TRIGGER {trigger}"))
+                        .execute(&store.pool)
+                        .await
+                        .unwrap();
+                }
+                sqlx::query("DELETE FROM diagnostic_errors")
+                    .execute(&store.pool)
+                    .await
+                    .unwrap();
+                sqlx::raw_sql(include_str!(
+                    "../migrations/0013_evaluation_diagnostics.sql"
+                ))
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            }
+            let errors = store.list_diagnostic_errors(true, 20).await.unwrap();
+            assert_eq!(errors.len(), 2);
+            assert!(errors
+                .iter()
+                .all(|record| record.error.public_context.get("request_id") == Some(&source_id)));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_legacy_evidence_does_not_block_diagnostic_migration_or_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = plankton_core::PlanktonSettings {
+            database_url: format!("sqlite://{}", temp.path().join("diagnostics.db").display()),
+            ..Default::default()
+        };
+        let store = SqliteStore::new(&settings).await.unwrap();
+        let request = store
+            .submit_request(
+                &settings,
+                plankton_core::RequestContext::new(
+                    "secret/test".into(),
+                    "Review".into(),
+                    "tester".into(),
+                ),
+                plankton_core::PolicyMode::ManualOnly,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE access_requests SET llm_suggestion_json = 'invalid' WHERE id = ?")
+            .bind(&request.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let backfill = include_str!("../migrations/0013_evaluation_diagnostics.sql")
+            .split("CREATE TRIGGER")
+            .next()
+            .unwrap();
+        sqlx::raw_sql(backfill).execute(&store.pool).await.unwrap();
+        assert_eq!(
+            store
+                .recover_interrupted_review_details(Utc::now())
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(store
+            .list_diagnostic_errors(true, 20)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_failed_evaluations_are_backfilled_without_duplicate_diagnostics() {
+        let (_temp, store, id) = evaluation_fixture().await;
+        sqlx::query("DROP TRIGGER evaluation_diagnostic_after_update")
+            .execute(&store.pool)
+            .await
+            .expect("simulate old schema");
+        sqlx::query("UPDATE access_requests SET llm_suggestion_json = ? WHERE id = ?")
+            .bind(serde_json::json!({"error":"provider output validation failed: no JSON object or array found in input"}).to_string())
+            .bind(&id).execute(&store.pool).await.expect("legacy failure");
+        let backfill = include_str!("../migrations/0013_evaluation_diagnostics.sql")
+            .split("CREATE TRIGGER")
+            .next()
+            .expect("backfill");
+        for _ in 0..2 {
+            sqlx::raw_sql(backfill)
+                .execute(&store.pool)
+                .await
+                .expect("backfill");
+        }
+        let errors = store
+            .list_diagnostic_errors(true, 20)
+            .await
+            .expect("diagnostics");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].error.code, ErrorCode::BackendFailed);
+    }
+
+    #[tokio::test]
+    async fn interrupted_enrichment_keeps_the_approval_and_surfaces_a_warning() {
+        let (_temp, store, id) = evaluation_fixture().await;
+        sqlx::query("UPDATE access_requests SET llm_suggestion_json = ?, approval_status = 'approved', final_decision = 'allow', evaluation_state = 'completed' WHERE id = ?")
+            .bind(serde_json::json!({"provider_trace":{"review_progress":{"state":"running","completed_units":2,"total_units":6,"error":null}}}).to_string())
+            .bind(&id).execute(&store.pool).await.expect("running evidence");
+        assert_eq!(
+            store
+                .recover_interrupted_review_details(Utc::now())
+                .await
+                .expect("recover"),
+            1
+        );
+        assert_eq!(
+            store
+                .recover_interrupted_review_details(Utc::now())
+                .await
+                .expect("idempotent recovery"),
+            0
+        );
+        let row: (String, String, String) = sqlx::query_as("SELECT approval_status, final_decision, json_extract(llm_suggestion_json, '$.provider_trace.review_progress.state') FROM access_requests WHERE id = ?")
+            .bind(&id).fetch_one(&store.pool).await.expect("state");
+        assert_eq!(row, ("approved".into(), "allow".into(), "partial".into()));
+        let errors = store
+            .list_diagnostic_errors(true, 20)
+            .await
+            .expect("diagnostics");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].error.severity, ErrorSeverity::Warning);
+        assert_eq!(
+            errors[0]
+                .error
+                .public_context
+                .get("phase")
+                .map(String::as_str),
+            Some("review_details")
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_retry_and_failed_details_have_independent_acknowledgements() {
+        let (_temp, store, id) = evaluation_fixture().await;
+        sqlx::query("UPDATE access_requests SET llm_suggestion_json = ? WHERE id = ?")
+            .bind(serde_json::json!({"error":null,"provider_trace":{"decision_attempt_errors":["first decision timed out"],"review_progress":{"state":"failed","error":"invalid detail response"}}}).to_string())
+            .bind(&id).execute(&store.pool).await.expect("retry then detail failure");
+        let errors = store
+            .list_diagnostic_errors(true, 20)
+            .await
+            .expect("diagnostics");
+        assert_eq!(errors.len(), 2);
+        assert_ne!(
+            errors[0].error.correlation_id,
+            errors[1].error.correlation_id
+        );
+        store
+            .acknowledge_diagnostic_error(errors[0].error.correlation_id, Utc::now())
+            .await
+            .expect("acknowledge one");
+        assert_eq!(
+            store
+                .list_diagnostic_errors(false, 20)
+                .await
+                .expect("remaining")
+                .len(),
+            1
+        );
     }
 }
