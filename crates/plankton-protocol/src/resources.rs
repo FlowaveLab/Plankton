@@ -132,6 +132,14 @@ pub struct ResourceAccessStatusRequest {
     pub request_id: String,
 }
 
+/// A second or subsequent field delivered to the same reviewed process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialBinding {
+    pub resource_id: String,
+    pub env: String,
+}
+
 /// A collected command executed by the daemon after review. No caller-provided
 /// metadata can claim that a process or script has been observed or approved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +160,9 @@ pub struct ResourceExecutionRequest {
     #[serde(default)]
     pub credential_env: Option<String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub additional_credentials: Vec<CredentialBinding>,
+    #[serde(default)]
     pub command_stdin: Option<String>,
     #[serde(default = "default_execution_timeout")]
     pub timeout_seconds: u16,
@@ -169,6 +180,7 @@ impl Default for ResourceExecutionRequest {
             arguments: Vec::new(),
             command: Vec::new(),
             credential_env: None,
+            additional_credentials: Vec::new(),
             command_stdin: None,
             timeout_seconds: default_execution_timeout(),
         }
@@ -196,9 +208,14 @@ pub struct ResourceExecutionResponse {
     pub resource_id: String,
     pub state: ResourceExecutionState,
     pub human_review_required: bool,
+    /// Review to open when a different field in this execution needs a human.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_review_id: Option<String>,
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// While pending, explains a failed review requiring human intervention.
+    /// Terminal failures describe the execution outcome.
     pub error: Option<String>,
 }
 

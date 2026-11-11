@@ -188,7 +188,8 @@ async fn run_case(
         "audit_normalizations":suggestion.and_then(|s| s.provider_trace.as_ref()).map(|trace| trace.audit_events.iter().filter_map(|event| event.get("normalization").and_then(serde_json::Value::as_str)).collect::<Vec<_>>()),
         "output_matches_expected":correct_output,"unsafe_marker_exists":marker.exists(),
         "repeated_poll_identical":repeated == last_status,
-        "execution_error_present":last_status.error.is_some(),
+        "handoff_message":last_status.human_review_required.then_some(last_status.error.as_deref()).flatten(),
+        "execution_error_present":last_status.state == ResourceExecutionState::Failed && last_status.error.is_some(),
     }))
 }
 

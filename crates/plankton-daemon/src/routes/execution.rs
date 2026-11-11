@@ -104,7 +104,15 @@ impl ExecutionRegistry {
     }
 }
 
+#[derive(Clone)]
+struct FieldReview {
+    id: String,
+    resource: String,
+    env: Option<String>,
+}
+
 struct Entry {
+    reviews: Vec<FieldReview>,
     plan: Option<ExecutionPlan>,
     response: ResourceExecutionResponse,
     created_at: Instant,
@@ -120,8 +128,8 @@ async fn expire_plans(state: &ServerState) {
             ) || entry.created_at.elapsed() < PLAN_TTL
         });
         entries
-            .iter_mut()
-            .filter_map(|(id, entry)| {
+            .values_mut()
+            .filter_map(|entry| {
                 if entry.response.state != ResourceExecutionState::Pending
                     || entry.created_at.elapsed() < PLAN_TTL
                 {
@@ -130,24 +138,30 @@ async fn expire_plans(state: &ServerState) {
                 entry.plan = None;
                 entry.response.state = ResourceExecutionState::Failed;
                 entry.response.human_review_required = false;
+                entry.response.pending_review_id = None;
                 entry.response.error = Some("execution approval expired before execution".into());
                 entry.created_at = Instant::now();
-                Some(id.clone())
+                Some(entry.reviews.clone())
             })
             .collect::<Vec<_>>()
     };
-    for id in expired {
-        if let Ok(settings) = state.settings.current() {
-            // A concurrent approval may already have resolved the request. In either
-            // case the expired in-memory plan is gone and cannot execute.
+    for reviews in expired {
+        discard_pending_reviews(state, &reviews, "Execution plan expired before execution").await;
+    }
+}
+
+async fn discard_pending_reviews(state: &ServerState, reviews: &[FieldReview], reason: &str) {
+    if let Ok(settings) = state.settings.current() {
+        for review in reviews {
+            // A resolved field retains its original audit decision.
             let _ = state
                 .store
                 .record_decision(
                     &settings,
-                    &id,
+                    &review.id,
                     Decision::Deny,
-                    "execution-expiry",
-                    Some("Execution plan expired before execution".into()),
+                    "execution-discard",
+                    Some(reason.into()),
                 )
                 .await;
         }
@@ -267,52 +281,92 @@ pub async fn execute_resource(
         }
     }
     let plan_id = Uuid::new_v4().to_string();
-    let access = ResourceAccessRequest {
-        resource_id: payload.resource_id.clone(),
-        reason: payload.reason,
-        requested_by: payload.requested_by,
-        script_path: plan.source_path().map(str::to_string),
-        call_chain: Vec::new(),
-        call_chain_details: Vec::new(),
-        metadata: plan.evidence(&plan_id),
-    };
-    let Json(submission) = admitted_access_resource(
-        State(state.clone()),
-        Json(RequestEnvelope {
-            protocol_version: plankton_protocol::PROTOCOL_VERSION,
-            correlation_id,
-            payload: access,
-        }),
-        plan.call_chain_nodes(),
-    )
-    .await;
-    let submitted = match submission {
-        ResponseEnvelope::Success { data, .. } => data,
-        ResponseEnvelope::Failure {
-            protocol_version,
-            correlation_id,
-            error,
-        } => {
-            return Json(ResponseEnvelope::Failure {
+    let bindings = std::iter::once((payload.resource_id.clone(), payload.credential_env))
+        .chain(
+            payload
+                .additional_credentials
+                .into_iter()
+                .map(|field| (field.resource_id, Some(field.env))),
+        )
+        .collect::<Vec<_>>();
+    let mut evidence = plan.evidence(&plan_id);
+    if bindings.len() > 1 {
+        evidence.insert(
+            "execution_credential_bindings".into(),
+            serde_json::to_string(&bindings).expect("bindings serialize"),
+        );
+    }
+    let mut reviews = Vec::new();
+    let mut pending_review_id = None;
+    for (resource, env) in bindings {
+        if let Some(name) = &env {
+            evidence.insert("execution_credential_env".into(), name.clone());
+        }
+        let access = ResourceAccessRequest {
+            resource_id: resource.clone(),
+            reason: payload.reason.clone(),
+            requested_by: payload.requested_by.clone(),
+            script_path: plan.source_path().map(str::to_string),
+            call_chain: Vec::new(),
+            call_chain_details: Vec::new(),
+            metadata: evidence.clone(),
+        };
+        let Json(submission) = admitted_access_resource(
+            State(state.clone()),
+            Json(RequestEnvelope {
+                protocol_version: plankton_protocol::PROTOCOL_VERSION,
+                correlation_id,
+                payload: access,
+            }),
+            plan.call_chain_nodes(),
+        )
+        .await;
+        match submission {
+            ResponseEnvelope::Success { data, .. } => {
+                if data.human_review_required && pending_review_id.is_none() {
+                    pending_review_id = Some(data.request_id.clone());
+                }
+                reviews.push(FieldReview {
+                    id: data.request_id,
+                    resource,
+                    env,
+                });
+            }
+            ResponseEnvelope::Failure {
                 protocol_version,
                 correlation_id,
                 error,
-            })
+            } => {
+                discard_pending_reviews(
+                    &state,
+                    &reviews,
+                    "Another credential could not be admitted",
+                )
+                .await;
+                return Json(ResponseEnvelope::Failure {
+                    protocol_version,
+                    correlation_id,
+                    error,
+                });
+            }
         }
-    };
+    }
+    let request_id = reviews[0].id.clone();
     let response = ResourceExecutionResponse {
-        request_id: submitted.request_id.clone(),
+        request_id: request_id.clone(),
         resource_id: payload.resource_id,
         state: ResourceExecutionState::Pending,
-        human_review_required: submitted.human_review_required,
+        human_review_required: pending_review_id.is_some(),
+        pending_review_id: pending_review_id.filter(|id| id != &request_id),
         exit_code: None,
         stdout: String::new(),
         stderr: String::new(),
         error: None,
     };
     entries.insert(
-        submitted.request_id,
+        request_id,
         Entry {
+            reviews,
             plan: Some(plan),
             response: response.clone(),
             created_at: Instant::now(),
@@ -347,53 +401,81 @@ pub async fn execution_status(
     if entry.response.state != ResourceExecutionState::Pending {
         return Json(success(correlation_id, entry.response.clone()));
     }
-    let review = match state.store.get_request(&id).await {
-        Ok(review) => review.request,
-        Err(_) => {
-            return Json(failure(
-                correlation_id,
-                ErrorCode::StorageFailed,
-                "execution review is unavailable".into(),
-                false,
-            ))
-        }
-    };
-    entry.response.human_review_required = review.human_review_required();
-    match review.approval_status {
-        ApprovalStatus::Pending => {}
-        ApprovalStatus::Rejected => {
-            entry.plan = None;
-            entry.response.state = ResourceExecutionState::Denied;
-            entry.response.error = Some("credential execution was denied".into());
-            entry.created_at = Instant::now();
-        }
-        ApprovalStatus::Approved if running < MAX_RUNNING => {
-            let Some(plan) = entry.plan.take() else {
+    let mut pending = false;
+    entry.response.error = None;
+    entry.response.human_review_required = false;
+    entry.response.pending_review_id = None;
+    for field in &entry.reviews {
+        let review = match state.store.get_request(&field.id).await {
+            Ok(review) => review.request,
+            Err(_) => {
                 return Json(failure(
                     correlation_id,
-                    ErrorCode::Conflict,
-                    "execution plan has already been consumed".into(),
+                    ErrorCode::StorageFailed,
+                    "execution review is unavailable".into(),
                     false,
-                ));
-            };
-            entry.response.state = ResourceExecutionState::Running;
-            entry.response.human_review_required = false;
-            let resource = entry.response.resource_id.clone();
-            let execution_id = id.clone();
-            let execution_state = state.clone();
-            if !state.executions.spawn(async move {
-                complete_execution(execution_state, execution_id, resource, plan).await;
-            }) {
-                entry.response.state = ResourceExecutionState::Failed;
-                entry.response.error = Some("daemon stopped before execution started".into());
+                ))
+            }
+        };
+        match review.approval_status {
+            ApprovalStatus::Rejected => {
+                entry.plan = None;
+                entry.response.state = ResourceExecutionState::Denied;
+                entry.response.error = Some("credential execution was denied".into());
+                entry.response.human_review_required = false;
+                entry.response.pending_review_id = None;
+                entry.created_at = Instant::now();
+                discard_pending_reviews(
+                    &state,
+                    &entry.reviews,
+                    "Another credential in this execution was denied",
+                )
+                .await;
+                return Json(success(correlation_id, entry.response.clone()));
+            }
+            ApprovalStatus::Approved => {}
+            ApprovalStatus::Pending => {
+                pending = true;
+                if review.human_review_required() && !entry.response.human_review_required {
+                    entry.response.human_review_required = true;
+                    if let Some(message) = review.review_failure_message("en") {
+                        entry.response.error = Some(format!("{}: {message}", field.resource));
+                    }
+                    entry.response.pending_review_id = (field.id != id).then(|| field.id.clone());
+                }
             }
         }
-        ApprovalStatus::Approved => {}
+    }
+    if !pending && running < MAX_RUNNING {
+        let Some(plan) = entry.plan.take() else {
+            return Json(failure(
+                correlation_id,
+                ErrorCode::Conflict,
+                "execution plan has already been consumed".into(),
+                false,
+            ));
+        };
+        entry.response.state = ResourceExecutionState::Running;
+        entry.response.human_review_required = false;
+        let reviews = entry.reviews.clone();
+        let execution_id = id.clone();
+        let execution_state = state.clone();
+        if !state.executions.spawn(async move {
+            complete_execution(execution_state, execution_id, reviews, plan).await;
+        }) {
+            entry.response.state = ResourceExecutionState::Failed;
+            entry.response.error = Some("daemon stopped before execution started".into());
+        }
     }
     Json(success(correlation_id, entry.response.clone()))
 }
 
-async fn complete_execution(state: ServerState, id: String, resource: String, plan: ExecutionPlan) {
+async fn complete_execution(
+    state: ServerState,
+    id: String,
+    reviews: Vec<FieldReview>,
+    plan: ExecutionPlan,
+) {
     let operation_id = format!("execution:{id}");
     let now = Utc::now();
     let operation = InterruptedOperation {
@@ -412,29 +494,38 @@ async fn complete_execution(state: ServerState, id: String, resource: String, pl
             .start_operation(&operation)
             .await
             .map_err(|_| "could not record execution start".to_string())?;
-        if !resource_backend_enabled(&state.store, &resource)
-            .await
-            .map_err(|_| "credential backend availability check failed")?
-        {
-            return Err("credential backend is disabled".into());
-        }
-        let allow_secret_output = output_surfaces_allow_secret(&state, &id, &resource).await?;
         let check = plan.clone();
         tokio::task::spawn_blocking(move || check.verify_unchanged())
             .await
             .map_err(|_| "could not verify reviewed files")??;
-        let value =
-            tokio::task::spawn_blocking(move || default_value_resolver()?.resolve(&resource))
+        let mut credentials = Vec::with_capacity(reviews.len());
+        for field in &reviews {
+            if !resource_backend_enabled(&state.store, &field.resource)
                 .await
-                .map_err(|_| "credential resolution failed")?
-                .map_err(|_| "credential resolution failed")?;
+                .map_err(|_| "credential backend availability check failed")?
+            {
+                return Err("credential backend is disabled".into());
+            }
+            let resource = field.resource.clone();
+            let allow_output = output_surfaces_allow_secret(&state, &field.id, &resource).await?;
+            let value =
+                tokio::task::spawn_blocking(move || default_value_resolver()?.resolve(&resource))
+                    .await
+                    .map_err(|_| "credential resolution failed")?
+                    .map_err(|_| "credential resolution failed")?;
+            credentials.push(ResolvedCredential {
+                env: field.env.clone(),
+                value,
+                allow_output,
+            });
+        }
         // Resolving an external backend can take time. Recheck immediately before
         // launch as well; this does not isolate mutable imports or same-user races.
         let check = plan.clone();
         tokio::task::spawn_blocking(move || check.verify_unchanged())
             .await
             .map_err(|_| "could not verify reviewed files")??;
-        run_consumer(&plan, value, allow_secret_output).await
+        run_consumer(&plan, &credentials).await
     }
     .await;
     let (exit_code, stdout, stderr, error) = match outcome {
@@ -442,8 +533,10 @@ async fn complete_execution(state: ServerState, id: String, resource: String, pl
             output.exit_code,
             output.stdout,
             output.stderr,
-            output.error.or_else(|| {
-                (output.exit_code != Some(0)).then(|| "consumer exited unsuccessfully".to_string())
+            output.error.or_else(|| match output.exit_code {
+                Some(0) => None,
+                Some(code) => Some(format!("consumer exited with status {code}")),
+                None => Some("consumer terminated without an exit code".into()),
             }),
         ),
         Err(error) => (None, String::new(), String::new(), Some(error)),
@@ -573,10 +666,15 @@ impl Drop for ProcessGroup {
     }
 }
 
+struct ResolvedCredential {
+    env: Option<String>,
+    value: String,
+    allow_output: bool,
+}
+
 async fn run_consumer(
     plan: &ExecutionPlan,
-    value: String,
-    allow_secret_output: bool,
+    credentials: &[ResolvedCredential],
 ) -> Result<ConsumerOutput, String> {
     let mut command = tokio::process::Command::new(&plan.interpreter_path);
     command
@@ -588,8 +686,10 @@ async fn run_consumer(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if let Some(name) = &plan.credential_env {
-        command.env(name, &value);
+    for credential in credentials {
+        if let Some(name) = &credential.env {
+            command.env(name, &credential.value);
+        }
     }
     #[cfg(unix)]
     command.process_group(0);
@@ -610,7 +710,7 @@ async fn run_consumer(
     let input = if plan.credential_env.is_some() {
         plan.command_stdin.as_deref().unwrap_or_default()
     } else {
-        &value
+        &credentials[0].value
     };
     let run = async {
         tokio::try_join!(
@@ -640,14 +740,14 @@ async fn run_consumer(
         tokio::time::timeout(Duration::from_secs(u64::from(plan.timeout_seconds)), run).await;
     match result {
         Ok(Ok(((), stdout, stderr, status))) => {
-            let contains_value = |bytes: &[u8]| {
-                !value.is_empty()
-                    && bytes
-                        .windows(value.len())
-                        .any(|window| window == value.as_bytes())
-            };
-            let withheld =
-                !allow_secret_output && (contains_value(&stdout) || contains_value(&stderr));
+            let withheld = credentials.iter().any(|credential| {
+                let value = credential.value.as_bytes();
+                !credential.allow_output
+                    && !value.is_empty()
+                    && [&stdout, &stderr]
+                        .iter()
+                        .any(|bytes| bytes.windows(value.len()).any(|window| window == value))
+            });
             Ok(ConsumerOutput {
                 exit_code: status.code(),
                 stdout: if withheld { String::new() } else { String::from_utf8_lossy(&stdout).into_owned() },

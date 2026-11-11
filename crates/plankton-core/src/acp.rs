@@ -1,3 +1,4 @@
+mod pi_diagnostics;
 mod session_options;
 use session_options::{configure_session, AcpConfigOption};
 use std::{
@@ -1406,6 +1407,12 @@ async fn acp_supervisor_staged_request(
                 error => error,
             };
             if let Err(cleanup) = cleanup {
+                // Only a retry needs positive proof of closure. Preserve the
+                // original diagnostic for a terminal provider/validation error.
+                if !crate::provider::staged_decision_error_is_retryable(&error) {
+                    tracing::debug!(%cleanup, "ACP review session cleanup unconfirmed");
+                    return Err(error);
+                }
                 return Err(match error {
                     ProviderError::DecisionFailed { message, trace } => {
                         ProviderError::DecisionFailed {
@@ -1537,7 +1544,7 @@ async fn run_acp_supervisor(
         return;
     };
     let stderr_task = tokio::spawn(capture_acp_stderr(stderr));
-    let handler = AcpMultiplexHandler::default();
+    let mut handler = AcpMultiplexHandler::default();
     let (conn, handle_io) = acp::ClientSideConnection::new(
         handler.clone(),
         stdin.compat_write(),
@@ -1577,6 +1584,11 @@ async fn run_acp_supervisor(
         finish_acp_supervisor_child(&mut child, stderr_task).await;
         return;
     };
+    handler.supports_close = initialize_response
+        .agent_capabilities
+        .session_capabilities
+        .close
+        .is_some();
     let initialize_json = serde_json::to_value(&initialize_response).unwrap_or_default();
     let agent_name = read_json_string(&initialize_json, &["/agentInfo/name", "/agent_info/name"]);
     let agent_version = read_json_string(
@@ -2531,6 +2543,21 @@ async fn run_acp_decision_with_repair(
                     "non-text decision content".into(),
                 ));
             }
+            if state.content.trim().is_empty() {
+                if trace.agent_name.as_deref() == Some("pi-acp") {
+                    if let Some(message) = BaseDirs::new().and_then(|dirs| {
+                        pi_diagnostics::model_error(
+                            dirs.home_dir(),
+                            &config.cwd,
+                            &session_id.to_string(),
+                            started_at,
+                        )
+                    }) {
+                        return Err(ProviderError::Transport(message.into()));
+                    }
+                }
+                return Err(ProviderError::EmptyResponse);
+            }
             crate::provider::validate_decision_text(&state.content)
         });
         trace.stop_reason = match &validation {
@@ -2773,20 +2800,26 @@ async fn complete_staged_cleanup(
     result: Result<AcpPromptResult, ProviderError>,
 ) {
     let local_cleanup = multiplex.unregister(&session_id.to_string());
-    let remote_cleanup = timeout(
-        ACP_SESSION_CLOSE_TIMEOUT,
-        conn.close_session(acp::CloseSessionRequest::new(session_id.clone())),
-    )
-    .await;
-    let cleanup = local_cleanup.and_then(|()| match remote_cleanup {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(ProviderError::Transport(format!(
-            "ACP decision cleanup could not confirm session closure: {error}; automatic retry stopped",
-        ))),
-        Err(_) => Err(ProviderError::Transport(
-            "ACP decision cleanup could not confirm session closure before its deadline; automatic retry stopped".to_string(),
-        )),
-    });
+    let cleanup = if multiplex.supports_close {
+        let remote_cleanup = timeout(
+            ACP_SESSION_CLOSE_TIMEOUT,
+            conn.close_session(acp::CloseSessionRequest::new(session_id.clone())),
+        )
+        .await;
+        local_cleanup.and_then(|()| match remote_cleanup {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(ProviderError::Transport(format!(
+                "ACP decision cleanup could not confirm session closure: {error}; automatic retry stopped",
+            ))),
+            Err(_) => Err(ProviderError::Transport(
+                "ACP decision cleanup could not confirm session closure before its deadline; automatic retry stopped".into(),
+            )),
+        })
+    } else {
+        local_cleanup.and(Err(ProviderError::Transport(
+            "ACP decision cleanup cannot confirm session closure: the adapter does not advertise session/close; automatic retry stopped".into(),
+        )))
+    };
     let _ = completion.send(AcpStagedCompletion { result, cleanup });
 }
 
@@ -2796,6 +2829,9 @@ async fn close_acp_session(
     session_id: &acp::SessionId,
 ) {
     let _ = multiplex.unregister(&session_id.to_string());
+    if !multiplex.supports_close {
+        return;
+    }
     let _ = timeout(
         ACP_SESSION_CLOSE_TIMEOUT,
         conn.close_session(acp::CloseSessionRequest::new(session_id.clone())),
@@ -2831,6 +2867,7 @@ fn acp_prompt_result_from_state(
 
 #[derive(Debug, Clone, Default)]
 struct AcpMultiplexHandler {
+    supports_close: bool,
     sessions: Arc<Mutex<HashMap<String, AcpClientHandler>>>,
 }
 
@@ -3796,7 +3833,28 @@ async fn run_acp_probe_requests(
         ));
         return result;
     }
-    let readiness_output = state.content.trim();
+    // pi-acp echoes the startupInfo declared by session/new as its own message
+    // chunk. Only discard that exact chunk; the model must still answer READY.
+    let startup_info = session_response
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("piAcp"))
+        .and_then(|pi| pi.get("startupInfo"))
+        .and_then(serde_json::Value::as_str);
+    let first_chunk = state.processed_client_messages.iter().find_map(|message| {
+        let AcpObservedClientMessage::SessionNotification(event) = message else {
+            return None;
+        };
+        (event.get("sessionId")?.as_str()? == session_response.session_id.to_string()
+            && event.pointer("/update/sessionUpdate")?.as_str()? == "agent_message_chunk")
+            .then(|| event.pointer("/update/content/text")?.as_str())
+            .flatten()
+    });
+    let readiness_output = startup_info
+        .filter(|notice| Some(*notice) == first_chunk)
+        .and_then(|notice| state.content.strip_prefix(notice))
+        .unwrap_or(&state.content)
+        .trim();
     if state.non_text_content_seen || readiness_output != "READY" {
         result.readiness = AcpProbeCheck::failed(AcpProbeError::protocol_behavior(
             "ACP readiness prompt did not return the complete READY output",
@@ -4030,7 +4088,11 @@ async fn run_acp_prompt_turn(
     )
     .await
     {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(response)) if response.stop_reason == acp::StopReason::EndTurn => Ok(()),
+        Ok(Ok(response)) => Err(ProviderError::Transport(format!(
+            "ACP {stage} prompt stopped with {}",
+            acp_stop_reason_name(response.stop_reason)
+        ))),
         Ok(Err(error)) => Err(ProviderError::Transport(format!(
             "ACP {stage} prompt failed: {error}"
         ))),
@@ -4283,6 +4345,7 @@ mod tests {
         response_sequence: Vec<String>,
         request_permission: bool,
         readiness_output: String,
+        startup_info: Option<String>,
         stop_reason: acp::StopReason,
     }
 
@@ -4302,6 +4365,7 @@ mod tests {
                 response_sequence: Vec::new(),
                 request_permission: false,
                 readiness_output: "READY".to_string(),
+                startup_info: None,
                 stop_reason: acp::StopReason::EndTurn,
             }
         }
@@ -4406,7 +4470,24 @@ mod tests {
             self.live_sessions
                 .borrow_mut()
                 .insert(session_id.to_string());
-            Ok(serde_json::from_value(serde_json::json!({"sessionId":session_id.to_string(),"configOptions":mock_session_options()})).unwrap())
+            let mut response = serde_json::json!({"sessionId":session_id.to_string(),"configOptions":mock_session_options()});
+            if let Some(notice) = &self.behavior.startup_info {
+                response["_meta"] = serde_json::json!({"piAcp":{"startupInfo":notice}});
+                let (tx, rx) = oneshot::channel();
+                self.client_action_tx
+                    .send(MockClientAction::SessionNotification {
+                        notification: acp::SessionNotification::new(
+                            session_id.to_string(),
+                            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                                notice.clone().into(),
+                            )),
+                        ),
+                        acknowledged: tx,
+                    })
+                    .map_err(|_| acp::Error::internal_error())?;
+                rx.await.map_err(|_| acp::Error::internal_error())?;
+            }
+            Ok(serde_json::from_value(response).unwrap())
         }
 
         async fn load_session(
@@ -6148,6 +6229,31 @@ for line in sys.stdin:
                     .and_then(|error| error.data.as_ref())
                     .and_then(|data| data.pointer("/stopReason")),
                 Some(&serde_json::json!(expected))
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acp_probe_separates_pi_startup_notice_from_the_model_reply() {
+        for (reply, expected) in [
+            ("READY", AcpProbeStatus::Passed),
+            ("", AcpProbeStatus::Failed),
+            ("unexpected\nREADY", AcpProbeStatus::Failed),
+            ("READY\nextra", AcpProbeStatus::Failed),
+        ] {
+            let (result, _, _) = run_mock_probe(
+                Duration::from_secs(2),
+                MockProbeBehavior {
+                    startup_info: Some("Pi update available\n".into()),
+                    readiness_output: reply.into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(
+                result.unwrap().readiness.status,
+                expected,
+                "reply: {reply:?}"
             );
         }
     }

@@ -5,7 +5,10 @@ use plankton_core::{Decision, PlanktonSettings, PolicyMode};
 use plankton_daemon::{start_with_settings, DaemonConfig, RunningDaemon};
 use plankton_protocol::{
     daemon::{RequestEnvelope, ResponseEnvelope},
-    resources::{ResourceExecutionRequest, ResourceExecutionResponse, ResourceExecutionState},
+    resources::{
+        CredentialBinding, ResourceExecutionRequest, ResourceExecutionResponse,
+        ResourceExecutionState,
+    },
 };
 use plankton_store::SqliteStore;
 
@@ -101,7 +104,7 @@ async fn daemon_admits_bound_consumers_and_never_releases_unbound_credentials() 
     .unwrap();
     plankton_core::upsert_local_secret_literal(plankton_core::LocalSecretLiteralUpsert {
         resource: "secret/direct".into(),
-        value: fixture.into(),
+        value: fixture.replacen("SYNTHETIC", "DIFFERENT", 1),
         display_name: None,
         description: None,
         tags: Vec::new(),
@@ -246,6 +249,69 @@ async fn daemon_admits_bound_consumers_and_never_releases_unbound_credentials() 
     .unwrap();
     assert!(raw.contains("Unbound credential retrieval is disabled"));
     assert!(!raw.contains(fixture));
+
+    // The direct ID and protected key share a consumer, but neither policy
+    // decides the other field. Start it only after all reviews allow.
+    let pair_marker = directory.path().join("pair-runs");
+    let mut pair = ResourceExecutionRequest {
+        resource_id: "secret/direct".into(),
+        credential_env: Some("CLS_ID".into()),
+        additional_credentials: vec![CredentialBinding { resource_id: "secret/test".into(), env: "CLS_KEY".into() }],
+        command: vec!["python3".into(), "-c".into(),
+            "import os, pathlib, sys; assert os.environ['CLS_ID'].startswith('DIFFERENT') and os.environ['CLS_KEY'].startswith('SYNTHETIC'); pathlib.Path(sys.argv[1]).open('a').write('x'); print('ok')".into(),
+            pair_marker.display().to_string()],
+        cwd: request.cwd.clone(),
+        reason: request.reason.clone(),
+        requested_by: request.requested_by.clone(),
+        ..Default::default()
+    };
+    for decision in [Decision::Deny, Decision::Allow] {
+        let submitted = submit(&daemon, &pair).await;
+        let pending = poll(&daemon, &submitted.request_id).await;
+        assert_eq!(pending.state, ResourceExecutionState::Pending);
+        assert!(!pair_marker.exists());
+        let key_review = pending.pending_review_id.unwrap();
+        let context = store
+            .get_request(&key_review)
+            .await
+            .unwrap()
+            .request
+            .context;
+        assert_eq!(context.metadata["execution_credential_env"], "CLS_KEY");
+        assert!(context.metadata["execution_credential_bindings"].contains("CLS_ID"));
+        store
+            .record_decision(&settings, &key_review, decision, "test-human", None)
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(
+            finish(&daemon, &submitted.request_id),
+            finish(&daemon, &submitted.request_id)
+        );
+        assert_eq!(a, b);
+        if decision == Decision::Deny {
+            assert_eq!(a.state, ResourceExecutionState::Denied);
+            assert!(!pair_marker.exists());
+        } else {
+            assert_eq!(a.state, ResourceExecutionState::Completed, "{a:?}");
+            assert_eq!(std::fs::read_to_string(&pair_marker).unwrap(), "x");
+        }
+    }
+    pair.command[2] =
+        "import os,sys; print('before'); sys.stderr.write(os.environ['CLS_KEY'])".into();
+    let submitted = submit(&daemon, &pair).await;
+    store
+        .record_decision(
+            &settings,
+            submitted.pending_review_id.as_deref().unwrap(),
+            Decision::Allow,
+            "test-human",
+            None,
+        )
+        .await
+        .unwrap();
+    let blocked = finish(&daemon, &submitted.request_id).await;
+    assert!(blocked.error.unwrap().contains("withheld"));
+    assert!(blocked.stdout.is_empty() && blocked.stderr.is_empty());
 
     let denied = submit(&daemon, &request).await;
     store
@@ -405,7 +471,7 @@ async fn daemon_admits_bound_consumers_and_never_releases_unbound_credentials() 
         ),
         (
             "import sys\nsys.stdin.read()\nsys.exit(7)\n",
-            "consumer exited unsuccessfully",
+            "consumer exited with status 7",
             Some(7),
         ),
         (

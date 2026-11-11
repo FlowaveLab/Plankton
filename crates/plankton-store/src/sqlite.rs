@@ -2551,13 +2551,21 @@ mod tests {
         let failed = store
             .finalize_evaluation(
                 &request.id,
-                suggestion_for(&running, Some("provider unavailable".into())),
+                suggestion_for(&running, Some("Pi model provider returned HTTP 402 (insufficient balance) private upstream details".into())),
             )
             .await
             .expect("failure should be durably finalized");
 
         assert_eq!(failed.evaluation_state, EvaluationState::Failed);
         assert_eq!(failed.approval_status, ApprovalStatus::Pending);
+        assert_eq!(
+            failed.review_failure_message("zh-CN"),
+            Some("审批模型账户余额不足（HTTP 402）。")
+        );
+        assert_eq!(
+            failed.review_failure_message("en"),
+            Some("The review model has insufficient balance (HTTP 402).")
+        );
         assert_eq!(
             evaluation_operation_status(&store, &request.id).await,
             "failed"

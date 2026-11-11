@@ -3931,7 +3931,7 @@ describe("DiagnosticsPage", () => {
     await act(async () => {});
     const acknowledge = Array.from(
       view.container.querySelectorAll("button"),
-    ).find((button) => button.textContent === "Acknowledge");
+    ).find((button) => button.textContent === "Mark as read");
     await act(async () => {
       acknowledge?.click();
     });
@@ -3978,7 +3978,7 @@ describe("DiagnosticsPage", () => {
     act(() => refresh?.click());
     const acknowledge = Array.from(
       view.container.querySelectorAll("button"),
-    ).find((button) => button.textContent === "Acknowledge");
+    ).find((button) => button.textContent === "Mark as read");
     act(() => acknowledge?.click());
 
     await act(async () => acknowledgement.resolve(true));
@@ -4021,7 +4021,7 @@ describe("DiagnosticsPage", () => {
     await act(async () => {});
     const acknowledge = Array.from(
       view.container.querySelectorAll("button"),
-    ).find((button) => button.textContent === "Acknowledge");
+    ).find((button) => button.textContent === "Mark as read");
     act(() => acknowledge?.click());
     const refresh = Array.from(view.container.querySelectorAll("button")).find(
       (button) => button.textContent === "Refresh",

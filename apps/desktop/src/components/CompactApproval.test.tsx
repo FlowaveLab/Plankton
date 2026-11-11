@@ -119,6 +119,31 @@ afterEach(() => {
 });
 
 describe("CompactApproval", () => {
+  it("shows the failure and manual action before the details, without a model score", async () => {
+    const api = createApi([
+      {
+        ...firstRequest,
+        locale: "zh-CN",
+        evaluation_state: "failed",
+        review_error: "审批模型账户余额不足（HTTP 402）。",
+        review_error_detail:
+          "Pi model provider returned HTTP 402 (insufficient balance)",
+      },
+    ]);
+    const view = render(<CompactApproval api={api} />);
+    await flush();
+    const alert = view.container.querySelector('[role="alert"]');
+    expect(alert?.querySelector("strong")?.textContent).toBe(
+      "自动审批未完成，等待人工决定",
+    );
+    expect(alert?.querySelector("span")?.textContent).toContain("HTTP 402");
+    expect(alert?.querySelector("code")?.textContent).toContain(
+      "insufficient balance",
+    );
+    expect(view.container.textContent).not.toContain("28 / 100");
+    view.unmount();
+  });
+
   it("shows the exact scope and quick approval beside decision buttons without expanding an editor", async () => {
     const api = createApi([
       {

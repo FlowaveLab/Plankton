@@ -329,6 +329,46 @@ pub struct AccessRequest {
 }
 
 impl AccessRequest {
+    /// A public handoff message. Provider output may include request data, so
+    /// the terminal gets a bounded explanation and the full trace stays local.
+    pub fn review_failure_message(&self, locale: &str) -> Option<&'static str> {
+        let (en, zh) = match self.evaluation_state {
+            EvaluationState::Interrupted => {
+                ("Automatic review was interrupted.", "自动审批已中断。")
+            }
+            EvaluationState::Failed => {
+                let error = self
+                    .llm_suggestion
+                    .as_ref()
+                    .and_then(|s| s.error.as_deref())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if error.contains("http 402 (insufficient balance)") {
+                    (
+                        "The review model has insufficient balance (HTTP 402).",
+                        "审批模型账户余额不足（HTTP 402）。",
+                    )
+                } else if error.contains("output validation failed")
+                    || error.contains("did not include any message content")
+                {
+                    (
+                        "The review provider did not return a valid decision.",
+                        "审批服务未返回有效的审批结果。",
+                    )
+                } else if error.contains("timed out") || error.contains("deadline") {
+                    ("The automatic review timed out.", "自动审批超时。")
+                } else {
+                    (
+                        "Automatic review failed. See the error in the request details.",
+                        "自动审批失败，请在请求详情中查看错误原因。",
+                    )
+                }
+            }
+            _ => return None,
+        };
+        Some(if locale == "zh-CN" { zh } else { en })
+    }
+
     pub fn human_review_required(&self) -> bool {
         self.approval_status == ApprovalStatus::Pending
             && match self.policy_mode {

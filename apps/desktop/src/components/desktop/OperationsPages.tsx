@@ -6207,8 +6207,8 @@ function DiagnosticsPage({
         }
         description={
           zh
-            ? "检查本地代理的健康状态与可见错误。"
-            : "Inspect local-agent health and visible errors."
+            ? "查看服务当前状态与历史错误。标记已阅只更新诊断记录的查阅状态。"
+            : "View current service health and historical errors. Marking a diagnostic as read updates its read status only."
         }
         eyebrow="SYSTEM OBSERVABILITY"
         title={zh ? "诊断" : "Diagnostics"}
@@ -6322,8 +6322,10 @@ function DiagnosticsPage({
             </h2>
           </div>
           <strong
-            className={
-              diagnosticTotal === 0 ? "status-approved" : "status-rejected"
+            title={
+              zh
+                ? "当前筛选下的历史记录数"
+                : "Historical records matching these filters"
             }
           >
             {diagnosticTotal}
@@ -6359,7 +6361,7 @@ function DiagnosticsPage({
           <ChoiceGroup
             label={
               <>
-                <span>{zh ? "确认状态" : "Acknowledgement"}</span>
+                <span>{zh ? "查阅状态" : "Read status"}</span>
               </>
             }
             aria-label="Acknowledgement status"
@@ -6372,11 +6374,11 @@ function DiagnosticsPage({
               { value: "all", label: <>{zh ? "全部" : "All"}</> },
               {
                 value: "unacknowledged",
-                label: <>{zh ? "未确认" : "Unacknowledged"}</>,
+                label: <>{zh ? "未标记已阅" : "Not marked as read"}</>,
               },
               {
                 value: "acknowledged",
-                label: <>{zh ? "已确认" : "Acknowledged"}</>,
+                label: <>{zh ? "已阅" : "Marked as read"}</>,
               },
             ]}
           />
@@ -6464,10 +6466,10 @@ function DiagnosticsPage({
                       <dt>{zh ? "状态" : "Status"}</dt>
                       <dd>
                         {diagnostic.acknowledged_at
-                          ? `${zh ? "已确认" : "Acknowledged"} · ${diagnostic.acknowledged_at}`
+                          ? `${zh ? "已阅" : "Marked as read"} · ${diagnostic.acknowledged_at}`
                           : zh
-                            ? "未确认"
-                            : "Unacknowledged"}
+                            ? "未标记已阅"
+                            : "Not marked as read"}
                       </dd>
                     </div>
                   </dl>
@@ -6506,11 +6508,11 @@ function DiagnosticsPage({
                     >
                       {acknowledgingId === diagnostic.error.correlation_id
                         ? zh
-                          ? "确认中…"
-                          : "Acknowledging…"
+                          ? "正在标记…"
+                          : "Marking…"
                         : zh
-                          ? "确认"
-                          : "Acknowledge"}
+                          ? "标记已阅"
+                          : "Mark as read"}
                     </button>
                   ) : null}
                 </article>

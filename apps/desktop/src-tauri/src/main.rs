@@ -2745,12 +2745,7 @@ async fn compact_approval_requests(
         }
     }
     let locale = lock_settings(&state)?.locale.clone();
-    let mut compact =
-        approval_window::compact_requests(&app, &requests).map_err(|error| error.to_string())?;
-    for request in &mut compact {
-        request.locale = locale.clone();
-    }
-    Ok(compact)
+    approval_window::compact_requests(&app, &requests, &locale).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -6870,17 +6865,17 @@ async fn determine_tray_activity(
     if client.is_none() {
         *client = DaemonClient::connect_default().await.ok();
     }
-    let connected = match client.as_ref() {
-        Some(client) => client.health().await.is_ok(),
-        None => false,
+    let health = match client.as_ref() {
+        Some(client) => client.health().await.ok(),
+        None => None,
     };
-    if !connected {
+    let Some(health) = health else {
         *client = None;
         return Ok(tray::select_activity(tray::TraySignals {
             disconnected: true,
             ..tray::TraySignals::default()
         }));
-    }
+    };
     let active = store
         .list_active_operations(Some("llm_evaluation"))
         .await
@@ -6893,22 +6888,10 @@ async fn determine_tray_activity(
         .await
         .map_err(|error| format!("failed to inspect pending approvals: {error}"))?;
     let attention = !human_review_ids.is_empty();
-    if attention {
-        return Ok(tray::select_activity(tray::TraySignals {
-            disconnected: false,
-            attention,
-            degraded: false,
-            reasoning,
-        }));
-    }
-    let diagnostics = store
-        .list_diagnostic_errors(false, 1)
-        .await
-        .map_err(|error| format!("failed to inspect diagnostics: {error}"))?;
     Ok(tray::select_activity(tray::TraySignals {
         disconnected: false,
         attention,
-        degraded: !diagnostics.is_empty(),
+        degraded: health.health == plankton_protocol::daemon::DaemonHealth::Degraded,
         reasoning,
     }))
 }

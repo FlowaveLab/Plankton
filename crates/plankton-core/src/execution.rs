@@ -265,9 +265,30 @@ impl ExecutionPlan {
         if !cwd.is_dir() {
             return Err("cwd must be a directory".into());
         }
-        if let Some(name) = &request.credential_env {
-            if !valid_env_name(name) || runtime_env(name) {
+        if request.additional_credentials.len() > 15 {
+            return Err("at most 16 credentials may be bound to one execution".into());
+        }
+        if !request.additional_credentials.is_empty() && request.credential_env.is_none() {
+            return Err("multiple credentials require named environment bindings".into());
+        }
+        let mut resources = std::collections::BTreeSet::from([request.resource_id.as_str()]);
+        let mut names = std::collections::BTreeSet::new();
+        for field in &request.additional_credentials {
+            if field.resource_id.trim().is_empty() || !resources.insert(&field.resource_id) {
+                return Err("credential resources must be non-empty and distinct".into());
+            }
+        }
+        for name in request.credential_env.iter().chain(
+            request
+                .additional_credentials
+                .iter()
+                .map(|field| &field.env),
+        ) {
+            if !valid_env_name(name) || runtime_env(&name.to_ascii_uppercase()) {
                 return Err("credential environment variable must be a POSIX name and cannot control command lookup or runtime startup".into());
+            }
+            if !names.insert(name.to_ascii_uppercase()) {
+                return Err("credential environment variables must be distinct".into());
             }
         }
         if request.command_stdin.is_some() && request.credential_env.is_none() {
@@ -1015,6 +1036,36 @@ mod tests {
             original
         );
     }
+    #[test]
+    fn multi_field_bindings_require_safe_unique_destinations() {
+        use plankton_protocol::resources::CredentialBinding;
+        let cwd = tempfile::tempdir().unwrap();
+        let mut request = request(
+            cwd.path(),
+            vec!["python3".into(), "-c".into(), "pass".into()],
+        );
+        request.credential_env = Some("ID".into());
+        for (resource, env) in [
+            ("second", "id"),
+            ("second", "PATH"),
+            ("second", "BAD-NAME"),
+            ("secret/test", "KEY"),
+            ("", "KEY"),
+        ] {
+            request.additional_credentials = vec![CredentialBinding {
+                resource_id: resource.into(),
+                env: env.into(),
+            }];
+            assert!(
+                ExecutionPlan::prepare(&request).is_err(),
+                "{resource} {env}"
+            );
+        }
+        request.additional_credentials[0].resource_id = "second".into();
+        request.credential_env = None;
+        assert!(ExecutionPlan::prepare(&request).is_err());
+    }
+
     #[test]
     #[cfg(unix)]
     fn inline_stdin_env_and_disguised_program_admission() {

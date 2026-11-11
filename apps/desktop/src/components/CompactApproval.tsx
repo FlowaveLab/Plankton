@@ -50,6 +50,8 @@ export type CompactApprovalRequest = {
   reason: string;
   context: string;
   call_chain: CallChainEntry[];
+  review_error?: string | null;
+  review_error_detail?: string | null;
   suggestion: string;
   suggested_decision: string;
   risk_score: number | null;
@@ -613,6 +615,23 @@ export function CompactApproval(props: {
                     <strong>{zh ? "人工决定" : "Human decision"}</strong>
                   </div>
 
+                  {current.review_error ? (
+                    <section className="compact-approval__error" role="alert">
+                      <strong>
+                        {zh
+                          ? "自动审批未完成，等待人工决定"
+                          : "Automatic review failed. Your decision is needed."}
+                      </strong>
+                      <span>{current.review_error}</span>
+                      {current.review_error_detail && (
+                        <details>
+                          <summary>{zh ? "错误详情" : "Error details"}</summary>
+                          <code>{current.review_error_detail}</code>
+                        </details>
+                      )}
+                    </section>
+                  ) : null}
+
                   <section className="compact-approval__request">
                     <div className="compact-approval__queue">
                       <span>
@@ -653,115 +672,121 @@ export function CompactApproval(props: {
                     </details>
                   </section>
 
-                  <section className="compact-approval__suggestion">
-                    <div className="compact-approval__guidance-text">
-                      <div>
-                        <strong>
-                          <small>
-                            {zh ? "评估建议" : "Automatic guidance"}
-                          </small>
-                          {decisionLabel(current.suggested_decision, zh)}
-                        </strong>
-                        <span>
-                          {current.risk_score === null
-                            ? zh
-                              ? "暂无风险评分"
-                              : "Risk not scored"
-                            : `${zh ? "风险" : "Risk"} ${current.risk_score} / 100`}
-                        </span>
-                      </div>
-                      <ApprovalMarkdown>
-                        {zh &&
-                        current.suggestion ===
-                          "No automatic recommendation is available."
-                          ? "此请求由人工判断，暂无模型建议。"
-                          : current.suggestion}
-                      </ApprovalMarkdown>
-                      {current.exposure_report?.surfaces
-                        .filter(
-                          (surface) =>
-                            surface.evidence_state === "unknown" ||
-                            surface.actual_level >
-                              ((
-                                current.exposure_policy ??
-                                defaultExposurePolicy()
-                              ).surfaces.find(
-                                (limit) => limit.surface === surface.surface,
-                              )?.max_level ?? 0),
-                        )
-                        .map((surface) => (
-                          <div
-                            className="approval-exposure-attention"
-                            key={surface.surface}
-                          >
-                            <strong>
-                              {
-                                {
-                                  llm_context: zh ? "LLM 回显" : "LLM context",
-                                  network: zh ? "网络发送" : "Network",
-                                  local_persistence: zh
-                                    ? "本地持久化"
-                                    : "Local storage",
-                                  terminal_log: zh
-                                    ? "终端 / 日志"
-                                    : "Terminal / logs",
-                                  process_propagation: zh
-                                    ? "进程传递"
-                                    : "Process handoff",
-                                }[surface.surface]
-                              }{" "}
-                              ·{" "}
-                              {surface.evidence_state === "unknown"
-                                ? zh
-                                  ? "证据不足"
-                                  : "Insufficient evidence"
-                                : zh
-                                  ? "超出允许范围"
-                                  : "Over allowed limit"}
-                            </strong>
-                            <ApprovalMarkdown>
-                              {surface.summary}
-                            </ApprovalMarkdown>
-                          </div>
-                        ))}
-                    </div>
-                    {current.exposure_report ? (
-                      <ExposureRadar
-                        compact
-                        breachedSurfaces={current.exposure_report.surfaces
+                  {!current.review_error && (
+                    <section className="compact-approval__suggestion">
+                      <div className="compact-approval__guidance-text">
+                        <div>
+                          <strong>
+                            <small>
+                              {zh ? "评估建议" : "Automatic guidance"}
+                            </small>
+                            {decisionLabel(current.suggested_decision, zh)}
+                          </strong>
+                          <span>
+                            {current.risk_score === null
+                              ? zh
+                                ? "暂无风险评分"
+                                : "Risk not scored"
+                              : `${zh ? "风险" : "Risk"} ${current.risk_score} / 100`}
+                          </span>
+                        </div>
+                        <ApprovalMarkdown>
+                          {zh &&
+                          current.suggestion ===
+                            "No automatic recommendation is available."
+                            ? "此请求由人工判断，暂无模型建议。"
+                            : current.suggestion}
+                        </ApprovalMarkdown>
+                        {current.exposure_report?.surfaces
                           .filter(
                             (surface) =>
+                              surface.evidence_state === "unknown" ||
                               surface.actual_level >
-                              ((
-                                current.exposure_policy ??
-                                defaultExposurePolicy()
-                              ).surfaces.find(
-                                (entry) => entry.surface === surface.surface,
-                              )?.max_level ?? 0),
+                                ((
+                                  current.exposure_policy ??
+                                  defaultExposurePolicy()
+                                ).surfaces.find(
+                                  (limit) => limit.surface === surface.surface,
+                                )?.max_level ?? 0),
                           )
-                          .map((surface) => surface.surface as ExposureSurface)}
-                        primary={{
-                          ...defaultExposurePolicy(),
-                          surfaces: defaultExposurePolicy().surfaces.map(
-                            (entry) => ({
-                              ...entry,
-                              max_level:
-                                current.exposure_report?.surfaces.find(
-                                  (surface) =>
-                                    surface.surface === entry.surface,
-                                )?.actual_level ?? 2,
-                            }),
-                          ),
-                        }}
-                        locale={zh ? "zh-CN" : "en"}
-                        primaryLabel={zh ? "实际暴露" : "Observed"}
-                        secondary={
-                          current.exposure_policy ?? defaultExposurePolicy()
-                        }
-                        secondaryLabel={zh ? "允许上限" : "Allowed"}
-                      />
-                    ) : null}
-                  </section>
+                          .map((surface) => (
+                            <div
+                              className="approval-exposure-attention"
+                              key={surface.surface}
+                            >
+                              <strong>
+                                {
+                                  {
+                                    llm_context: zh
+                                      ? "LLM 回显"
+                                      : "LLM context",
+                                    network: zh ? "网络发送" : "Network",
+                                    local_persistence: zh
+                                      ? "本地持久化"
+                                      : "Local storage",
+                                    terminal_log: zh
+                                      ? "终端 / 日志"
+                                      : "Terminal / logs",
+                                    process_propagation: zh
+                                      ? "进程传递"
+                                      : "Process handoff",
+                                  }[surface.surface]
+                                }{" "}
+                                ·{" "}
+                                {surface.evidence_state === "unknown"
+                                  ? zh
+                                    ? "证据不足"
+                                    : "Insufficient evidence"
+                                  : zh
+                                    ? "超出允许范围"
+                                    : "Over allowed limit"}
+                              </strong>
+                              <ApprovalMarkdown>
+                                {surface.summary}
+                              </ApprovalMarkdown>
+                            </div>
+                          ))}
+                      </div>
+                      {current.exposure_report ? (
+                        <ExposureRadar
+                          compact
+                          breachedSurfaces={current.exposure_report.surfaces
+                            .filter(
+                              (surface) =>
+                                surface.actual_level >
+                                ((
+                                  current.exposure_policy ??
+                                  defaultExposurePolicy()
+                                ).surfaces.find(
+                                  (entry) => entry.surface === surface.surface,
+                                )?.max_level ?? 0),
+                            )
+                            .map(
+                              (surface) => surface.surface as ExposureSurface,
+                            )}
+                          primary={{
+                            ...defaultExposurePolicy(),
+                            surfaces: defaultExposurePolicy().surfaces.map(
+                              (entry) => ({
+                                ...entry,
+                                max_level:
+                                  current.exposure_report?.surfaces.find(
+                                    (surface) =>
+                                      surface.surface === entry.surface,
+                                  )?.actual_level ?? 2,
+                              }),
+                            ),
+                          }}
+                          locale={zh ? "zh-CN" : "en"}
+                          primaryLabel={zh ? "实际暴露" : "Observed"}
+                          secondary={
+                            current.exposure_policy ?? defaultExposurePolicy()
+                          }
+                          secondaryLabel={zh ? "允许上限" : "Allowed"}
+                        />
+                      ) : null}
+                    </section>
+                  )}
                   <CompactEvaluationProgress request={current} />
                   {current.exposure_report?.chain_summary ? (
                     <details className="compact-approval__chain-summary">
@@ -1364,7 +1389,7 @@ const compactApprovalStyles = `
     gap: 8px;
     padding: 24px;
   }
-  .compact-approval__error { border-color: #f2381e; }
+  .compact-approval__error { border-color: #f2381e; overflow-wrap: anywhere; }
   .compact-approval__error span,
   .compact-approval__state p { color: #706d67; }
   .compact-approval__state h2,

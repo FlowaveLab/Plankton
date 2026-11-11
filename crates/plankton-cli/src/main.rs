@@ -37,8 +37,8 @@ use plankton_protocol::{
         PasswordSourceDescriptor, SelectedPasswordEntry,
     },
     resources::{
-        ResourceExecutionRequest, ResourceExecutionResponse, ResourceExecutionState,
-        ResourceSearchItem, ResourceSearchRequest,
+        CredentialBinding, ResourceExecutionRequest, ResourceExecutionResponse,
+        ResourceExecutionState, ResourceSearchItem, ResourceSearchRequest,
     },
 };
 use serde::Serialize;
@@ -402,6 +402,8 @@ struct RunArgs {
         help = "Inject the credential into this consumer environment variable; accepts a name, never a value"
     )]
     credential_env: Option<String>,
+    #[arg(long = "bind", requires = "credential_env", value_name = "RESOURCE=ENV", value_parser = parse_binding, help = "Bind another resource to this consumer; repeat for additional fields. Supply identifiers only.")]
+    additional_credentials: Vec<CredentialBinding>,
     #[arg(
         long,
         requires = "credential_env",
@@ -442,6 +444,19 @@ fn parse_credential_env(name: &str) -> std::result::Result<String, String> {
         return Err("--env requires a POSIX variable name, never NAME=VALUE".into());
     }
     Ok(name.into())
+}
+
+fn parse_binding(input: &str) -> std::result::Result<CredentialBinding, String> {
+    let (resource_id, env) = input
+        .rsplit_once('=')
+        .ok_or("--bind requires RESOURCE=ENV")?;
+    if resource_id.trim().is_empty() {
+        return Err("--bind requires a resource identifier".into());
+    }
+    Ok(CredentialBinding {
+        resource_id: resource_id.into(),
+        env: parse_credential_env(env)?,
+    })
 }
 
 #[derive(Debug, Args)]
@@ -1119,6 +1134,7 @@ fn execution_request_with_input(
         interpreter_path,
         command,
         credential_env: args.credential_env,
+        additional_credentials: args.additional_credentials,
         command_stdin,
         cwd,
         arguments,
@@ -1173,7 +1189,8 @@ where
     WaitFuture: Future<Output = ()>,
     Handoff: FnMut(String) -> Result<()>,
 {
-    let mut handoff_dispatched = false;
+    let mut opened_reviews = std::collections::BTreeSet::new();
+    let mut reported_failures = std::collections::BTreeSet::new();
     loop {
         if !matches!(
             result.state,
@@ -1181,12 +1198,19 @@ where
         ) {
             return Ok(result);
         }
-        if !handoff_dispatched
-            && result.state == ResourceExecutionState::Pending
-            && result.human_review_required
-        {
-            handoff(result.request_id.clone())?;
-            handoff_dispatched = true;
+        if result.state == ResourceExecutionState::Pending && result.human_review_required {
+            let review_id = result
+                .pending_review_id
+                .as_ref()
+                .unwrap_or(&result.request_id);
+            if let Some(error) = &result.error {
+                if reported_failures.insert(review_id.clone()) {
+                    eprintln!("plankton: {error} Waiting for your decision in Plankton (request {review_id}).");
+                }
+            }
+            if opened_reviews.insert(review_id.clone()) {
+                handoff(review_id.clone())?;
+            }
         }
         wait(GET_POLL_INTERVAL).await;
         let request_id = result.request_id.clone();
@@ -1918,6 +1942,7 @@ mod tests {
 
     fn execution_response(state: ResourceExecutionState) -> ResourceExecutionResponse {
         ResourceExecutionResponse {
+            pending_review_id: None,
             request_id: "execution-one".into(),
             resource_id: "secret/api".into(),
             state,
@@ -1927,6 +1952,29 @@ mod tests {
             stderr: String::new(),
             error: None,
         }
+    }
+
+    #[test]
+    fn parses_repeated_additional_field_bindings() {
+        let args = command_args(&[
+            "--env",
+            "ID",
+            "--bind",
+            "secret/key=KEY",
+            "--bind",
+            "secret/token=TOKEN",
+            "--",
+            "python3",
+            "-c",
+            "pass",
+        ]);
+        let request = execution_request(args).unwrap();
+        assert_eq!(request.additional_credentials[0].env, "KEY");
+        assert_eq!(
+            request.additional_credentials[1].resource_id,
+            "secret/token"
+        );
+        assert!(parse_binding("secret/key").is_err());
     }
 
     #[test]
@@ -2145,6 +2193,7 @@ mod tests {
             script: Some(script.clone()),
             python: Some(interpreter.clone()),
             credential_env: None,
+            additional_credentials: Vec::new(),
             input: None,
             cwd: Some(directory.path().to_path_buf()),
             timeout: 60,
@@ -2838,6 +2887,7 @@ mod tests {
             human_review_required: bool,
         ) -> ResourceExecutionResponse {
             ResourceExecutionResponse {
+                pending_review_id: None,
                 request_id: "request-automatic".into(),
                 resource_id: "secret/automatic".into(),
                 state,

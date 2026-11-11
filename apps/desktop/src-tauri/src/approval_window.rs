@@ -224,6 +224,7 @@ pub fn present_request<R: Runtime>(
 pub fn compact_requests<R: Runtime>(
     app: &AppHandle<R>,
     pending_requests: &[AccessRequest],
+    locale: &str,
 ) -> Result<Vec<CompactApprovalRequest>> {
     let runtime = app
         .try_state::<ApprovalRuntime>()
@@ -235,7 +236,7 @@ pub fn compact_requests<R: Runtime>(
             pending_requests
                 .iter()
                 .find(|request| request.id == request_id)
-                .map(CompactApprovalRequest::from)
+                .map(|request| CompactApprovalRequest::new(request, locale))
         })
         .collect())
 }
@@ -373,6 +374,8 @@ pub struct CompactApprovalRequest {
     reason: String,
     context: String,
     call_chain: Vec<CallChainNode>,
+    review_error: Option<&'static str>,
+    review_error_detail: Option<String>,
     suggestion: String,
     suggested_decision: String,
     risk_score: Option<u8>,
@@ -385,8 +388,8 @@ pub struct CompactApprovalRequest {
     review_progress: Option<LlmReviewProgress>,
 }
 
-impl From<&AccessRequest> for CompactApprovalRequest {
-    fn from(request: &AccessRequest) -> Self {
+impl CompactApprovalRequest {
+    fn new(request: &AccessRequest, locale: &str) -> Self {
         let context = request
             .context
             .script_path
@@ -434,7 +437,12 @@ impl From<&AccessRequest> for CompactApprovalRequest {
                     .and_then(|decision| decision.risk_score)
             });
         Self {
-            locale: "en".into(),
+            locale: locale.into(),
+            review_error: request.review_failure_message(locale),
+            review_error_detail: request
+                .llm_suggestion
+                .as_ref()
+                .and_then(|suggestion| suggestion.error.clone()),
             policy_mode: request.policy_mode,
             created_at: request.created_at,
             resource_metadata: request.context.resource_metadata.clone(),
@@ -531,7 +539,7 @@ mod tests {
             None,
         );
 
-        let compact = CompactApprovalRequest::from(&request);
+        let compact = CompactApprovalRequest::new(&request, "en");
 
         assert_eq!(compact.inline_sources, vec![inline_source]);
     }

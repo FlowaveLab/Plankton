@@ -76,7 +76,7 @@ impl TrayActivity {
             Self::Idle => "Plankton is ready",
             Self::Attention => "Plankton needs your approval",
             Self::Reasoning => "Plankton is evaluating a request",
-            Self::Degraded => "Plankton needs attention",
+            Self::Degraded => "Plankton service status is degraded",
             Self::Disconnected => "Plankton daemon is disconnected",
         }
     }
@@ -259,8 +259,16 @@ fn update_icon<R: Runtime>(
     } else {
         render_activity_icon(&base, &base, activity)
     };
-    tray.set_icon(Some(rendered))
-        .map_err(|error| format!("failed to update tray icon: {error}"))
+    #[cfg(target_os = "macos")]
+    let update = tray
+        .with_inner_tray_icon(move |icon| -> tauri::Result<()> {
+            icon.set_icon_with_as_template(Some(rendered.try_into()?), true)?;
+            Ok(())
+        })
+        .and_then(|result| result);
+    #[cfg(not(target_os = "macos"))]
+    let update = tray.set_icon(Some(rendered));
+    update.map_err(|error| format!("failed to update tray icon: {error}"))
 }
 
 fn base_image<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Image<'static>> {

@@ -193,6 +193,20 @@ plankton run secret/api-token --env API_TOKEN \
   --requested-by agent -- python3 ./api-client.py --status
 ```
 
+When the same consumer requires several fields, name the first with `--env`
+and repeat `--bind RESOURCE=ENV` for each additional resource:
+
+```bash
+plankton run SECRET_ID --env CLS_SECRET_ID --bind SECRET_KEY=CLS_SECRET_KEY \
+  --reason "Authenticate the CLS SearchLog request to cls.tencentcloudapi.com" \
+  -- /usr/bin/python3 ./query_cls.py
+```
+
+Plankton reviews each field against its own policy and starts one consumer only
+after every field is approved. Older versions without `--bind` need a matching
+CLI and desktop upgrade. When automatic review fails, report the CLI handoff
+message to the user while the same execution waits for their desktop decision.
+
 The consumer reads `os.environ["API_TOKEN"]` (or the equivalent API in its
 language), performs the authorized task and prints only non-secret results.
 Without `--env`, the daemon sends the credential to consumer stdin; use that
