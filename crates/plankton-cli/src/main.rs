@@ -386,6 +386,12 @@ struct GetArgs {
         .args(["script", "arguments"]),
 ))]
 struct RunArgs {
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Connect to an explicitly selected daemon instance; defaults to the local desktop service"
+    )]
+    daemon_state: Option<PathBuf>,
     #[arg(value_name = "RESOURCE")]
     resource: String,
     #[arg(
@@ -1155,13 +1161,26 @@ fn execution_request_with_input(
 }
 
 async fn run_consumer(output: OutputFormat, args: RunArgs) -> Result<ExitCode> {
+    let isolated = args.daemon_state.is_some();
+    let daemon_state = args.daemon_state.clone();
     let request = execution_request(args)?;
-    let client = connect().await?;
+    let client = match daemon_state.as_ref() {
+        Some(path) => DaemonClient::from_state_file(path)
+            .await
+            .context("failed to connect to the selected daemon")?,
+        None => connect().await?,
+    };
     let result = submit_execution_and_wait(
         client.execute_resource(request),
         |request_id| client.resource_execution_status(request_id),
         sleep,
-        trigger_request_handoff,
+        |request_id| {
+            if isolated {
+                Ok(())
+            } else {
+                trigger_request_handoff(request_id)
+            }
+        },
     )
     .await?;
     handle_execution_result(output, result)
@@ -2192,6 +2211,22 @@ mod tests {
         .is_err());
     }
 
+    #[tokio::test]
+    async fn explicitly_selected_daemon_never_falls_back_to_the_desktop() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-daemon.json");
+        let args = command_args(&[
+            "--daemon-state",
+            missing.to_str().unwrap(),
+            "--env",
+            "TOKEN",
+            "--",
+            "/usr/bin/true",
+        ]);
+        let error = run_consumer(OutputFormat::Json, args).await.unwrap_err();
+        assert!(error.to_string().contains("selected daemon"));
+    }
+
     #[test]
     fn run_resolves_paths_but_does_not_consume_or_execute_script() {
         let directory = tempfile::tempdir().unwrap();
@@ -2201,6 +2236,7 @@ mod tests {
         let interpreter = directory.path().join("python3");
         std::fs::write(&interpreter, b"test interpreter path").unwrap();
         let args = RunArgs {
+            daemon_state: None,
             resource: "secret/api".into(),
             script: Some(script.clone()),
             python: Some(interpreter.clone()),
