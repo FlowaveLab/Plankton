@@ -1,3 +1,6 @@
+mod review_batch;
+pub use review_batch::{request_llm_batch_suggestions, BatchReviewInput, MAX_REVIEW_BATCH_SIZE};
+
 use async_openai::{
     config::OpenAIConfig,
     types::chat::{
@@ -2624,6 +2627,15 @@ fn append_canonical_context(
     };
 
     let mut result = format!("{prompt}\n\n{heading}\n{serialized_context}");
+    append_context_guidance(&mut result, sanitized_context, locale);
+    Ok(result)
+}
+
+fn append_context_guidance(
+    result: &mut String,
+    sanitized_context: &SanitizedPromptContext,
+    locale: &str,
+) {
     if matches!(
         sanitized_context
             .request_metadata
@@ -2649,7 +2661,6 @@ fn append_canonical_context(
             "\n\nDeclared consumer script: script_path is included in the allowed read files. Even if an older template mentions only call-chain files, inspect this allowlisted script with the existing read-only file capability to verify credential consumption; this declaration does not grant permission to execute it or access unrelated files. This is a caller-declared consumer, not a system-observed ancestor, proof of execution, or complete pipeline coverage. Describe independent script evidence in chain_summary and surface summaries; never invent a call-chain node or bind source_quote to an unrelated node."
         });
     }
-    Ok(result)
 }
 
 #[derive(Debug, Serialize)]
@@ -2959,6 +2970,41 @@ fn parse_suggestion_payload(content: &str) -> Result<SuggestionPayload, Provider
         } else {
             JsonRepairStrategy::Conservative
         });
+        return normalize_suggestion_payload(payload);
+    }
+
+    // CLI agents often narrate tool use before their final fenced object. Extract
+    // only a unique schema-valid object; never let a repair heuristic choose
+    // between contradictory decisions or mistake an example for the result.
+    let mut candidate: Option<serde_json::Value> = None;
+    for block in content.split("```").skip(1).step_by(2) {
+        let Some((language, body)) = block.split_once('\n') else {
+            continue;
+        };
+        if !matches!(language.trim(), "" | "json") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            continue;
+        };
+        if serde_json::from_value::<StrictSuggestionPayload>(value.clone()).is_err() {
+            continue;
+        }
+        if candidate
+            .as_ref()
+            .is_some_and(|previous| previous != &value)
+        {
+            return Err(ProviderError::InvalidResponse(
+                "ambiguous response: multiple different decision objects".into(),
+            ));
+        }
+        candidate = Some(value);
+    }
+    if let Some(value) = candidate {
+        let strict = serde_json::from_value::<StrictSuggestionPayload>(value)
+            .expect("candidate passed strict schema parsing");
+        let mut payload = SuggestionPayload::from(strict);
+        payload.json_repair_strategy = Some(JsonRepairStrategy::Conservative);
         return normalize_suggestion_payload(payload);
     }
 
@@ -3629,6 +3675,28 @@ mod tests {
         );
         assert_eq!(payload.batch_decisions.len(), 1);
         assert_eq!(payload.batch_decisions[0].resource_selector, "SECRET_ID");
+    }
+
+    #[test]
+    fn commentary_around_one_strict_result_needs_no_model_repair() {
+        let decision = r#"{"suggested_decision":"deny","rationale_summary":"the consumer logs the credential","risk_score":90}"#;
+        let content = format!(
+            "I inspected the consumer and its output.\n```json\n{decision}\n```\nReview finished."
+        );
+        assert_eq!(
+            parse_suggestion_payload(&content)
+                .unwrap()
+                .suggested_decision,
+            SuggestedDecision::Deny
+        );
+        let conflicting = format!(
+            "{content}\n```json\n{}\n```",
+            decision.replace("\"deny\"", "\"allow\"")
+        );
+        assert!(parse_suggestion_payload(&conflicting)
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
     }
 
     #[test]

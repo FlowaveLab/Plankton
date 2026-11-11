@@ -12,11 +12,12 @@ use std::{
 
 use chrono::Utc;
 use plankton_core::{
-    request_llm_suggestion_with_progress, LlmSuggestionProgress, PlanktonSettings, SettingsError,
+    request_llm_batch_suggestions, request_llm_suggestion_with_progress, BatchReviewInput,
+    LlmSuggestionProgress, PlanktonSettings, SettingsError, MAX_REVIEW_BATCH_SIZE,
 };
 use plankton_protocol::error::{ErrorCode, ErrorSeverity, ErrorSource, PlanktonError};
 use plankton_store::{SqliteStore, StoreError};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -24,10 +25,12 @@ use uuid::Uuid;
 use crate::{review_journal::ReviewJournal, runtime_settings::RuntimeSettings};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const BATCH_WINDOW: Duration = Duration::from_secs(1);
 
 type EvaluationFuture = Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'static>>;
-type EvaluationExecutor =
-    Arc<dyn Fn(PlanktonSettings, SqliteStore, String) -> EvaluationFuture + Send + Sync + 'static>;
+type EvaluationExecutor = Arc<
+    dyn Fn(PlanktonSettings, SqliteStore, Vec<String>) -> EvaluationFuture + Send + Sync + 'static,
+>;
 
 #[derive(Debug, thiserror::Error)]
 enum EvaluationRunError {
@@ -48,6 +51,9 @@ struct EvaluationWorkerInner {
     executor: EvaluationExecutor,
     shutting_down: Arc<AtomicBool>,
     tasks: Mutex<Vec<TrackedEvaluation>>,
+    pending: Mutex<Vec<String>>,
+    windows: Mutex<Vec<JoinHandle<()>>>,
+    permits: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -65,8 +71,8 @@ impl fmt::Debug for EvaluationWorker {
 
 impl EvaluationWorker {
     pub(crate) fn new(settings: RuntimeSettings, store: SqliteStore) -> Self {
-        let executor: EvaluationExecutor = Arc::new(|settings, store, request_id| {
-            Box::pin(evaluate_request(settings, store, request_id))
+        let executor: EvaluationExecutor = Arc::new(|settings, store, request_ids| {
+            Box::pin(evaluate_requests(settings, store, request_ids))
         });
         Self::with_executor(settings, store, executor)
     }
@@ -75,9 +81,23 @@ impl EvaluationWorker {
     fn new_with_executor(
         settings: PlanktonSettings,
         store: SqliteStore,
-        executor: EvaluationExecutor,
+        executor: Arc<
+            dyn Fn(PlanktonSettings, SqliteStore, String) -> EvaluationFuture
+                + Send
+                + Sync
+                + 'static,
+        >,
     ) -> Self {
-        Self::with_executor(RuntimeSettings::fixed(settings), store, executor)
+        let batch_executor: EvaluationExecutor = Arc::new(move |settings, store, requests| {
+            let executor = executor.clone();
+            Box::pin(async move {
+                for request in requests {
+                    executor(settings.clone(), store.clone(), request).await?;
+                }
+                Ok(())
+            })
+        });
+        Self::with_executor(RuntimeSettings::fixed(settings), store, batch_executor)
     }
 
     fn with_executor(
@@ -92,6 +112,9 @@ impl EvaluationWorker {
                 executor,
                 shutting_down: Arc::new(AtomicBool::new(false)),
                 tasks: Mutex::new(Vec::new()),
+                pending: Mutex::new(Vec::new()),
+                windows: Mutex::new(Vec::new()),
+                permits: Arc::new(Semaphore::new(2)),
             }),
         }
     }
@@ -121,15 +144,69 @@ impl EvaluationWorker {
     }
 
     pub(crate) fn spawn(&self, request_id: String) {
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        let mut pending = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if pending.contains(&request_id) {
+            return;
+        }
+        let first = pending.is_empty();
+        pending.push(request_id);
+        if !first {
+            return;
+        }
+        let worker = self.clone();
+        let deadline = tokio::time::Instant::now() + BATCH_WINDOW;
+        let window = tokio::spawn(async move {
+            // Fixed from the first arrival. Later arrivals never reset this timer.
+            tokio::time::sleep_until(deadline).await;
+            let requests = std::mem::take(
+                &mut *worker
+                    .inner
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()),
+            );
+            for batch in requests.chunks(MAX_REVIEW_BATCH_SIZE) {
+                worker.spawn_batch(batch.to_vec());
+            }
+        });
+        let mut windows = self
+            .inner
+            .windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        windows.retain(|window| !window.is_finished());
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            window.abort();
+        } else {
+            windows.push(window);
+        }
+    }
+
+    fn spawn_batch(&self, request_ids: Vec<String>) {
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
         let settings = self.inner.settings.clone();
         let store = self.inner.store.clone();
         let shutting_down = self.inner.shutting_down.clone();
         let executor = self.inner.executor.clone();
         let evaluation_store = store.clone();
-        let evaluation_request_id = request_id.clone();
+        let evaluation_request_ids = request_ids.clone();
+        let permits = self.inner.permits.clone();
         let evaluation = tokio::spawn(async move {
+            let _permit = permits
+                .acquire_owned()
+                .await
+                .expect("evaluation semaphore stays open");
             let settings = settings.current()?;
-            executor(settings, evaluation_store, evaluation_request_id)
+            executor(settings, evaluation_store, evaluation_request_ids)
                 .await
                 .map_err(EvaluationRunError::Store)
         });
@@ -156,29 +233,49 @@ impl EvaluationWorker {
                 )),
             };
             if let Some((code, message)) = failure {
-                finalize_worker_failure(&store, &request_id, code, message).await;
+                for request_id in request_ids {
+                    finalize_worker_failure(&store, &request_id, code, message.clone()).await;
+                }
             }
         });
         let tracked = TrackedEvaluation {
             evaluation: evaluation_abort,
             monitor,
         };
-        match self.inner.tasks.lock() {
-            Ok(mut tasks) => {
-                tasks.retain(|task| !task.monitor.is_finished());
-                tasks.push(tracked);
-            }
-            Err(poisoned) => {
-                let mut tasks = poisoned.into_inner();
-                tasks.retain(|task| !task.monitor.is_finished());
-                tasks.push(tracked);
-                warn!("evaluation task registry mutex was poisoned");
-            }
+        let mut tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        tasks.retain(|task| !task.monitor.is_finished());
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            tracked.evaluation.abort();
+            tracked.monitor.abort();
+        } else {
+            tasks.push(tracked);
         }
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), StoreError> {
         self.inner.shutting_down.store(true, Ordering::Release);
+        let windows = std::mem::take(
+            &mut *self
+                .inner
+                .windows
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for window in &windows {
+            window.abort();
+        }
+        for window in windows {
+            let _ = window.await;
+        }
+        self.inner
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         let tasks = match self.inner.tasks.lock() {
             Ok(mut tasks) => std::mem::take(&mut *tasks),
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
@@ -202,6 +299,20 @@ impl EvaluationWorker {
 
     pub(crate) fn abort_now(&self) {
         self.inner.shutting_down.store(true, Ordering::Release);
+        for window in self
+            .inner
+            .windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .drain(..)
+        {
+            window.abort();
+        }
+        self.inner
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         let mut tasks = match self.inner.tasks.lock() {
             Ok(tasks) => tasks,
             Err(poisoned) => poisoned.into_inner(),
@@ -251,6 +362,77 @@ async fn finalize_worker_failure(
             "failed to persist asynchronous evaluation diagnostic"
         );
     }
+}
+
+async fn evaluate_requests(
+    settings: PlanktonSettings,
+    store: SqliteStore,
+    request_ids: Vec<String>,
+) -> Result<(), StoreError> {
+    if request_ids.len() == 1 || !matches!(settings.provider_kind.as_str(), "acp" | "acp_codex") {
+        for id in request_ids {
+            evaluate_request(settings.clone(), store.clone(), id).await?;
+        }
+        return Ok(());
+    }
+    let mut inputs = Vec::new();
+    let mut journals = BTreeMap::new();
+    for id in request_ids {
+        let Some(request) = store.claim_evaluation(&id, Utc::now()).await? else {
+            continue;
+        };
+        let input = request
+            .provider_input
+            .ok_or_else(|| StoreError::InvalidStoredValue {
+                field: "provider_input_json",
+                value: format!("queued evaluation {id} has no provider input"),
+            })?;
+        match ReviewJournal::create(&settings, &id).await {
+            Ok(journal) => {
+                journals.insert(id.clone(), journal);
+            }
+            Err(error) => warn!(request_id = id, %error, "failed to create batch review journal"),
+        }
+        inputs.push(BatchReviewInput {
+            request_id: id,
+            policy_mode: request.policy_mode,
+            input,
+        });
+    }
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let suggestions = request_llm_batch_suggestions(&settings, &inputs);
+    tokio::pin!(suggestions);
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let suggestions = loop {
+        tokio::select! {
+            suggestions = &mut suggestions => break suggestions,
+            _ = heartbeat.tick() => {
+                for input in &inputs { store.heartbeat_evaluation(&input.request_id, Utc::now()).await?; }
+            }
+        }
+    };
+    for input in &inputs {
+        let suggestion =
+            suggestions
+                .get(&input.request_id)
+                .ok_or_else(|| StoreError::InvalidStoredValue {
+                    field: "batch_review",
+                    value: format!("missing result for {}", input.request_id),
+                })?;
+        // The existing store rechecks this field's own policy and concurrent
+        // human resolution. No approval is copied from a neighboring request.
+        store
+            .finalize_evaluation(&input.request_id, suggestion.clone())
+            .await?;
+        if let Some(journal) = journals.get(&input.request_id) {
+            if let Err(error) = journal.complete(suggestion).await {
+                warn!(request_id = input.request_id, %error, "failed to persist batch review journal");
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn evaluate_request(
@@ -351,6 +533,224 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{EvaluationFuture, EvaluationWorker};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_batch_uses_one_cli_turn_and_preserves_independent_database_results() {
+        for mode in ["complete", "missing"] {
+            let temp = tempdir().unwrap();
+            let script = temp.path().join("batch_acp.py");
+            let log = temp.path().join("prompts.jsonl");
+            std::fs::write(&script, include_str!("../tests/fixtures/batch_acp.py")).unwrap();
+            let settings = PlanktonSettings {
+                database_url: format!("sqlite://{}", temp.path().join("batch.db").display()),
+                provider_kind: "acp".into(),
+                acp_profile: plankton_protocol::acp::AcpProfile {
+                    agent_kind: plankton_protocol::acp::AgentKind::Custom,
+                    version_mode: plankton_protocol::acp::VersionMode::Custom,
+                    version: None,
+                    program: Some("/usr/bin/python3".into()),
+                    args: vec![
+                        "-u".into(),
+                        script.display().to_string(),
+                        log.display().to_string(),
+                        mode.into(),
+                    ],
+                    session_options: Default::default(),
+                },
+                acp_timeout_secs: 5,
+                ..PlanktonSettings::default()
+            };
+            let store = SqliteStore::new(&settings).await.unwrap();
+            let worker = EvaluationWorker::new(
+                crate::runtime_settings::RuntimeSettings::fixed(settings.clone()),
+                store.clone(),
+            );
+            let mut requests = Vec::new();
+            for resource in ["secret/allow", "secret/deny"] {
+                let request = store
+                    .submit_request(
+                        &settings,
+                        RequestContext::new(resource.into(), "batch fixture".into(), "test".into()),
+                        PolicyMode::LlmAutomatic,
+                    )
+                    .await
+                    .unwrap();
+                worker.spawn(request.id.clone());
+                requests.push(request);
+            }
+            let finished = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let first = store.get_request(&requests[0].id).await.unwrap().request;
+                    let second = store.get_request(&requests[1].id).await.unwrap().request;
+                    if first.llm_suggestion.is_some() && second.llm_suggestion.is_some() {
+                        break [first, second];
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let calls = std::fs::read_to_string(log).unwrap();
+            assert_eq!(
+                calls.lines().count(),
+                1,
+                "two approvals use one CLI prompt, with no repair or audit turn"
+            );
+            let ids: Vec<String> = serde_json::from_str(calls.trim()).unwrap();
+            assert_eq!(
+                ids,
+                requests
+                    .iter()
+                    .map(|request| request.id.clone())
+                    .collect::<Vec<_>>()
+            );
+            if mode == "complete" {
+                assert_eq!(
+                    finished[0].approval_status,
+                    plankton_core::ApprovalStatus::Approved
+                );
+                assert_eq!(
+                    finished[1].approval_status,
+                    plankton_core::ApprovalStatus::Rejected
+                );
+                assert_eq!(
+                    finished[0]
+                        .llm_suggestion
+                        .as_ref()
+                        .unwrap()
+                        .provider_trace
+                        .as_ref()
+                        .unwrap()
+                        .session_id,
+                    finished[1]
+                        .llm_suggestion
+                        .as_ref()
+                        .unwrap()
+                        .provider_trace
+                        .as_ref()
+                        .unwrap()
+                        .session_id
+                );
+            } else {
+                for request in finished {
+                    assert_ne!(
+                        request.approval_status,
+                        plankton_core::ApprovalStatus::Approved
+                    );
+                    assert!(request
+                        .llm_suggestion
+                        .unwrap()
+                        .error
+                        .unwrap()
+                        .contains("omitted"));
+                }
+            }
+            worker.shutdown().await.unwrap();
+        }
+    }
+
+    async fn batch_worker(
+        executor: super::EvaluationExecutor,
+    ) -> (tempfile::TempDir, EvaluationWorker) {
+        let temp = tempdir().unwrap();
+        let settings = PlanktonSettings {
+            database_url: format!("sqlite://{}", temp.path().join("batch.db").display()),
+            provider_kind: "mock".into(),
+            ..PlanktonSettings::default()
+        };
+        let store = SqliteStore::new(&settings).await.unwrap();
+        let worker = EvaluationWorker::with_executor(
+            crate::runtime_settings::RuntimeSettings::fixed(settings),
+            store,
+            executor,
+        );
+        // SQLite runs on blocking threads; pause only after its real IO finishes.
+        tokio::time::pause();
+        (temp, worker)
+    }
+
+    #[tokio::test]
+    async fn one_second_window_is_fixed_deduplicated_and_preserves_later_requests() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let executor: super::EvaluationExecutor = Arc::new(move |_, _, ids| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                tx.send(ids).unwrap();
+                Ok(())
+            })
+        });
+        let (_temp, worker) = batch_worker(executor).await;
+        worker.spawn("a".into());
+        tokio::time::advance(std::time::Duration::from_millis(900)).await;
+        assert!(rx.try_recv().is_err());
+        worker.spawn("b".into());
+        worker.spawn("a".into());
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        assert_eq!(rx.recv().await.unwrap(), vec!["a", "b"]);
+        worker.spawn("c".into());
+        tokio::time::advance(std::time::Duration::from_millis(999)).await;
+        assert!(rx.try_recv().is_err());
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        assert_eq!(rx.recv().await.unwrap(), vec!["c"]);
+        tokio::time::resume();
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batches_overlap_with_two_workers_and_never_exceed_capacity() {
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let executor: super::EvaluationExecutor = Arc::new({
+            let release = release.clone();
+            move |_, _, ids| {
+                let release = release.clone();
+                let started = started_tx.clone();
+                Box::pin(async move {
+                    started.send(ids).unwrap();
+                    release.acquire().await.unwrap().forget();
+                    Ok(())
+                })
+            }
+        });
+        let (_temp, worker) = batch_worker(executor).await;
+        for index in 0..17 {
+            worker.spawn(format!("request-{index}"));
+        }
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let first = started_rx.recv().await.unwrap();
+        let second = started_rx.recv().await.unwrap();
+        assert_eq!(first.len(), 8);
+        assert_eq!(second.len(), 8);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "third batch must wait for capacity"
+        );
+        release.add_permits(1);
+        assert_eq!(started_rx.recv().await.unwrap(), vec!["request-16"]);
+        release.add_permits(2);
+        tokio::time::resume();
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_collecting_window_starts_no_review() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let executor: super::EvaluationExecutor = Arc::new(move |_, _, ids| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                tx.send(ids).unwrap();
+                Ok(())
+            })
+        });
+        let (_temp, worker) = batch_worker(executor).await;
+        worker.spawn("a".into());
+        tokio::time::resume();
+        worker.shutdown().await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert!(rx.try_recv().is_err());
+    }
 
     async fn test_worker(
         executor: fn(PlanktonSettings, SqliteStore, String) -> EvaluationFuture,

@@ -60,10 +60,11 @@ pub use password_changes::{
     apply_password_changes, password_catalog_metadata, preview_password_changes,
 };
 pub use provider::{
-    build_provider_input_snapshot, generate_llm_suggestion, request_llm_suggestion,
-    request_llm_suggestion_with_progress, AcpAdapter, ClaudeAdapter, ClaudeMessagesAdapter,
-    LlmSuggestionProgress, MockProviderAdapter, OpenAiCompatibleAdapter, ProviderAdapter,
-    ProviderError, ProviderRequest, ProviderResponse, CLAUDE_PROVIDER_KIND,
+    build_provider_input_snapshot, generate_llm_suggestion, request_llm_batch_suggestions,
+    request_llm_suggestion, request_llm_suggestion_with_progress, AcpAdapter, BatchReviewInput,
+    ClaudeAdapter, ClaudeMessagesAdapter, LlmSuggestionProgress, MockProviderAdapter,
+    OpenAiCompatibleAdapter, ProviderAdapter, ProviderError, ProviderRequest, ProviderResponse,
+    CLAUDE_PROVIDER_KIND, MAX_REVIEW_BATCH_SIZE,
 };
 pub use sanitization::{
     build_prompt_context, sanitize_audit_payload_for_display, sanitize_request_context_for_storage,

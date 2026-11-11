@@ -319,6 +319,11 @@ struct SkillArgs {
 
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
+    #[command(about = "Read a bundled skill reference without installing the skill")]
+    Show {
+        #[arg(value_parser = ["setup", "credentials", "execution", "catalog", "boundaries"])]
+        topic: String,
+    },
     #[command(about = "Install the bundled secret-access skill for explicit agent targets")]
     Install(SkillInstallArgs),
 }
@@ -987,7 +992,11 @@ async fn run() -> Result<ExitCode> {
         Commands::Password(args) => run_password(output.unwrap_or(OutputFormat::Text), args).await,
         Commands::Skill(args) => match args.command {
             None => {
-                print_bundled_skill(output.unwrap_or(OutputFormat::Text))?;
+                print_bundled_skill(output.unwrap_or(OutputFormat::Text), None)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Some(SkillCommand::Show { topic }) => {
+                print_bundled_skill(output.unwrap_or(OutputFormat::Text), Some(&topic))?;
                 Ok(ExitCode::SUCCESS)
             }
             Some(SkillCommand::Install(args)) => {
@@ -1001,9 +1010,12 @@ async fn run() -> Result<ExitCode> {
     }
 }
 
-fn print_bundled_skill(output: OutputFormat) -> Result<()> {
+fn print_bundled_skill(output: OutputFormat, topic: Option<&str>) -> Result<()> {
     let name = skill_install::bundled_skill_name();
-    let content = skill_install::bundled_skill_markdown();
+    let content = match topic {
+        Some(topic) => skill_install::bundled_skill_reference(topic)?,
+        None => skill_install::bundled_skill_markdown(),
+    };
     match output {
         OutputFormat::Text => {
             let mut stdout = io::stdout().lock();
@@ -2680,6 +2692,10 @@ mod tests {
 
     #[test]
     fn parses_bundled_skill_view_and_explicit_install_targets() {
+        let reference = Cli::try_parse_from(["plankton", "skill", "show", "execution"]).unwrap();
+        assert!(matches!(reference.command,
+            Commands::Skill(SkillArgs { command: Some(SkillCommand::Show { topic }) }) if topic == "execution"));
+        assert!(Cli::try_parse_from(["plankton", "skill", "show", "missing"]).is_err());
         let view =
             Cli::try_parse_from(["plankton", "skill"]).expect("bundled skill view should parse");
         assert!(matches!(

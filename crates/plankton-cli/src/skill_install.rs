@@ -9,6 +9,28 @@ use anyhow::{bail, Context, Result};
 
 const BUNDLED_SKILL_NAME: &str = "secret-access";
 const BUNDLED_SKILL_MD: &str = include_str!("../../../.codex/skills/secret-access/SKILL.md");
+const BUNDLED_REFERENCES: [(&str, &str); 5] = [
+    (
+        "setup.md",
+        include_str!("../../../.codex/skills/secret-access/references/setup.md"),
+    ),
+    (
+        "credentials.md",
+        include_str!("../../../.codex/skills/secret-access/references/credentials.md"),
+    ),
+    (
+        "execution.md",
+        include_str!("../../../.codex/skills/secret-access/references/execution.md"),
+    ),
+    (
+        "catalog.md",
+        include_str!("../../../.codex/skills/secret-access/references/catalog.md"),
+    ),
+    (
+        "boundaries.md",
+        include_str!("../../../.codex/skills/secret-access/references/boundaries.md"),
+    ),
+];
 const SKILLS_CLI_PACKAGE: &str = "skills@1.5.18";
 
 pub fn install_bundled_skill(agents: &[String]) -> Result<()> {
@@ -40,11 +62,23 @@ pub fn bundled_skill_markdown() -> &'static str {
     BUNDLED_SKILL_MD
 }
 
+pub fn bundled_skill_reference(topic: &str) -> Result<&'static str> {
+    BUNDLED_REFERENCES.iter().find(|(name, _)| name.strip_suffix(".md") == Some(topic))
+        .map(|(_, content)| *content)
+        .with_context(|| format!("unknown skill topic {topic}; choose setup, credentials, execution, catalog or boundaries"))
+}
+
 fn write_bundled_skill(staging_dir: &Path) -> Result<PathBuf> {
     let skill_dir = staging_dir.join(BUNDLED_SKILL_NAME);
     fs::create_dir(&skill_dir).context("failed to create bundled skill directory")?;
     fs::write(skill_dir.join("SKILL.md"), BUNDLED_SKILL_MD)
         .context("failed to stage the bundled secret-access skill")?;
+    let references = skill_dir.join("references");
+    fs::create_dir(&references).context("failed to create bundled skill references")?;
+    for (name, content) in BUNDLED_REFERENCES {
+        fs::write(references.join(name), content)
+            .with_context(|| format!("failed to stage bundled skill reference {name}"))?;
+    }
     Ok(skill_dir)
 }
 
@@ -88,6 +122,22 @@ mod tests {
             fs::read_to_string(skill_dir.join("SKILL.md")).expect("read staged skill"),
             BUNDLED_SKILL_MD
         );
+    }
+
+    #[test]
+    fn installed_skill_links_resolve_without_the_source_checkout() {
+        let staging = tempfile::tempdir().expect("temp dir");
+        let skill_dir = write_bundled_skill(staging.path()).expect("stage skill");
+        let main = fs::read_to_string(skill_dir.join("SKILL.md")).expect("installed entrypoint");
+        let mut references = std::collections::BTreeSet::new();
+        for suffix in main.split("](references/").skip(1) {
+            let name = suffix.split(')').next().expect("reference target");
+            let content = fs::read_to_string(skill_dir.join("references").join(name))
+                .expect("every linked reference is bundled");
+            assert!(!content.trim().is_empty());
+            references.insert(name);
+        }
+        assert_eq!(references.len(), BUNDLED_REFERENCES.len());
     }
 
     #[test]

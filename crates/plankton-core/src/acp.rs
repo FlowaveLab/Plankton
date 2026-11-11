@@ -1,5 +1,7 @@
 mod pi_diagnostics;
+mod review_output;
 mod session_options;
+use review_output::{audit_frames, ReviewOutput};
 use session_options::{configure_session, AcpConfigOption};
 use std::{
     cell::RefCell,
@@ -8,7 +10,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -45,6 +50,9 @@ const ACP_ENRICHMENT_TIMEOUT: Duration = Duration::from_secs(120);
 const ACP_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 const ACP_DECISION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_SESSION_REPLAY_QUIET_PERIOD: Duration = Duration::from_millis(50);
+const PI_REVIEW_WORKERS: usize = 2;
+static NEXT_PI_WORKER: AtomicUsize = AtomicUsize::new(0);
+static PI_SESSION_INDEX_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub(crate) const ACP_REVIEW_CHAIN_PATH: &str = "/plankton-review/chain.md";
 pub(crate) const ACP_REVIEW_NODES_PATH: &str = "/plankton-review/nodes.json";
 pub(crate) const ACP_REVIEW_EXPOSURE_PATH: &str = "/plankton-review/exposure.json";
@@ -243,8 +251,13 @@ pub struct AcpSessionConfig {
 impl AcpSessionConfig {
     pub fn from_settings(settings: &PlanktonSettings) -> Result<Self, ProviderError> {
         let command = resolve_acp_command(&settings.acp_profile)?;
-        let cwd = prepare_acp_working_directory()?;
+        let mut cwd = prepare_acp_working_directory()?;
         if settings.acp_profile.agent_kind == AgentKind::Pi {
+            let worker = NEXT_PI_WORKER.fetch_add(1, Ordering::Relaxed) % PI_REVIEW_WORKERS;
+            cwd = cwd.join(format!("pi-worker-{worker}"));
+            fs::create_dir_all(&cwd)
+                .map_err(|error| ProviderError::Transport(format!("prepare Pi worker: {error}")))?;
+            set_private_directory_permissions(&cwd)?;
             prepare_pi_workspace(&cwd)?;
         }
         let codex_home = if settings.acp_profile.agent_kind == AgentKind::Codex {
@@ -357,7 +370,22 @@ fn prepare_pi_workspace(cwd: &Path) -> Result<(), ProviderError> {
         .map(|_| ())
         .map_err(|error| {
             ProviderError::Transport(format!("failed to save Pi review output: {error}"))
-        })
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let launcher = cwd.join("pi-review-cli");
+        let temporary = tempfile::NamedTempFile::new_in(cwd)
+            .map_err(|error| ProviderError::Transport(error.to_string()))?;
+        fs::write(temporary.path(), "#!/bin/sh\nexec \"${PLANKTON_PI_PROGRAM:-pi}\" --no-skills --no-prompt-templates --no-context-files \"$@\"\n")
+            .map_err(|error| ProviderError::Transport(error.to_string()))?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
+            .map_err(|error| ProviderError::Transport(error.to_string()))?;
+        temporary
+            .persist(launcher)
+            .map_err(|error| ProviderError::Transport(error.to_string()))?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2152,6 +2180,13 @@ async fn create_acp_session(
     config: &AcpSessionConfig,
     conn: &acp::ClientSideConnection,
 ) -> Result<acp::NewSessionResponse, ProviderError> {
+    // Pi's session-map.json is a read/modify/write index shared by its processes.
+    // Serialize only lifecycle operations; independent model turns run in parallel.
+    let _index_guard = if single_session_adapter(config, None) {
+        Some(PI_SESSION_INDEX_LOCK.lock().await)
+    } else {
+        None
+    };
     let session = timeout(
         config.timeout,
         conn.new_session(acp::NewSessionRequest::new(config.cwd.clone())),
@@ -2208,8 +2243,14 @@ async fn run_supervised_acp_prompt(
     active_sessions: &Rc<RefCell<HashMap<String, acp::SessionId>>>,
     mut cancellation: watch::Receiver<bool>,
 ) -> Result<AcpPromptResult, ProviderError> {
+    let output = review_workspace_enabled
+        .then(|| ReviewOutput::new(&config.cwd))
+        .transpose()?;
     if review_workspace_enabled {
-        prompt.push_str("\n\nACP review output protocol:\n- Return only the compact structured JSON required by the request.\n- You may use any available tools; Plankton stores and validates the review output.\n- Preserve evidence provenance.");
+        prompt.push_str("\n\nACP review output protocol:\n- Submit the structured JSON required by the request.\n- You may use any available tools; Plankton stores and validates the review output.\n- Preserve evidence provenance.");
+    }
+    if let Some(output) = &output {
+        prompt = output.prompt(&prompt);
     }
     if *cancellation.borrow() {
         return Err(ProviderError::Transport(
@@ -2253,8 +2294,18 @@ async fn run_supervised_acp_prompt(
     };
     let state = handler.snapshot();
     close_acp_session(conn, multiplex, &session_id).await;
-    let state = state?;
+    let mut state = state?;
     prompt_result?;
+    trace.audit_events = raw_client_events(&state);
+    if let Some(output) = output {
+        if let Some(content) = output.read()? {
+            trace
+                .audit_events
+                .push(serde_json::json!({"type":"submitted_review_result","content":content}));
+            state.content = content;
+            state.non_text_content_seen = false;
+        }
+    }
     if state.non_text_content_seen {
         return Err(ProviderError::InvalidResponse(
             "ACP agent returned non-text content instead of a strict JSON suggestion".to_string(),
@@ -2380,7 +2431,8 @@ async fn run_supervised_acp_staged_prompt(
         return false;
     }
 
-    if let Err(error) = handler.reset_for_next_turn(Some(enrichment_chunks), None) {
+    let output = ReviewOutput::new(&config.cwd);
+    if let Err(error) = handler.reset_for_next_turn(None, None) {
         complete_staged_cleanup(
             conn,
             multiplex,
@@ -2393,6 +2445,20 @@ async fn run_supervised_acp_staged_prompt(
     }
     let mut enrichment_config = config.clone();
     enrichment_config.timeout = ACP_ENRICHMENT_TIMEOUT;
+    let enrichment_prompt = match &output {
+        Ok(output) => output.prompt(&enrichment_prompt),
+        Err(error) => {
+            complete_staged_cleanup(
+                conn,
+                multiplex,
+                &session_id,
+                enrichment_response,
+                Err(ProviderError::Transport(error.to_string())),
+            )
+            .await;
+            return false;
+        }
+    };
     let enrichment_turn = tokio::select! {
         _ = cancellation.changed() => {
             let _ = cancel_acp_prompt(config, conn, session_id.clone()).await;
@@ -2408,11 +2474,16 @@ async fn run_supervised_acp_staged_prompt(
     };
     let enrichment_state = handler.snapshot();
     let enrichment_result = enrichment_turn.and_then(|()| {
-        let state = enrichment_state?;
+        let mut state = enrichment_state?;
         let mut trace = trace;
         trace.audit_events = raw_client_events(&state);
+        let written = output.expect("checked output directory").read()?;
+        let content = written.as_deref().unwrap_or(&state.content);
+        state.content = audit_frames(content)?;
+        let _ = enrichment_chunks.send(state.content.clone());
         acp_prompt_result_from_state(state, provider_model, trace, session_id.clone(), request_id)
     });
+    drop(enrichment_chunks);
     complete_staged_cleanup(
         conn,
         multiplex,
@@ -2500,7 +2571,8 @@ async fn run_acp_decision_with_repair(
         "verification": "agent capability validation and configuration acknowledgment"
     }));
     let deadline = tokio::time::Instant::now() + config.timeout;
-    let mut prompt = original_prompt;
+    let output = ReviewOutput::new(&config.cwd)?;
+    let mut prompt = output.prompt(&original_prompt);
     persist_decision_trace(config, request_id, &trace)?;
     for attempt_index in 0..=1 {
         let started_at = chrono::Utc::now();
@@ -2513,7 +2585,13 @@ async fn run_acp_decision_with_repair(
             }
             result = run_acp_prompt_turn(&remaining_config, conn, session_id.clone(), prompt.clone(), "decision") => result,
         };
-        let state = handler.snapshot()?;
+        let mut state = handler.snapshot()?;
+        let submitted = output.read();
+        let mut tool_events = decision_tool_events(&state);
+        if let Ok(Some(content)) = &submitted {
+            tool_events
+                .push(serde_json::json!({"type":"submitted_review_result","content":content}));
+        }
         trace
             .decision_attempts
             .push(crate::domain::DecisionAttempt {
@@ -2521,7 +2599,7 @@ async fn run_acp_decision_with_repair(
                 raw_response: state.content.clone(),
                 started_at,
                 finished_at: chrono::Utc::now(),
-                tool_events: decision_tool_events(&state),
+                tool_events,
                 validation_error: None,
                 normalization: None,
                 evidence_path: Some(
@@ -2538,6 +2616,10 @@ async fn run_acp_decision_with_repair(
             });
         }
         let validation = result.and_then(|()| {
+            if let Some(content) = submitted? {
+                state.content = content;
+                state.non_text_content_seen = false;
+            }
             if state.non_text_content_seen {
                 return Err(ProviderError::InvalidResponse(
                     "non-text decision content".into(),
@@ -2602,7 +2684,8 @@ async fn run_acp_decision_with_repair(
                         trace: Box::new(trace),
                     });
                 }
-                prompt = format!("Your decision output failed validation: {error}. Correct the JSON structure in this SAME session. Preserve the intended decision and evidence; do not invent facts to pass validation. Return only decision JSON matching the original schema: exposure_report has chain_summary and a surfaces ARRAY containing exactly five entries. Do not emit node_assessments or annotations. This is the single decision repair attempt.");
+                prompt = output.prompt(&format!("Your decision output failed validation: {error}. Correct the JSON structure in this SAME session. Preserve the intended decision and evidence; do not invent facts to pass validation. Submit decision JSON matching the original schema: exposure_report has chain_summary and a surfaces ARRAY containing exactly five entries. Do not emit node_assessments or annotations. This is the single decision repair attempt."));
+                output.clear()?;
                 handler.reset_for_next_turn(None, None)?;
             }
         }
@@ -2631,7 +2714,10 @@ async fn run_supervised_acp_chat_turn(
             "ACP chat was cancelled before session acquisition".to_string(),
         ));
     }
-
+    let output = (kind == AcpContinuationKind::ReviewDetailRepair)
+        .then(|| ReviewOutput::new(&config.cwd))
+        .transpose()?;
+    let live_events = (kind == AcpContinuationKind::Chat).then(|| events.clone());
     let handler = AcpClientHandler::with_allowed_read_files(allowed_read_files, false);
     let session_id = if let Some(previous_session_id) = previous_session_id {
         let session_id = acp::SessionId::new(previous_session_id);
@@ -2643,6 +2729,11 @@ async fn run_supervised_acp_chat_turn(
                 config.cwd.clone(),
             )),
         );
+        let index_guard = if single_session_adapter(config, trace.agent_name.as_deref()) {
+            Some(PI_SESSION_INDEX_LOCK.lock().await)
+        } else {
+            None
+        };
         let loaded = if single_session_adapter(config, trace.agent_name.as_deref()) {
             // session/load also ends with closeAllExcept in Pi. Cancellation
             // must not let that late completion race the next queued review.
@@ -2658,6 +2749,7 @@ async fn run_supervised_acp_chat_turn(
                 result = loading => result,
             }
         };
+        drop(index_guard);
         let loaded = match loaded {
             Ok(Ok(loaded)) => loaded,
             Ok(Err(error)) => {
@@ -2697,7 +2789,7 @@ async fn run_supervised_acp_chat_turn(
                 "ACP session history replay did not settle before the chat turn".to_string(),
             ));
         }
-        if let Err(error) = handler.reset_for_next_turn(None, Some(events)) {
+        if let Err(error) = handler.reset_for_next_turn(None, live_events.clone()) {
             close_acp_session(conn, multiplex, &session_id).await;
             return Err(error);
         }
@@ -2718,7 +2810,7 @@ async fn run_supervised_acp_chat_turn(
             return Err(error);
         }
         // create_acp_session already configured the review model and tool access.
-        if let Err(error) = handler.reset_for_next_turn(None, Some(events)) {
+        if let Err(error) = handler.reset_for_next_turn(None, live_events) {
             close_acp_session(conn, multiplex, &session_id).await;
             return Err(error);
         }
@@ -2730,6 +2822,9 @@ async fn run_supervised_acp_chat_turn(
         .insert(request_id.to_string(), session_id.clone());
     handler.send_chat_event(AcpChatEvent::SessionStarted(session_id.to_string()));
     let (prompt, turn_label) = continuation_prompt(kind, &user_prompt);
+    let prompt = output
+        .as_ref()
+        .map_or_else(|| prompt.clone(), |output| output.prompt(&prompt));
     let turn = tokio::select! {
         _ = cancellation.changed() => {
             let _ = cancel_acp_prompt(config, conn, session_id.clone()).await;
@@ -2759,7 +2854,13 @@ async fn run_supervised_acp_chat_turn(
     close_acp_session(conn, multiplex, &session_id).await;
     turn?;
     settled?;
-    let state = state?;
+    let mut state = state?;
+    if let Some(output) = output {
+        let written = output.read()?;
+        state.content = audit_frames(written.as_deref().unwrap_or(&state.content))?;
+        let _ = events.send(AcpChatEvent::TextDelta(state.content.clone()));
+        state.non_text_content_seen = false;
+    }
     if state.non_text_content_seen {
         return Err(ProviderError::InvalidResponse(
             "ACP chat returned unsupported non-text content".to_string(),
@@ -3438,6 +3539,21 @@ fn acp_command(config: &AcpSessionConfig) -> Command {
         .kill_on_drop(true);
     if let Some(codex_home) = &config.codex_home {
         command.env("CODEX_HOME", codex_home);
+    }
+    #[cfg(unix)]
+    if config
+        .profile
+        .as_ref()
+        .is_some_and(|profile| profile.agent_kind == AgentKind::Pi)
+    {
+        let launcher = config.cwd.join("pi-review-cli");
+        if launcher.is_file() {
+            command.env(
+                "PLANKTON_PI_PROGRAM",
+                env::var_os("PI_ACP_PI_COMMAND").unwrap_or_else(|| "pi".into()),
+            );
+            command.env("PI_ACP_PI_COMMAND", launcher);
+        }
     }
     // Plankton can be launched by an AI desktop host. Its internal CODEX_* variables describe
     // the parent host session and must not leak into the independent approval reviewer.
@@ -5264,6 +5380,37 @@ for line in sys.stdin:
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn independent_pi_workers_overlap_and_cancel_without_affecting_each_other() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut first = SupervisorHarness::start(true, None).await;
+                let mut second = SupervisorHarness::start(true, None).await;
+                let mut first_result = first.prompt("cancel-this");
+                let mut second_result = second.prompt("keep-this");
+                tokio::join!(
+                    first.until(|| first.prompts.get() == 1),
+                    second.until(|| second.prompts.get() == 1)
+                );
+                assert!(
+                    first_result.try_recv().is_err(),
+                    "first prompt is still running"
+                );
+                assert!(
+                    second_result.try_recv().is_err(),
+                    "second prompt is running concurrently"
+                );
+                first.cancel("cancel-this");
+                assert!(first_result.await.unwrap().is_err());
+                assert!(second_result.await.unwrap().is_ok());
+                assert_eq!(first.max_in_flight.get(), 1);
+                assert_eq!(second.max_in_flight.get(), 1);
+                first.stop().await;
+                second.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn pi_supervisor_serializes_staged_audit_repair_and_loaded_chat_without_prewarming() {
         tokio::task::LocalSet::new()
             .run_until(async {
@@ -6056,7 +6203,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn pi_workspace_suppresses_only_the_adapter_banner() {
+    fn pi_workspace_preserves_settings_and_prepares_a_quiet_review_cli() {
         let workspace = tempfile::tempdir().expect("workspace");
         prepare_pi_workspace(workspace.path()).expect("prepare Pi");
         let path = workspace.path().join(".pi/settings.json");
@@ -6065,6 +6212,17 @@ for line in sys.stdin:
         assert_eq!(value, serde_json::json!({"quietStartup": true}));
         prepare_pi_workspace(workspace.path()).expect("idempotent refresh");
         assert!(path.is_file());
+        #[cfg(unix)]
+        {
+            let output = std::process::Command::new(workspace.path().join("pi-review-cli"))
+                .env("PLANKTON_PI_PROGRAM", "/bin/echo")
+                .args(["--model", "configured model", "--mode", "rpc"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(),
+                "--no-skills --no-prompt-templates --no-context-files --model configured model --mode rpc");
+        }
     }
 
     #[test]

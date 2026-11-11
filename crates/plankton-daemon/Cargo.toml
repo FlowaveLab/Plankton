@@ -25,6 +25,7 @@ uuid.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 plankton-client = { path = "../plankton-client" }
 reqwest.workspace = true
 tempfile = "3.13"

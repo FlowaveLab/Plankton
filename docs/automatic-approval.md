@@ -2,6 +2,12 @@
 
 ## Execution and latency
 
+Queued evaluations wait for a fixed one-second collection window starting at the first arrival. Later arrivals do not move the deadline. ACP requests collected in that window are split into batches of at most eight, with at most two evaluation batches running concurrently. Each request keeps its original ID, credential policy, execution context and independent database decision. Requests arriving after dispatch belong to another batch; the system does not predict future credential calls.
+
+An ACP batch uses one model turn containing every collected request and a result keyed by exact request ID. Identical captured source bodies are transmitted once by SHA-256 reference, retaining each request's source identity and binding metadata. Missing, duplicate or unknown IDs invalidate the whole batch. Invalid evidence or a disabled outcome invalidates the affected entry. Each accepted entry still passes the existing local uncertainty and exposure-policy guards, and concurrent human decisions retain precedence. Concise citations are returned with the decision; the host resolves exact quotes from the captured bytes. Missing detailed node annotations are marked partial; no mandatory second audit turn runs for a batch. A batch is not a grant covering a command's future requests.
+
+Single-request and non-ACP evaluations retain the two-phase behavior below.
+
 The decision turn performs any investigation needed for approval, then returns a compact JSON decision. The daemon applies local validation and policy routing as soon as `DecisionReady` arrives. It does not wait for node explanations, evidence highlighting, audit validation, or audit repairs.
 
 The second turn writes the human-readable audit. ACP uses the exact same session ID; audit repairs reload that same ID. OpenAI-compatible and Claude API providers retain the original messages, tool calls, tool results and decision response in the same conversation. The audit cannot change the decision or the original exposure assessment. Audit failures remain visible as partial/failed audit progress and do not change the completed approval.
@@ -19,6 +25,10 @@ The human decision and `superseded` evaluation/operation states commit in one tr
 A queued evaluation will no longer start. An already running provider continues its same-session audit in the background: its suggestion and evidence are stored as advisory records, including a conflicting suggestion, without reopening approval or delaying the human response. Human override audit records identify the previous evaluation state.
 
 ## Tools and evidence
+
+All ACP CLI adapters use a request-local `result.json` channel. The agent writes the requested JSON with its normal file tool; progress commentary remains audit evidence and is not mixed into the result. Audit frames may be a pretty-printed JSON array. If no file was written, the legacy text channel remains available; a malformed written file never falls back to an unrelated chat answer. Strict JSON inside one unambiguous fenced block also parses locally, without another model turn.
+
+Pi retains the configured CLI, model, extensions and credentials. Two isolated ACP workers allow parallel review while each Pi process serializes its own sessions; session creation/loading is synchronized across workers because the adapter's shared session index is not transactional. On Unix, Plankton generates an internal CLI launcher that disables automatic skill, prompt-template and context-file discovery for review. No additional user configuration or separate SDK runner is required. This is process/session isolation, not a filesystem security boundary.
 
 The reviewer may use every available agent tool. Plankton does not restrict reviewer filesystem paths or command types. ACP advertises file reads and writes, permits tool permission requests, and requires the Codex agent to advertise `agent-full-access` (or the compatible `full-access` ID). It verifies the configuration response before reviewing; missing or unconfirmed full access fails explicitly, with no fallback to restricted `auto` mode. API providers expose unrestricted file reads/writes and `run_command`, which can invoke installed tools and network clients. Output-size, transport timeout, and tool-loop budgets are resource controls, not operation approval rules.
 
@@ -70,7 +80,7 @@ All listed batch resources share one conservative exposure report covering the u
 
 The request list and detail prioritize the recorded collection, item, field and request intent. Resource URIs and request IDs remain in expandable details. Related requests are loaded independently of status filters, search and history pagination, using explicit source links or the same semantic context and correlation window; each decision and its evidence remain separate.
 
-Batch tickets reuse already completed source decisions; they do not coalesce simultaneous in-flight model evaluations. The human approval button decides the selected request only. This is distinct from one model response containing multiple resource decisions.
+Legacy batch tickets reuse already completed source decisions. The one-second collection window described above separately coalesces queued ACP evaluations using explicit request IDs; it does not issue an open-ended ticket. The human approval button decides the selected request only.
 
 ## Verification
 
