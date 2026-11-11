@@ -551,11 +551,46 @@ fn resolve_preset_command(profile: &AcpProfile) -> Result<ResolvedAcpCommand, Pr
     args.extend(trailing_args);
 
     Ok(ResolvedAcpCommand {
-        program: resolve_npx_program()?,
+        program: if profile.agent_kind == AgentKind::Pi {
+            resolve_pi_npx_program(executable_search_directories())?
+        } else {
+            resolve_npx_program()?
+        },
         args,
         package_name: Some(package_name.to_string()),
         package_version,
     })
+}
+
+fn resolve_pi_npx_program(directories: Vec<PathBuf>) -> Result<String, ProviderError> {
+    // Pi 1.x needs Node >=22.19 (including Zstandard response decompression).
+    // A desktop app can inherit an older build-time Node ahead of a working
+    // system installation. Keep npx and its shebang runtime together; acp_command
+    // puts this directory first for both the adapter and its Pi child.
+    for directory in directories {
+        let node = executable_candidates(&directory, "node")
+            .into_iter()
+            .find(|path| is_executable_file(path));
+        let npx = executable_candidates(&directory, ACP_DEFAULT_PROGRAM)
+            .into_iter()
+            .find(|path| is_executable_file(path));
+        let (Some(node), Some(npx)) = (node, npx) else {
+            continue;
+        };
+        let Ok(output) = StdCommand::new(node).arg("--version").output() else {
+            continue;
+        };
+        let version = String::from_utf8_lossy(&output.stdout);
+        if output.status.success()
+            && Version::parse(version.trim().trim_start_matches('v'))
+                .is_ok_and(|version| version >= Version::new(22, 19, 0))
+        {
+            return Ok(npx.to_string_lossy().into_owned());
+        }
+    }
+    Err(ProviderError::Config(
+        "Pi requires Node.js >=22.19 with npx; no compatible installation was found in PATH, Homebrew, or nvm".into(),
+    ))
 }
 
 fn resolve_npx_program() -> Result<String, ProviderError> {
@@ -2477,7 +2512,7 @@ async fn run_supervised_acp_staged_prompt(
         let mut state = enrichment_state?;
         let mut trace = trace;
         trace.audit_events = raw_client_events(&state);
-        let written = output.expect("checked output directory").read()?;
+        let written = output.expect("checked output directory").read_audit()?;
         let content = written.as_deref().unwrap_or(&state.content);
         state.content = audit_frames(content)?;
         let _ = enrichment_chunks.send(state.content.clone());
@@ -2856,7 +2891,7 @@ async fn run_supervised_acp_chat_turn(
     settled?;
     let mut state = state?;
     if let Some(output) = output {
-        let written = output.read()?;
+        let written = output.read_audit()?;
         state.content = audit_frames(written.as_deref().unwrap_or(&state.content))?;
         let _ = events.send(AcpChatEvent::TextDelta(state.content.clone()));
         state.non_text_content_seen = false;
@@ -6223,6 +6258,33 @@ for line in sys.stdin:
             assert_eq!(String::from_utf8(output.stdout).unwrap().trim(),
                 "--no-skills --no-prompt-templates --no-context-files --model configured model --mode rpc");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pi_runtime_skips_incompatible_build_node_and_fails_before_prompting() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let install = |name: &str, version: &str| {
+            let directory = root.path().join(name);
+            fs::create_dir(&directory).unwrap();
+            for (program, body) in [
+                ("node", format!("#!/bin/sh\necho {version}\n")),
+                ("npx", "#!/bin/sh\nexit 0\n".into()),
+            ] {
+                let path = directory.join(program);
+                fs::write(&path, body).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            directory
+        };
+        let old = install("build-node", "v22.12.0");
+        let compatible = install("system-node", "v22.19.0");
+        assert!(resolve_pi_npx_program(vec![old.clone()]).is_err());
+        assert_eq!(
+            resolve_pi_npx_program(vec![old, compatible.clone()]).unwrap(),
+            compatible.join("npx").to_string_lossy()
+        );
     }
 
     #[test]

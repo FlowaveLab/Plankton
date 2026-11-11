@@ -35,6 +35,38 @@ impl ReviewOutput {
     }
 
     pub(super) fn read(&self) -> Result<Option<String>, ProviderError> {
+        let Some(content) = self.read_content()? else {
+            return Ok(None);
+        };
+        // Decision files must be one JSON value, never several competing answers.
+        serde_json::from_str::<serde_json::Value>(&content).map_err(|error| {
+            ProviderError::InvalidResponse(format!("invalid result.json: {error}"))
+        })?;
+        Ok(Some(content))
+    }
+
+    pub(super) fn read_audit(&self) -> Result<Option<String>, ProviderError> {
+        let Some(content) = self.read_content()? else {
+            return Ok(None);
+        };
+        let frames = audit_frames(&content)?;
+        if frames.trim().is_empty() {
+            return Err(ProviderError::InvalidResponse("empty audit result".into()));
+        }
+        for line in frames.lines().filter(|line| !line.trim().is_empty()) {
+            let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+                ProviderError::InvalidResponse(format!("invalid audit result: {error}"))
+            })?;
+            if !value.is_object() {
+                return Err(ProviderError::InvalidResponse(
+                    "audit frames must be objects".into(),
+                ));
+            }
+        }
+        Ok(Some(frames))
+    }
+
+    fn read_content(&self) -> Result<Option<String>, ProviderError> {
         let path = self.directory.path().join("result.json");
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -61,10 +93,6 @@ impl ReviewOutput {
                 "review result exceeds 1 MiB".into(),
             ));
         }
-        // Reject malformed files instead of falling back to an unrelated answer.
-        serde_json::from_str::<serde_json::Value>(&content).map_err(|error| {
-            ProviderError::InvalidResponse(format!("invalid result.json: {error}"))
-        })?;
         Ok(Some(content))
     }
 
@@ -144,5 +172,20 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(input).unwrap()
         );
         assert!(audit_frames("[1]").is_err());
+    }
+
+    #[test]
+    fn audit_file_accepts_ndjson_without_relaxing_decision_file_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let output = ReviewOutput::new(root.path()).unwrap();
+        let path = output.directory.path().join("result.json");
+        let frames = "{\"type\":\"node\"}\n{\"type\":\"complete\"}\n";
+        fs::write(&path, frames).unwrap();
+        assert_eq!(output.read_audit().unwrap().unwrap(), frames);
+        assert!(output.read().is_err());
+        fs::write(&path, "{\"type\":\"node\"}\nmalformed").unwrap();
+        assert!(output.read_audit().is_err());
+        fs::write(&path, "[1]").unwrap();
+        assert!(output.read_audit().is_err());
     }
 }
