@@ -54,3 +54,9 @@ unicode-normalization = "0.1"
 uuid = { version = "1.8", features = ["serde", "v4"] }
 sysinfo = { version = "0.38.4", default-features = true }
 libc = "0.2"
+
+# The pinned Rust toolchain can misalign stripped proc-macro dylibs on macOS 27.
+# Keep build-time libraries loadable; shipped binaries retain their release profile.
+# https://github.com/rust-lang/rust/issues/157750
+[profile.release.build-override]
+strip = "none"
