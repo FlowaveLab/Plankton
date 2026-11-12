@@ -1,7 +1,8 @@
 ## Manage catalog metadata
 
-- To propose catalog management changes, use the metadata-only commands. Every
-  new change requires an audit reason and opens desktop confirmation:
+Use metadata-only commands with an audit reason. Changes require desktop
+confirmation unless automatic mode explicitly permits every included change.
+Exposure-policy changes always require human confirmation.
 
 ```bash
 plankton password edit production-api \
@@ -33,15 +34,17 @@ plankton password delete retired-api \
 
 - Reuse `--change-id` to aggregate several calls into one cumulative diff. The
   default `--commit async` returns after staging; `--commit sync` waits for the
-  confirmed version to finish. Query either mode explicitly:
+  confirmed version to finish. Operations appended to a pending `--change-id`
+  inherit its reason. Query either mode explicitly:
 
 ```bash
 plankton password change CHANGE_ID
 plankton password change CHANGE_ID --wait --timeout 300
 ```
 
-- `password add` never writes a password manager directly. The human confirms the exact draft in the desktop app and chooses Plankton KDBX or an enabled external backend.
-- `password create` sends an editable title, key names, destination, and suggested exposure policy. It never accepts password values from CLI arguments or stdin; the human supplies them in one aggregated desktop popup. With `--wait`, successful output contains resource IDs but no values.
+- To import selected values or ask the human to enter missing ones, use
+  `password add` / `password create` as described in [credentials](credentials.md).
+  These drafts always require human confirmation; values never return to the CLI.
 - Password management commands never return secret values. They submit metadata-only operations and return a change ID, cumulative diff, state, and optional successor change ID.
 - `move-field` and `merge` preserve resource keys while changing password-item membership. `dedupe-field` compares two existing stored values locally and refuses deletion unless they match; neither value is returned.
 - A confirmed change ID is immutable. Calls that arrive afterward are accepted under a successor change ID in the same batch instead of being rejected.

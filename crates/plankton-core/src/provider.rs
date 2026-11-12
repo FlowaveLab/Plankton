@@ -2656,9 +2656,9 @@ fn append_context_guidance(
             .is_some_and(|path| !path.trim().is_empty())
     {
         result.push_str(if locale == "zh-CN" {
-            "\n\n声明的消费脚本：本次 script_path 已加入允许读取的文件列表。即使旧模板只提到调用链内文件，也应使用已有的只读文件能力检查这个允许列表内的脚本，以核验凭据的消费方式；消费脚本声明本身不授予执行脚本或访问无关文件的权限。这是调用方声明的消费者，不是系统采集的祖先进程，也不证明实际执行或覆盖全部管道消费者。独立脚本的证据写入 chain_summary 和暴露域 summary，不得伪造调用链节点或把 source_quote 绑定到无关节点。"
+            "\n\n声明的消费脚本：使用可用工具检查 script_path，核验凭据的消费方式；不要执行消费者。文件路径标识证据来源，不是文件系统访问白名单。这是调用方声明的消费者，不是系统采集的祖先进程，也不证明实际执行或覆盖全部管道消费者。独立脚本的证据写入 chain_summary 和暴露域 summary，不得伪造调用链节点或把 source_quote 绑定到无关节点。"
         } else {
-            "\n\nDeclared consumer script: script_path is included in the allowed read files. Even if an older template mentions only call-chain files, inspect this allowlisted script with the existing read-only file capability to verify credential consumption; this declaration does not grant permission to execute it or access unrelated files. This is a caller-declared consumer, not a system-observed ancestor, proof of execution, or complete pipeline coverage. Describe independent script evidence in chain_summary and surface summaries; never invent a call-chain node or bind source_quote to an unrelated node."
+            "\n\nDeclared consumer script: inspect script_path with available tools to verify credential consumption; do not execute the consumer. File paths identify evidence, not a filesystem allowlist. This is a caller-declared consumer, not a system-observed ancestor, proof of execution, or complete pipeline coverage. Describe independent script evidence in chain_summary and surface summaries; never invent a call-chain node or bind source_quote to an unrelated node."
         });
     }
 }
@@ -2884,7 +2884,6 @@ struct StrictSuggestionPayload {
     risk_score: u8,
     #[serde(default)]
     batch_decisions: Vec<BatchResourceDecision>,
-    #[serde(default)]
     #[schemars(required, with = "CredentialExposureReport")]
     exposure_report: Option<CredentialExposureReport>,
 }
@@ -3097,15 +3096,15 @@ fn normalize_suggestion_payload(
     Ok(payload)
 }
 
-fn normalize_json_payload(content: &str) -> &str {
+pub(crate) fn normalize_json_payload(content: &str) -> &str {
     let content = content.trim();
-    if let Some(stripped) = content.strip_prefix("```json") {
-        stripped.trim().trim_end_matches("```").trim()
-    } else if let Some(stripped) = content.strip_prefix("```") {
-        stripped.trim().trim_end_matches("```").trim()
-    } else {
-        content
-    }
+    let inner = content
+        .strip_prefix("```json")
+        .or_else(|| content.strip_prefix("```"));
+    inner
+        .and_then(|inner| inner.trim().strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(content)
 }
 
 fn extract_response_request_id(response: &reqwest::Response) -> Option<String> {
@@ -3569,6 +3568,10 @@ mod tests {
             deny: true,
             escalate: true,
         });
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("exposure_report")));
         let report = &schema["properties"]["exposure_report"];
         assert!(report["properties"].get("node_assessments").is_none());
         let surfaces = &report["properties"]["surfaces"];

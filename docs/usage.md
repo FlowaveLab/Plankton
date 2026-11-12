@@ -107,7 +107,9 @@ tags, field keys and labels, sections, and metadata, with stable pagination.
 `run` always passes execution admission; Direct fields may skip the review decision but cannot skip admission. `password add` does not write a vault: it creates a single-use
 draft and opens the desktop confirmation dialog, where the human reviews the
 exact values and chooses Plankton or an explicitly enabled external backend.
-CLI metadata edits and deletions likewise stage changes for human confirmation.
+CLI metadata edits and deletions stage changes for desktop confirmation unless
+automatic mode explicitly permits every included change. Exposure-policy edits
+always require human confirmation.
 There are no CLI approve, reject, or direct password-manager write commands.
 
 If the request cannot be completed automatically, Plankton hands off to the desktop UI. Human approval, suggestion review, and audit inspection all happen there. Denial and admission failures do not execute the consumer. A consumer that exits nonzero can still return its bounded task output, with its nonzero exit code.

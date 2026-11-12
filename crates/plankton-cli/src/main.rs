@@ -59,7 +59,8 @@ const STATUS_POLL_RETRY_LIMIT: u8 = 3;
                   imports selected existing values. `password edit --human` opens a local human \
                   editor without putting values in CLI arguments or output. Other edit, \
                   `rename-field`, `edit-field`, `refresh`, and `delete` operations stage \
-                  value-free changes in the daemon and require desktop confirmation before commit."
+                  value-free changes in the daemon. They require desktop confirmation unless the configured \
+                  automatic policy covers every change; exposure-policy edits always require confirmation."
 )]
 struct Cli {
     #[arg(
@@ -304,7 +305,7 @@ enum Commands {
     )]
     Search(SearchArgs),
     #[command(
-        about = "Create password drafts or stage metadata-only catalog changes for human confirmation"
+        about = "Create human-confirmed password drafts or stage metadata-only catalog changes"
     )]
     Password(PasswordArgs),
     #[command(about = "Inspect or install Plankton's bundled agent skill")]

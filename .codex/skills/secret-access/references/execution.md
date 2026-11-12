@@ -1,7 +1,8 @@
 ## Execute a bound consumer command
 
-This requires Plankton 0.2.4 / protocol 6 or later with a matching desktop app
-and CLI. Upgrade both together within the authorized installation flow.
+Use a matching desktop app and CLI. Bound execution requires Plankton 0.2.4 /
+protocol 6 or later; multiple bindings require a version that supports `--bind`.
+Upgrade both together within the authorized installation flow.
 `get`, its `request` alias and raw-value access/status APIs are disabled, even
 for Direct fields and historical approvals: a declaration alone cannot bind a
 consumer. Catalog metadata and exposure policies remain available.
@@ -18,25 +19,14 @@ plankton run secret/api-token --env API_TOKEN \
   --requested-by agent -- python3 ./api-client.py --status
 ```
 
-When the same consumer requires several fields, name the first with `--env`
-and repeat `--bind RESOURCE=ENV` for each additional resource:
-
-```bash
-plankton run SECRET_ID --env CLS_SECRET_ID --bind SECRET_KEY=CLS_SECRET_KEY \
-  --reason "Authenticate the CLS SearchLog request to cls.tencentcloudapi.com" \
-  -- /usr/bin/python3 ./query_cls.py
-```
-
-Plankton reviews each field against its own policy and starts one consumer only
-after every field is approved. Older versions without `--bind` need a matching
-CLI and desktop upgrade. When automatic review fails, report the CLI handoff
-message to the user while the same execution waits for their desktop decision.
+For several credentials in one consumer, repeat `--bind RESOURCE=ENV` as shown
+in [SKILL.md](../SKILL.md). Each field keeps its own policy; all must pass before
+one consumer starts. A version without `--bind` requires an app and CLI upgrade.
 
 The consumer reads `os.environ["API_TOKEN"]` (or the equivalent API in its
 language), performs the authorized task and prints only non-secret results.
 Without `--env`, the daemon sends the credential to consumer stdin; use that
-mode for a consumer that reads its credential there. Keep all credential values
-out of command arguments, source, caller input, output and model context.
+mode for a consumer that reads its credential there.
 
 Named scripts, recognized inline-code forms (such as Python `-c` and Node `-e`),
 and shell `-c` wrappers can be inspected. A wrapper, environment injection or
@@ -91,17 +81,14 @@ paths resolve there. Use an explicit interpreter path for a virtual environment.
 The daemon records the recognized execution and rechecks bound file identities
 before launch. Keep these files unchanged while approval is pending.
 
-Each `run` submits once and polls the same execution. Human review opens the
-desktop flow when required. Interrupting the CLI does not cancel an execution
-already started by the daemon; do not blindly resubmit after a disconnect.
+Each `run` submits once and polls the same execution. Follow the handoff and
+disconnect guidance in [SKILL.md](../SKILL.md).
 `--timeout` bounds consumer execution to 1–300 seconds (default 60), excluding
 review and credential-read time. External credential-backend commands have a
 separate 60-second deadline and 2 MiB limit per output stream.
 
-This binds the consumer and credential handoff; it is not a sandbox. Installed
-dependencies, dynamic I/O and concurrent changes by another process under the
-same OS account are not fully isolated. Missing decision-relevant evidence must
-not be replaced with an assertion that a wrapper or filename is safe.
+Concurrent changes by another process under the same OS account are not fully
+isolated. A wrapper or filename alone is not evidence of safe credential use.
 
 Each consumer output stream is limited to 64 KiB; exceeding it stops execution
 and discards output. Filter large responses in the consumer. Literal credential

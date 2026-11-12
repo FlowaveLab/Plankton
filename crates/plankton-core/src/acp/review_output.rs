@@ -68,22 +68,24 @@ impl ReviewOutput {
 
     fn read_content(&self, response: &str) -> Result<Option<String>, ProviderError> {
         let legacy_path = self.directory.path().join("result.json");
-        let reference = serde_json::from_str::<serde_json::Value>(response.trim()).ok();
-        let reference = reference
-            .as_ref()
-            .and_then(|value| value.as_object())
-            .filter(|object| object.len() == 1)
-            .and_then(|object| object.get("result_file"));
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct FileReference {
+            result_file: String,
+        }
+        let reference = serde_json::from_str::<FileReference>(
+            crate::provider::normalize_json_payload(response),
+        )
+        .ok();
         let path = if fs::symlink_metadata(&legacy_path).is_ok() {
             legacy_path.as_path()
-        } else if let Some(reference) = reference {
-            let path = reference
-                .as_str()
-                .map(Path::new)
-                .filter(|path| path.is_absolute())
-                .ok_or_else(|| {
-                    ProviderError::InvalidResponse("result_file must be an absolute path".into())
-                })?;
+        } else if let Some(reference) = &reference {
+            let path = Path::new(&reference.result_file);
+            if !path.is_absolute() {
+                return Err(ProviderError::InvalidResponse(
+                    "result_file must be an absolute path".into(),
+                ));
+            }
             path
         } else {
             return Ok(None);
@@ -91,7 +93,7 @@ impl ReviewOutput {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) => {
-                return Err(ProviderError::Transport(format!(
+                return Err(ProviderError::InvalidResponse(format!(
                     "read review result: {error}"
                 )))
             }
@@ -174,12 +176,32 @@ mod tests {
         assert!(output.read(r#"{"reviews":[]}"#).unwrap().is_none());
         let path = root.path().join("chosen-result.json");
         let reference = serde_json::json!({"result_file":path}).to_string();
-        assert!(output.read(&reference).is_err());
+        assert!(matches!(
+            output.read(&reference),
+            Err(ProviderError::InvalidResponse(_))
+        ));
         fs::write(&path, r#"{"reviews":[]}"#).unwrap();
         assert_eq!(
             output.read(&reference).unwrap().unwrap(),
             r#"{"reviews":[]}"#
         );
+        assert_eq!(
+            output
+                .read(&format!("```json\n{reference}\n```"))
+                .unwrap()
+                .unwrap(),
+            r#"{"reviews":[]}"#
+        );
+        assert!(output
+            .read(&format!("```json\n{reference}"))
+            .unwrap()
+            .is_none());
+        let duplicate = format!(
+            "{{\"result_file\":{},\"result_file\":{}}}",
+            serde_json::to_string(&path).unwrap(),
+            serde_json::to_string(&path).unwrap()
+        );
+        assert!(output.read(&duplicate).unwrap().is_none());
         fs::write(&path, "not JSON").unwrap();
         assert!(output.read(&reference).is_err());
         assert!(output.read(r#"{"result_file":"relative.json"}"#).is_err());

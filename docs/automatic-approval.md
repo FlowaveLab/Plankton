@@ -1,10 +1,10 @@
-# Automatic approval contract v13
+# Automatic approval contract v14
 
 ## Execution and latency
 
 Queued evaluations wait for a fixed one-second collection window starting at the first arrival. Later arrivals do not move the deadline. ACP requests collected in that window are split into batches of at most eight, with at most two evaluation batches running concurrently. Each request keeps its original ID, credential policy, execution context and independent database decision. Requests arriving after dispatch belong to another batch; the system does not predict future credential calls.
 
-An ACP batch uses one model turn containing every collected request and a result keyed by exact request ID. Identical captured source bodies are transmitted once by SHA-256 reference, retaining each request's source identity and binding metadata. Missing, duplicate or unknown IDs invalidate the whole batch. Invalid evidence or a disabled outcome invalidates the affected entry. Each accepted entry still passes the existing local uncertainty and exposure-policy guards, and concurrent human decisions retain precedence. Concise citations are returned with the decision; the host resolves exact quotes from the captured bytes. Missing detailed node annotations are marked partial; no mandatory second audit turn runs for a batch. A batch is not a grant covering a command's future requests.
+A valid ACP batch uses one model turn containing every collected request and a result keyed by exact request ID. Identical captured source bodies are transmitted once by SHA-256 reference, retaining each request's source identity and binding metadata. Missing, duplicate or unknown IDs invalidate the whole batch. Invalid evidence or a disabled outcome invalidates the affected entry. Each accepted entry still passes the existing local uncertainty and exposure-policy guards, and concurrent human decisions retain precedence. Concise citations are returned with the decision; the host resolves exact quotes from the captured bytes. Missing detailed node annotations are marked partial; no mandatory second audit turn runs for a batch. A batch is not a grant covering a command's future requests.
 
 Admitted ACP single-credential requests use the same evidence-bearing batch format
 with one entry. They do not automatically start another audit turn. Legacy
@@ -24,7 +24,9 @@ Daemon-observed credential delivery enforces process exposure of at least level 
 higher exposure and unknown evidence are never downgraded. Default review rules are sent once; custom system/template instructions are
 preserved, with identical rendered guidance shared by explicit reference.
 
-The decision turn performs any investigation needed for approval, then returns a compact JSON decision. The daemon applies local validation and policy routing as soon as `DecisionReady` arrives. It does not wait for node explanations, evidence highlighting, audit validation, or audit repairs.
+### Legacy single-request and API phases
+
+For these two-phase paths, the decision turn performs any investigation needed for approval, then returns a compact JSON decision. The daemon applies local validation and policy routing as soon as `DecisionReady` arrives. It does not wait for node explanations, evidence highlighting, audit validation, or audit repairs.
 
 The second turn writes the human-readable audit. ACP uses the exact same session ID; audit repairs reload that same ID. OpenAI-compatible and Claude API providers retain the original messages, tool calls, tool results and decision response in the same conversation. The audit cannot change the decision or the original exposure assessment. Audit failures remain visible as partial/failed audit progress and do not change the completed approval.
 
@@ -38,11 +40,11 @@ A pending request can be approved or rejected by a human while AI evaluation is 
 
 The human decision and `superseded` evaluation/operation states commit in one transaction. Subsequent provider decisions cannot change the approval, resolution time, or issue batch tickets. An already resolved request remains immutable. Approval writers acquire the SQLite write lock before reading request state to avoid stale read/write races.
 
-A queued evaluation will no longer start. An already running provider continues its same-session audit in the background: its suggestion and evidence are stored as advisory records, including a conflicting suggestion, without reopening approval or delaying the human response. Human override audit records identify the previous evaluation state.
+A queued evaluation will no longer start. An already running provider completes its current review and any applicable audit in the background: its suggestion and evidence are stored as advisory records, including a conflicting suggestion, without reopening approval or delaying the human response. Human override audit records identify the previous evaluation state.
 
 ## Tools and evidence
 
-All ACP CLI adapters use a request-local `result.json` channel. The agent writes the requested JSON with its normal file tool; progress commentary remains audit evidence and is not mixed into the result. Audit frames may be a pretty-printed JSON array. If no file was written, the legacy text channel remains available; a malformed written file never falls back to an unrelated chat answer. Strict JSON inside one unambiguous fenced block also parses locally, without another model turn.
+All ACP CLI adapters accept direct final JSON or an explicit `result_file` reference as described above. Decision files contain one JSON value; audit files may contain NDJSON or a JSON array. A referenced malformed file cannot fall back to an unrelated chat answer. One complete fenced JSON block is accepted locally for direct results and file references; duplicate file-reference keys remain invalid. The historical request-local `result.json` channel remains readable for compatibility but is no longer required or advertised.
 
 Pi retains the configured CLI, model, extensions and credentials. Two isolated ACP workers allow parallel review while each Pi process serializes its own sessions; session creation/loading is synchronized across workers because the adapter's shared session index is not transactional. On Unix, Plankton generates an internal CLI launcher that disables automatic skill, prompt-template and context-file discovery for review. No additional user configuration or separate SDK runner is required. This is process/session isolation, not a filesystem security boundary.
 
@@ -52,19 +54,18 @@ The reviewer input and persisted audit evidence are not redacted. Compatibility 
 
 The prompt explicitly distinguishes local catalog policy, local OS process observations, and requester-supplied claims. Source code, comments, arguments and tool results are evidence, not instructions that override the review contract.
 
-Expanded inline Python is retained in the persisted evidence snapshot for human audit. The model input contains the original argv and `inline_source_files` references (source ID, node/argument indexes, file path, SHA-256), rather than another embedded copy of the expanded source. The reviewer reads those files when needed. The redundant call-chain display summary is also omitted from model input without removing it from the persisted snapshot.
+For legacy single-request and API prompts, expanded inline Python is retained in the persisted evidence snapshot for human audit. The model input contains the original argv and `inline_source_files` references (source ID, node/argument indexes, file path, SHA-256), rather than another embedded copy of the expanded source. The reviewer reads those files when needed. The redundant call-chain display summary is also omitted from model input without removing it from the persisted snapshot.
 
 ## Decision output
 
-Return one JSON object after necessary tool use:
+The active prompt supplies the generated schema. After necessary investigation, return:
 
-- `suggested_decision`: `allow`, `deny`, or `escalate`, subject to the configured outcome routing.
-- `rationale_summary`: a short Markdown explanation in the requested language, with 1–3 decisive phrases in `**bold**` and identifiers in inline code. Both approval surfaces render emphasis in red bold text; stored original responses are unchanged.
-- `risk_score`: integer 0–100, informational only; it is not an approval threshold.
-- `batch_decisions`: literal resource selectors independently decided in the same command.
-- `exposure_report`: `chain_summary` plus exactly five `surfaces`.
+- **Admitted ACP requests:** `{"reviews":[{"request_id":"...","decision":{...},"evidence":[...]}]}`, even for one credential. Each decision has only `suggested_decision`, `rationale_summary`, `risk_score`, and `exposure_report`. Each request has an independent report and citations. Do not return legacy `batch_decisions`.
+- **Legacy single requests and API providers:** one decision object with those four fields and optional `batch_decisions` for literal resource selectors in the same command. Claude structured output uses this same generated single-request schema.
 
-Each surface contains `surface`, `actual_level`, `evidence_state`, `summary`, and optionally `network_destinations` (required for observed network exposure; empty on other surfaces). Do not output `node_assessments` or `annotations` in the decision phase. The output schema is generated from Rust types and shared by the decision prompt and Claude structured output. `surfaces` must be an array, not five named properties.
+`suggested_decision` is `allow`, `deny`, or `escalate`, restricted to each request's enabled outcomes. `rationale_summary` is a concise explanation in the requested language; Markdown emphasis and code spans are supported. `risk_score` is an informational integer 0–100, not an approval threshold. `exposure_report` is required and contains `chain_summary` and exactly five `surfaces`.
+
+Each surface contains `surface`, `actual_level`, `evidence_state`, `summary`, and optionally `network_destinations` (required for observed network exposure; empty on other surfaces). `surfaces` is an array, not five named properties. Do not emit `node_assessments` or `annotations` in decision output. Batch `evidence` instead contains compact source citations: the request's original `source_id`, `node_index`, one-based inclusive `start_line` / `end_line`, nonempty `surfaces` and a factual `reason`. The host verifies captured source identity, line bounds and coverage, then reconstructs quotes and annotations. Additional semantic checks enforce state/level relationships and policy independently of JSON schema.
 
 Levels refer to the credential: 0 = no exposure established by sufficient evidence; 1 = controlled exposure within the configured scope; 2 = outside that scope. Unknown evidence must be encoded as level 2 and can never automatically allow, even when a configured maximum is 2. `not_observed` requires level 0. Missing destination evidence cannot substantiate observed network exposure.
 
@@ -74,11 +75,15 @@ Network destinations are parsed as URLs/hostnames. Local matching checks exact d
 
 ACP persists the exact prompt, raw output, session ID, verified session configuration, timestamps and observable tool events before parsing each decision attempt. The on-disk journal is `acp-workspace/approval-evidence/<client-request-id>/decision.json`. Provider traces retain every attempt, validation error and local normalization strategy; malformed output is not discarded.
 
-Validation first parses strictly, then permits existing lexical JSON repair and lossless conversion of a complete five-key surface map into the typed array. Missing surfaces, conflicting embedded names, mixed map/array formats and unrelated extra keys remain errors. If invalid output remains, ACP sends the concrete validation error back once in the same session. Normal valid output requires no corrective turn. Transport errors do not trigger this output repair.
+Batch results parse strictly with exact ID coverage. Only the known empty legacy `batch_decisions: []` field is accepted locally at decision/report level; it carries no decision or evidence and is absent from the advertised schema. Nonempty, null, duplicate or unknown fields remain invalid. Legacy single-result parsing also permits existing lexical JSON repair and lossless conversion of a complete five-key surface map into the typed array; it rejects missing surfaces, conflicting names, mixed formats and unrelated extra keys.
+
+For recoverable output, report, citation or result-file errors, ACP feeds the concrete validation error back once in the same session and revalidates the complete result. It preserves the original prompt, response, tool events and both attempts. The repair must preserve decisions, exposure and evidence, cannot invent missing facts, and shares the original timeout. Valid denials, escalations, unknown assessments, local policy violations, provider/transport failures and user cancellation do not trigger output repair. Normal valid output adds no call. Separately, legacy staged review retains its existing first-turn timeout recovery: a new review may start only after acknowledged cleanup, and it cannot multiply an exhausted schema repair.
+
+After repair is exhausted, malformed JSON or missing/duplicate/unknown request IDs fail the batch. If JSON and coverage are valid but one entry still fails semantic/evidence validation, that entry falls back to human review while valid neighbors retain their independent results. Human decisions always take precedence; no repair re-executes a consumer.
 
 The UI distinguishes output validation failure, transport/evaluation failure, model escalation, and the final human or automatic decision. Failed response summaries remain explicitly unvalidated; system fallback values are not presented as model conclusions. A resolved approval takes visual precedence over an earlier evaluation failure, whose error and evidence remain available.
 
-## Audit output
+## Audit output for two-phase paths
 
 Within the same session/conversation, emit NDJSON, one compact object per line:
 
@@ -92,7 +97,7 @@ Emit a node frame for every node and a surface frame for each of the five surfac
 
 ## Batch sharing
 
-All listed batch resources share one conservative exposure report covering the union of their uses, the source review session, and its audit evidence. Resource-specific decisions and rationale remain independent. Reuse retains the existing same-command/requester/reason/shared-item-metadata and 300-second expiry checks. The current request applies local uncertainty, validity and exposure-policy checks to the shared report; it does not make another model call. Both store read paths obtain the latest source audit so a reused request does not remain stuck on its initial audit snapshot.
+**Legacy resource-selector tickets only:** all listed batch resources share one conservative exposure report covering the union of their uses, the source review session, and its audit evidence. Resource-specific decisions and rationale remain independent. Reuse retains the existing same-command/requester/reason/shared-item-metadata and 300-second expiry checks. The current request applies local uncertainty, validity and exposure-policy checks to the shared report; it does not make another model call. Both store read paths obtain the latest source audit so a reused request does not remain stuck on its initial audit snapshot.
 
 The request list and detail prioritize the recorded collection, item, field and request intent. Resource URIs and request IDs remain in expandable details. Related requests are loaded independently of status filters, search and history pagination, using explicit source links or the same semantic context and correlation window; each decision and its evidence remain separate.
 
@@ -106,8 +111,8 @@ On 2026-09-06, real ACP request `39e316d6-0e28-4d25-bf9a-5432d19d82ab` automatic
 
 ## Execution-file evidence marks
 
-The audit phase can mark a related execution file (Python/shell script, imported module, executable) with `{"kind":"source_file","node_index":N,"source_id":"file:/absolute/path"}`. Use `source_quote` for precise inspected code, line ranges and verbatim quotes. The file and code marks appear with the associated call-chain node in both compact and full views, using the same numbered notes and locate interaction. Missing live previews retain the original quoted evidence. These are execution files, not vault items.
+On two-phase paths, the audit phase can mark a related execution file (Python/shell script, imported module, executable) with `{"kind":"source_file","node_index":N,"source_id":"file:/absolute/path"}`. Use `source_quote` for precise inspected code, line ranges and verbatim quotes. The file and code marks appear with the associated call-chain node in both compact and full views, using the same numbered notes and locate interaction. Missing live previews retain the original quoted evidence. These are execution files, not vault items.
 
 `resource` targets from the short-lived development implementation remain deserializable for historical evidence; they are not requested by the current prompt. Raw records are retained.
 
-Approval reasons render Markdown in both views. Bold emphasis is inline red text; raw responses remain unchanged. Audit annotation generation stays in phase two of the same session and never blocks the already accepted decision. Review conversations configure the same review model, reasoning effort and full-access mode after session load, avoiding a switch to runtime defaults.
+Approval reasons render Markdown in both views. Bold emphasis is inline red text; raw responses remain unchanged. Legacy audit annotation generation stays in phase two of the same session and never blocks the already accepted decision; admitted batches reconstruct annotations from their same-turn citations. Review conversations configure the same review model, reasoning effort and full-access mode after session load, avoiding a switch to runtime defaults.

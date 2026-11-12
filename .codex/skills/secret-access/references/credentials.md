@@ -52,8 +52,8 @@ plankton password create \
 ```
 
   The human enters every value in Plankton and confirms the save. `--wait`
-  returns only the saved resource IDs. After it succeeds, request only the
-  resource needed by the consumer with `plankton run` below. Creation
+  returns only the saved resource IDs. After it succeeds, bind the required
+  resources in one `plankton run` for the consumer. Creation
   confirmation is not execution approval: every later `run` still receives its
   normal policy decision or human approval.
 
@@ -95,9 +95,9 @@ plankton password edit-field secret/api-token \
 Exposure flags on `edit-field` replace the whole exposure profile, with omitted
 options returning to defaults. Inspect the current field policy in Plankton and
 preserve its other intended domains, levels, and notes. Reuse `--change-id` when
-proposing changes to several fields. `password add` support varies by installed
-version; inspect its help before using exposure flags, or set the profile in the
-import dialog / propose `edit-field` after import. No secret value is needed.
+proposing changes to several fields. If an older CLI lacks import exposure
+flags, set the profile in the import dialog or propose `edit-field` afterward.
+No secret value is needed.
 
 Policy confirmation can remove repeat human approvals for matching, sufficiently
 evidenced requests that pass execution admission. New destinations, policy

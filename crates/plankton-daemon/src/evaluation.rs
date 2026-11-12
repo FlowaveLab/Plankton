@@ -554,13 +554,21 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn production_batch_uses_one_cli_turn_and_preserves_independent_database_results() {
+    async fn production_batch_repairs_once_and_preserves_independent_database_results() {
         for mode in [
             "complete",
             "direct",
             "missing",
             "single-file",
             "single-direct",
+            "misplaced-empty",
+            "repair-direct",
+            "repair-file",
+            "partial-invalid",
+            "missing-file",
+            "transport",
+            "empty-direct",
+            "unknown",
         ] {
             let temp = tempdir().unwrap();
             let script = temp.path().join("batch_acp.py");
@@ -627,31 +635,79 @@ mod tests {
             .await
             .unwrap();
             let calls = std::fs::read_to_string(log).unwrap();
-            assert_eq!(
-                calls.lines().count(),
-                1,
-                "admitted approvals use one CLI prompt, with no repair or audit turn"
-            );
-            let ids: Vec<String> = serde_json::from_str(calls.trim()).unwrap();
-            assert_eq!(
-                ids,
-                requests
-                    .iter()
-                    .map(|request| request.id.clone())
-                    .collect::<Vec<_>>()
-            );
-            if mode != "missing" {
+            let expected_calls = if matches!(
+                mode,
+                "missing" | "partial-invalid" | "missing-file" | "empty-direct"
+            ) || mode.starts_with("repair")
+            {
+                2
+            } else {
+                1
+            };
+            let calls: Vec<serde_json::Value> = calls
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(calls.len(), expected_calls, "{mode}");
+            for (index, call) in calls.iter().enumerate() {
+                assert_eq!(
+                    call["ids"],
+                    serde_json::json!(requests
+                        .iter()
+                        .map(|request| request.id.clone())
+                        .collect::<Vec<_>>())
+                );
+                assert_eq!(
+                    call["session"], calls[0]["session"],
+                    "repair must reuse the session"
+                );
+                assert_eq!(call["repair"], index > 0);
+            }
+            for request in &finished {
+                let trace = request
+                    .llm_suggestion
+                    .as_ref()
+                    .unwrap()
+                    .provider_trace
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(
+                    trace.decision_attempts.len(),
+                    expected_calls,
+                    "{mode}: audit attempts"
+                );
+                if expected_calls == 2 {
+                    assert!(trace.decision_attempts[0].validation_error.is_some());
+                    assert!(
+                        mode == "empty-direct"
+                            || !trace.decision_attempts[0].raw_response.is_empty()
+                    );
+                }
+            }
+            if !matches!(mode, "missing" | "transport" | "empty-direct") {
                 assert_eq!(
                     finished[0].approval_status,
                     plankton_core::ApprovalStatus::Approved,
                     "{mode}: {:?}",
                     finished[0].llm_suggestion
                 );
-                if finished.len() == 2 {
+                if mode == "partial-invalid" {
                     assert_eq!(
                         finished[1].approval_status,
-                        plankton_core::ApprovalStatus::Rejected
+                        plankton_core::ApprovalStatus::Pending
                     );
+                    assert!(finished[1].llm_suggestion.as_ref().unwrap().error.is_some());
+                } else if finished.len() == 2 {
+                    assert_eq!(
+                        finished[1].approval_status,
+                        if mode == "unknown" {
+                            plankton_core::ApprovalStatus::Pending
+                        } else {
+                            plankton_core::ApprovalStatus::Rejected
+                        },
+                        "{mode}"
+                    );
+                    assert!(finished[1].llm_suggestion.as_ref().unwrap().error.is_none());
                     assert_eq!(
                         finished[0]
                             .llm_suggestion
@@ -677,12 +733,14 @@ mod tests {
                         request.approval_status,
                         plankton_core::ApprovalStatus::Approved
                     );
-                    assert!(request
-                        .llm_suggestion
-                        .unwrap()
-                        .error
-                        .unwrap()
-                        .contains("omitted"));
+                    let error = request.llm_suggestion.unwrap().error.unwrap();
+                    let expected = match mode {
+                        "missing" => "omitted",
+                        "transport" => "fixture provider unavailable",
+                        "empty-direct" => "did not include any message content",
+                        _ => unreachable!(),
+                    };
+                    assert!(error.to_lowercase().contains(expected), "{mode}: {error}");
                 }
             }
             worker.shutdown().await.unwrap();

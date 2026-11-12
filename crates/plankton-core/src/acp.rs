@@ -40,6 +40,8 @@ pub const ACP_TRANSPORT_STDIO: &str = "stdio";
 const CODEX_ACP_PACKAGE: &str = "@agentclientprotocol/codex-acp";
 const LEGACY_CODEX_ACP_PACKAGE: &str = "@zed-industries/codex-acp";
 const ACP_READINESS_PROMPT: &str = "Reply with exactly READY (five uppercase letters), without punctuation, markdown, or any other text.";
+pub(crate) type AcpReviewValidator =
+    Arc<dyn Fn(&str) -> Result<crate::JsonRepairStrategy, ProviderError> + Send + Sync>;
 const ACP_STDERR_BUFFER_BYTES: usize = 8 * 1024;
 const ACP_STDERR_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const ACP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -1073,6 +1075,22 @@ impl AcpSessionClient {
             .await
     }
 
+    pub(crate) async fn prompt_validated_review_with_files(
+        &self,
+        prompt: String,
+        allowed_read_files: Vec<String>,
+        validator: AcpReviewValidator,
+    ) -> Result<AcpPromptResult, ProviderError> {
+        acp_supervisor_request(
+            self.config.clone(),
+            prompt,
+            allowed_read_files,
+            true,
+            Some(validator),
+        )
+        .await
+    }
+
     pub async fn prompt_json_review_staged_with_files(
         &self,
         decision_prompt: String,
@@ -1131,6 +1149,7 @@ impl AcpSessionClient {
             prompt,
             allowed_read_files,
             review_workspace_enabled,
+            None,
         )
         .await
     }
@@ -1198,6 +1217,7 @@ enum AcpSupervisorCommand {
         prompt: String,
         allowed_read_files: Vec<String>,
         review_workspace_enabled: bool,
+        validator: Option<AcpReviewValidator>,
         response: oneshot::Sender<Result<AcpPromptResult, ProviderError>>,
     },
     StagedPrompt {
@@ -1278,6 +1298,7 @@ enum PendingAcpReview {
         prompt: String,
         allowed_read_files: Vec<String>,
         review_workspace_enabled: bool,
+        validator: Option<AcpReviewValidator>,
         response: oneshot::Sender<Result<AcpPromptResult, ProviderError>>,
     },
     StagedPrompt {
@@ -1388,6 +1409,7 @@ async fn acp_supervisor_request(
     prompt: String,
     allowed_read_files: Vec<String>,
     review_workspace_enabled: bool,
+    validator: Option<AcpReviewValidator>,
 ) -> Result<AcpPromptResult, ProviderError> {
     let commands = acp_supervisor_commands(&config)?;
     let request_id = Uuid::new_v4().to_string();
@@ -1398,6 +1420,7 @@ async fn acp_supervisor_request(
             prompt,
             allowed_read_files,
             review_workspace_enabled,
+            validator,
             response,
         })
         .map_err(|_| ProviderError::Transport("ACP supervisor stopped".to_string()))?;
@@ -1791,6 +1814,7 @@ async fn supervise_acp_connection(
                 prompt,
                 allowed_read_files,
                 review_workspace_enabled,
+                validator,
                 response,
             } => {
                 let review = PendingAcpReview::Prompt {
@@ -1798,6 +1822,7 @@ async fn supervise_acp_connection(
                     prompt,
                     allowed_read_files,
                     review_workspace_enabled,
+                    validator,
                     response,
                 };
                 let prepared = idle_session.take();
@@ -2083,6 +2108,7 @@ fn spawn_pending_acp_review(
             prompt,
             allowed_read_files,
             review_workspace_enabled,
+            validator,
             response,
             ..
         } => {
@@ -2096,6 +2122,7 @@ fn spawn_pending_acp_review(
                     prompt,
                     allowed_read_files,
                     review_workspace_enabled,
+                    validator,
                     provider_model,
                     trace,
                     &task_active,
@@ -2280,12 +2307,13 @@ async fn run_supervised_acp_prompt(
     mut prompt: String,
     allowed_read_files: Vec<String>,
     review_workspace_enabled: bool,
+    validator: Option<AcpReviewValidator>,
     provider_model: Option<String>,
     mut trace: ProviderTrace,
     active_sessions: &Rc<RefCell<HashMap<String, acp::SessionId>>>,
     mut cancellation: watch::Receiver<bool>,
 ) -> Result<AcpPromptResult, ProviderError> {
-    let output = review_workspace_enabled
+    let output = (review_workspace_enabled && validator.is_none())
         .then(|| ReviewOutput::new(&config.cwd))
         .transpose()?;
     if review_workspace_enabled {
@@ -2327,23 +2355,29 @@ async fn run_supervised_acp_prompt(
             "ACP review was cancelled before prompting".to_string(),
         ));
     }
-    let mut protocol_stream = conn.subscribe();
+    if let Some(validator) = validator {
+        let result = run_acp_decision_with_repair(
+            config,
+            conn,
+            &handler,
+            &session,
+            request_id,
+            prompt,
+            provider_model,
+            trace,
+            &mut cancellation,
+            Some(&validator),
+        )
+        .await;
+        close_acp_session(conn, multiplex, &session_id).await;
+        return result;
+    }
     let prompt_result = tokio::select! {
         _ = cancellation.changed() => {
             let _ = conn.cancel(acp::CancelNotification::new(session_id.clone())).await;
             Err(ProviderError::Transport("ACP review was cancelled while prompting".to_string()))
         }
-        result = async {
-            let (_, expected) = tokio::try_join!(
-                run_acp_prompt_turn(config, conn, session_id.clone(), prompt, "suggestion"),
-                async {
-                    collect_client_messages_through_prompt_response(&mut protocol_stream, &session_id)
-                        .await.map_err(|error| ProviderError::Transport(error.message))
-                }
-            )?;
-            timeout(config.timeout, handler.wait_for_processed_client_messages(&expected))
-                .await.map_err(|_| ProviderError::Transport("ACP review output processing timed out".into()))?
-        } => result,
+        result = run_acp_prompt_with_output_barrier(config, conn, &handler, session_id.clone(), prompt, "suggestion") => result,
     };
     let state = handler.snapshot();
     close_acp_session(conn, multiplex, &session_id).await;
@@ -2464,6 +2498,7 @@ async fn run_supervised_acp_staged_prompt(
         provider_model.clone(),
         trace.clone(),
         &mut cancellation,
+        None,
     )
     .await;
     if decision_result.is_err() {
@@ -2621,6 +2656,7 @@ async fn run_acp_decision_with_repair(
     provider_model: Option<String>,
     mut trace: ProviderTrace,
     cancellation: &mut watch::Receiver<bool>,
+    validator: Option<&AcpReviewValidator>,
 ) -> Result<AcpPromptResult, ProviderError> {
     let session_id = session.session_id.clone();
     trace.session_id = Some(session_id.to_string());
@@ -2645,9 +2681,10 @@ async fn run_acp_decision_with_repair(
                 let _ = cancel_acp_prompt(config, conn, session_id.clone()).await;
                 Err(ProviderError::Transport("ACP decision cancelled".into()))
             }
-            result = run_acp_prompt_turn(&remaining_config, conn, session_id.clone(), prompt.clone(), "decision") => result,
+            result = run_acp_prompt_with_output_barrier(&remaining_config, conn, handler, session_id.clone(), prompt.clone(), "decision") => result,
         };
         let mut state = handler.snapshot()?;
+        trace.audit_events.extend(raw_client_events(&state));
         let submitted = output.read(&state.content[state.review_response_start..]);
         let mut tool_events = decision_tool_events(&state);
         if let Ok(Some(content)) = &submitted {
@@ -2678,6 +2715,7 @@ async fn run_acp_decision_with_repair(
             });
         }
         let validation = result.and_then(|()| {
+            state.content = state.content.split_off(state.review_response_start);
             if let Some(content) = submitted? {
                 state.content = content;
                 state.non_text_content_seen = false;
@@ -2702,7 +2740,10 @@ async fn run_acp_decision_with_repair(
                 }
                 return Err(ProviderError::EmptyResponse);
             }
-            crate::provider::validate_decision_text(&state.content)
+            match validator {
+                Some(validate) => validate(&state.content),
+                None => crate::provider::validate_decision_text(&state.content),
+            }
         });
         trace.stop_reason = match &validation {
             Ok(_) => None,
@@ -2741,12 +2782,34 @@ async fn run_acp_decision_with_repair(
                     ProviderError::InvalidResponse(_) | ProviderError::EmptyResponse
                 );
                 if attempt_index == 1 || !retryable || tokio::time::Instant::now() >= deadline {
+                    // Batch entries are finalized independently by the caller. After
+                    // one repair, preserve the final payload so a remaining bad entry
+                    // cannot suppress valid neighboring decisions. Coverage/JSON errors
+                    // still fail the entire batch in the caller's exact-ID decoder.
+                    if validator.is_some()
+                        && retryable
+                        && !state.non_text_content_seen
+                        && !state.content.trim().is_empty()
+                    {
+                        return acp_prompt_result_from_state(
+                            state,
+                            provider_model,
+                            trace,
+                            session_id,
+                            request_id,
+                        );
+                    }
                     return Err(ProviderError::DecisionFailed {
                         message: error.to_string(),
                         trace: Box::new(trace),
                     });
                 }
-                prompt = output.prompt(&format!("Your decision output failed validation: {error}. Correct the JSON structure in this SAME session. Preserve the intended decision and evidence; do not invent facts to pass validation. Submit decision JSON matching the original schema: exposure_report has chain_summary and a surfaces ARRAY containing exactly five entries. Do not emit node_assessments or annotations. This is the single decision repair attempt."));
+                let contract = if validator.is_some() {
+                    "Return the complete reviews object with exactly the original request IDs, each decision and its evidence. Keep each credential's policy separate. Match the original schema and captured source identities."
+                } else {
+                    "Submit decision JSON matching the original schema: exposure_report has chain_summary and a surfaces ARRAY containing exactly five entries. Do not emit node_assessments or annotations."
+                };
+                prompt = output.prompt(&format!("Your review output failed validation: {error}. Correct the output in this SAME session. Preserve intended decisions, exposure levels, destinations and evidence; never invent facts or weaken an assessment to pass validation. {contract} This is the single repair attempt; return only the corrected result."));
                 output.clear()?;
                 handler.reset_for_next_turn(None, None)?;
             }
@@ -4274,6 +4337,32 @@ async fn configure_continuation_session<T: Serialize>(
     configure_review_session_options(config, conn, session_id, session).await
 }
 
+async fn run_acp_prompt_with_output_barrier(
+    config: &AcpSessionConfig,
+    conn: &acp::ClientSideConnection,
+    handler: &AcpClientHandler,
+    session_id: acp::SessionId,
+    prompt: String,
+    stage: &str,
+) -> Result<(), ProviderError> {
+    let deadline = tokio::time::Instant::now() + config.timeout;
+    let mut stream = conn.subscribe();
+    let (_, expected) = tokio::try_join!(
+        run_acp_prompt_turn(config, conn, session_id.clone(), prompt, stage),
+        async {
+            collect_client_messages_through_prompt_response(&mut stream, &session_id)
+                .await
+                .map_err(|error| ProviderError::Transport(error.message))
+        }
+    )?;
+    timeout(
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        handler.wait_for_processed_client_messages(&expected),
+    )
+    .await
+    .map_err(|_| ProviderError::Transport("ACP review output processing timed out".into()))?
+}
+
 async fn run_acp_prompt_turn(
     config: &AcpSessionConfig,
     conn: &acp::ClientSideConnection,
@@ -5207,6 +5296,7 @@ mod tests {
                     prompt: request_id.into(),
                     allowed_read_files: Vec::new(),
                     review_workspace_enabled: false,
+                    validator: None,
                     response,
                 })
                 .unwrap();
@@ -5450,6 +5540,7 @@ for line in sys.stdin:
                     prompt: "pending until shutdown".into(),
                     allowed_read_files: Vec::new(),
                     review_workspace_enabled: false,
+                    validator: None,
                     response,
                 })
                 .unwrap();
@@ -5877,7 +5968,7 @@ for line in sys.stdin:
                     if failures == 1 {
                         assert!(first.trace.decision_attempts[1]
                             .prompt
-                            .contains("single decision repair"));
+                            .contains("single repair attempt"));
                         assert!(first.trace.decision_attempts[0].validation_error.is_some());
                     }
                     assert!(matches!(
