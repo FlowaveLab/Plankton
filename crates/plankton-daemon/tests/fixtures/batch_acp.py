@@ -18,6 +18,13 @@ for line in sys.stdin:
         result = {"sessionId": str(session)}
     elif method == "session/prompt":
         params = message["params"]
+        if "direct" in mode:
+            # Adapters may emit ordinary analysis before tools, without phase metadata.
+            for update in [
+                {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Inspecting evidence first. {not a decision}"}},
+                {"sessionUpdate": "tool_call", "toolCallId": "read-1", "title": "Read evidence", "kind": "read", "status": "completed"},
+            ]:
+                print(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": params["sessionId"], "update": update}}), flush=True)
         prompt = "".join(block.get("text", "") for block in params["prompt"])
         payload = json.loads(prompt.split("Request evidence:\n", 1)[1].split("\n\nResult schema:", 1)[0])
         with log_path.open("a") as log:
@@ -31,12 +38,14 @@ for line in sys.stdin:
         }} for item in payload["requests"]]
         if mode == "missing":
             reviews.pop()
-        encoded_path = prompt.split("save the requested JSON to ", 1)[1]
-        output_path, _ = json.JSONDecoder().raw_decode(encoded_path)
-        pathlib.Path(output_path).write_text(json.dumps({"reviews": reviews}, indent=2))
+        text = json.dumps({"reviews": reviews})
+        if "direct" not in mode:
+            output_path = log_path.parent / ("result-" + params["sessionId"] + ".json")
+            output_path.write_text(text)
+            text = json.dumps({"result_file": str(output_path)})
         print(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": params["sessionId"], "update": {"sessionUpdate": "agent_message_chunk",
-                "content": {"type": "text", "text": "Review complete. The result is in the file."}}}}), flush=True)
+                "content": {"type": "text", "text": text}}}}), flush=True)
         result = {"stopReason": "end_turn"}
     else:
         result = {}

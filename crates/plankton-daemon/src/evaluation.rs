@@ -369,7 +369,25 @@ async fn evaluate_requests(
     store: SqliteStore,
     request_ids: Vec<String>,
 ) -> Result<(), StoreError> {
-    if request_ids.len() == 1 || !matches!(settings.provider_kind.as_str(), "acp" | "acp_codex") {
+    // Admitted consumers already identify every credential explicitly. A single
+    // credential needs the same evidence-bearing result as a multi-credential batch,
+    // not a mandatory second audit. Retain legacy selector discovery for old requests.
+    let legacy_single = if let [id] = request_ids.as_slice() {
+        let request = store.get_request(id).await?.request;
+        !request.provider_input.as_ref().is_some_and(|input| {
+            matches!(
+                input
+                    .sanitized_context
+                    .request_metadata
+                    .get("execution_admission")
+                    .map(String::as_str),
+                Some("daemon_command_v1" | "daemon_python_file_v1")
+            )
+        })
+    } else {
+        false
+    };
+    if legacy_single || !matches!(settings.provider_kind.as_str(), "acp" | "acp_codex") {
         for id in request_ids {
             evaluate_request(settings.clone(), store.clone(), id).await?;
         }
@@ -537,7 +555,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn production_batch_uses_one_cli_turn_and_preserves_independent_database_results() {
-        for mode in ["complete", "missing"] {
+        for mode in [
+            "complete",
+            "direct",
+            "missing",
+            "single-file",
+            "single-direct",
+        ] {
             let temp = tempdir().unwrap();
             let script = temp.path().join("batch_acp.py");
             let log = temp.path().join("prompts.jsonl");
@@ -567,13 +591,19 @@ mod tests {
                 store.clone(),
             );
             let mut requests = Vec::new();
-            for resource in ["secret/allow", "secret/deny"] {
+            let resources: &[&str] = if mode.starts_with("single") {
+                &["secret/allow"]
+            } else {
+                &["secret/allow", "secret/deny"]
+            };
+            for resource in resources {
+                let mut context =
+                    RequestContext::new((*resource).into(), "batch fixture".into(), "test".into());
+                context
+                    .metadata
+                    .insert("execution_admission".into(), "daemon_command_v1".into());
                 let request = store
-                    .submit_request(
-                        &settings,
-                        RequestContext::new(resource.into(), "batch fixture".into(), "test".into()),
-                        PolicyMode::LlmAutomatic,
-                    )
+                    .submit_request(&settings, context, PolicyMode::LlmAutomatic)
                     .await
                     .unwrap();
                 worker.spawn(request.id.clone());
@@ -581,10 +611,15 @@ mod tests {
             }
             let finished = tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 loop {
-                    let first = store.get_request(&requests[0].id).await.unwrap().request;
-                    let second = store.get_request(&requests[1].id).await.unwrap().request;
-                    if first.llm_suggestion.is_some() && second.llm_suggestion.is_some() {
-                        break [first, second];
+                    let mut finished = Vec::new();
+                    for request in &requests {
+                        finished.push(store.get_request(&request.id).await.unwrap().request);
+                    }
+                    if finished
+                        .iter()
+                        .all(|request| request.llm_suggestion.is_some())
+                    {
+                        break finished;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
@@ -595,7 +630,7 @@ mod tests {
             assert_eq!(
                 calls.lines().count(),
                 1,
-                "two approvals use one CLI prompt, with no repair or audit turn"
+                "admitted approvals use one CLI prompt, with no repair or audit turn"
             );
             let ids: Vec<String> = serde_json::from_str(calls.trim()).unwrap();
             assert_eq!(
@@ -605,33 +640,37 @@ mod tests {
                     .map(|request| request.id.clone())
                     .collect::<Vec<_>>()
             );
-            if mode == "complete" {
+            if mode != "missing" {
                 assert_eq!(
                     finished[0].approval_status,
-                    plankton_core::ApprovalStatus::Approved
+                    plankton_core::ApprovalStatus::Approved,
+                    "{mode}: {:?}",
+                    finished[0].llm_suggestion
                 );
-                assert_eq!(
-                    finished[1].approval_status,
-                    plankton_core::ApprovalStatus::Rejected
-                );
-                assert_eq!(
-                    finished[0]
-                        .llm_suggestion
-                        .as_ref()
-                        .unwrap()
-                        .provider_trace
-                        .as_ref()
-                        .unwrap()
-                        .session_id,
-                    finished[1]
-                        .llm_suggestion
-                        .as_ref()
-                        .unwrap()
-                        .provider_trace
-                        .as_ref()
-                        .unwrap()
-                        .session_id
-                );
+                if finished.len() == 2 {
+                    assert_eq!(
+                        finished[1].approval_status,
+                        plankton_core::ApprovalStatus::Rejected
+                    );
+                    assert_eq!(
+                        finished[0]
+                            .llm_suggestion
+                            .as_ref()
+                            .unwrap()
+                            .provider_trace
+                            .as_ref()
+                            .unwrap()
+                            .session_id,
+                        finished[1]
+                            .llm_suggestion
+                            .as_ref()
+                            .unwrap()
+                            .provider_trace
+                            .as_ref()
+                            .unwrap()
+                            .session_id
+                    );
+                }
             } else {
                 for request in finished {
                     assert_ne!(

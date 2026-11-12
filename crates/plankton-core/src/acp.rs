@@ -374,10 +374,17 @@ fn prepare_pi_workspace(cwd: &Path) -> Result<(), ProviderError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let guidance = tempfile::NamedTempFile::new_in(cwd)
+            .map_err(|error| ProviderError::Transport(error.to_string()))?;
+        fs::write(guidance.path(), include_str!("acp/review_output_system.md"))
+            .map_err(|error| ProviderError::Transport(error.to_string()))?;
+        guidance
+            .persist(cwd.join("review-output-guidance.md"))
+            .map_err(|error| ProviderError::Transport(error.to_string()))?;
         let launcher = cwd.join("pi-review-cli");
         let temporary = tempfile::NamedTempFile::new_in(cwd)
             .map_err(|error| ProviderError::Transport(error.to_string()))?;
-        fs::write(temporary.path(), "#!/bin/sh\nexec \"${PLANKTON_PI_PROGRAM:-pi}\" --no-skills --no-prompt-templates --no-context-files \"$@\"\n")
+        fs::write(temporary.path(), "#!/bin/sh\nexec \"${PLANKTON_PI_PROGRAM:-pi}\" --no-skills --no-prompt-templates --no-context-files --system-prompt \"$(dirname \"$0\")/review-output-guidance.md\" \"$@\"\n")
             .map_err(|error| ProviderError::Transport(error.to_string()))?;
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
             .map_err(|error| ProviderError::Transport(error.to_string()))?;
@@ -2320,20 +2327,38 @@ async fn run_supervised_acp_prompt(
             "ACP review was cancelled before prompting".to_string(),
         ));
     }
+    let mut protocol_stream = conn.subscribe();
     let prompt_result = tokio::select! {
         _ = cancellation.changed() => {
             let _ = conn.cancel(acp::CancelNotification::new(session_id.clone())).await;
             Err(ProviderError::Transport("ACP review was cancelled while prompting".to_string()))
         }
-        result = run_acp_prompt_turn(config, conn, session_id.clone(), prompt, "suggestion") => result,
+        result = async {
+            let (_, expected) = tokio::try_join!(
+                run_acp_prompt_turn(config, conn, session_id.clone(), prompt, "suggestion"),
+                async {
+                    collect_client_messages_through_prompt_response(&mut protocol_stream, &session_id)
+                        .await.map_err(|error| ProviderError::Transport(error.message))
+                }
+            )?;
+            timeout(config.timeout, handler.wait_for_processed_client_messages(&expected))
+                .await.map_err(|_| ProviderError::Transport("ACP review output processing timed out".into()))?
+        } => result,
     };
     let state = handler.snapshot();
     close_acp_session(conn, multiplex, &session_id).await;
     let mut state = state?;
     prompt_result?;
     trace.audit_events = raw_client_events(&state);
+    if review_workspace_enabled {
+        // ACP has no universal final-message phase. A tool call ends the preceding
+        // assistant generation; only the text after the last tool call can be the
+        // final direct result. Keep every earlier chunk in the audit above. Do not
+        // scan prose for a convenient JSON substring or accept competing answers.
+        state.content = state.content.split_off(state.review_response_start);
+    }
     if let Some(output) = output {
-        if let Some(content) = output.read()? {
+        if let Some(content) = output.read(&state.content)? {
             trace
                 .audit_events
                 .push(serde_json::json!({"type":"submitted_review_result","content":content}));
@@ -2512,7 +2537,9 @@ async fn run_supervised_acp_staged_prompt(
         let mut state = enrichment_state?;
         let mut trace = trace;
         trace.audit_events = raw_client_events(&state);
-        let written = output.expect("checked output directory").read_audit()?;
+        let written = output
+            .expect("checked output directory")
+            .read_audit(&state.content[state.review_response_start..])?;
         let content = written.as_deref().unwrap_or(&state.content);
         state.content = audit_frames(content)?;
         let _ = enrichment_chunks.send(state.content.clone());
@@ -2621,7 +2648,7 @@ async fn run_acp_decision_with_repair(
             result = run_acp_prompt_turn(&remaining_config, conn, session_id.clone(), prompt.clone(), "decision") => result,
         };
         let mut state = handler.snapshot()?;
-        let submitted = output.read();
+        let submitted = output.read(&state.content[state.review_response_start..]);
         let mut tool_events = decision_tool_events(&state);
         if let Ok(Some(content)) = &submitted {
             tool_events
@@ -2891,7 +2918,7 @@ async fn run_supervised_acp_chat_turn(
     settled?;
     let mut state = state?;
     if let Some(output) = output {
-        let written = output.read_audit()?;
+        let written = output.read_audit(&state.content[state.review_response_start..])?;
         state.content = audit_frames(written.as_deref().unwrap_or(&state.content))?;
         let _ = events.send(AcpChatEvent::TextDelta(state.content.clone()));
         state.non_text_content_seen = false;
@@ -3073,6 +3100,7 @@ impl acp::Client for AcpMultiplexHandler {
 #[derive(Debug, Clone, Default)]
 struct AcpSessionState {
     content: String,
+    review_response_start: usize,
     non_text_content_seen: bool,
     processed_client_messages: Vec<AcpObservedClientMessage>,
     processed_client_message_version: u64,
@@ -3376,6 +3404,7 @@ impl acp::Client for AcpClientHandler {
                 ..
             }) => self.send_chat_event(AcpChatEvent::ThoughtDelta(text.text)),
             acp::SessionUpdate::ToolCall(tool_call) => {
+                state.review_response_start = state.content.len();
                 self.send_chat_event(AcpChatEvent::ToolCall(acp_chat_tool_call(tool_call)));
             }
             acp::SessionUpdate::ToolCallUpdate(update) => {
@@ -3934,7 +3963,10 @@ async fn run_acp_probe_requests(
 
     let expected_client_messages = match timeout(
         config.timeout,
-        collect_client_messages_through_prompt_response(protocol_stream),
+        collect_client_messages_through_prompt_response(
+            protocol_stream,
+            &session_response.session_id,
+        ),
     )
     .await
     {
@@ -4024,6 +4056,7 @@ async fn run_acp_probe_requests(
 
 async fn collect_client_messages_through_prompt_response(
     protocol_stream: &mut acp::StreamReceiver,
+    session_id: &acp::SessionId,
 ) -> Result<Vec<AcpObservedClientMessage>, AcpProbeError> {
     let mut prompt_request_id = None;
     let mut client_messages = Vec::new();
@@ -4038,7 +4071,13 @@ async fn collect_client_messages_through_prompt_response(
             (
                 acp::StreamMessageDirection::Incoming,
                 acp::StreamMessageContent::Request { method, params, .. },
-            ) if method.as_ref() == acp::CLIENT_METHOD_NAMES.session_request_permission => {
+            ) if method.as_ref() == acp::CLIENT_METHOD_NAMES.session_request_permission
+                && params
+                    .as_ref()
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(session_id.0.as_ref()) =>
+            {
                 client_messages.push(AcpObservedClientMessage::PermissionRequest(
                     params.unwrap_or(serde_json::Value::Null),
                 ));
@@ -4046,15 +4085,27 @@ async fn collect_client_messages_through_prompt_response(
             (
                 acp::StreamMessageDirection::Incoming,
                 acp::StreamMessageContent::Notification { method, params },
-            ) if method.as_ref() == acp::CLIENT_METHOD_NAMES.session_update => {
+            ) if method.as_ref() == acp::CLIENT_METHOD_NAMES.session_update
+                && params
+                    .as_ref()
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(session_id.0.as_ref()) =>
+            {
                 client_messages.push(AcpObservedClientMessage::SessionNotification(
                     params.unwrap_or(serde_json::Value::Null),
                 ));
             }
             (
                 acp::StreamMessageDirection::Outgoing,
-                acp::StreamMessageContent::Request { id, method, .. },
-            ) if method.as_ref() == acp::AGENT_METHOD_NAMES.session_prompt => {
+                acp::StreamMessageContent::Request { id, method, params },
+            ) if method.as_ref() == acp::AGENT_METHOD_NAMES.session_prompt
+                && params
+                    .as_ref()
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(session_id.0.as_ref()) =>
+            {
                 prompt_request_id = Some(id);
             }
             (
@@ -6255,8 +6306,12 @@ for line in sys.stdin:
                 .output()
                 .unwrap();
             assert!(output.status.success());
-            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(),
-                "--no-skills --no-prompt-templates --no-context-files --model configured model --mode rpc");
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), format!(
+                "--no-skills --no-prompt-templates --no-context-files --system-prompt {}/review-output-guidance.md --model configured model --mode rpc", workspace.path().display()));
+            assert_eq!(
+                fs::read_to_string(workspace.path().join("review-output-guidance.md")).unwrap(),
+                include_str!("acp/review_output_system.md")
+            );
         }
     }
 

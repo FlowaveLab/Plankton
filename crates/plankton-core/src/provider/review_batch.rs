@@ -6,7 +6,7 @@ use super::*;
 
 pub const MAX_REVIEW_BATCH_SIZE: usize = 8;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchReviewInput {
     pub request_id: String,
     pub policy_mode: PolicyMode,
@@ -145,6 +145,9 @@ fn batch_prompt(
     inputs: &[BatchReviewInput],
 ) -> Result<String, ProviderError> {
     let mut shared_sources = BTreeMap::<String, String>::new();
+    let mut shared_guidance = BTreeMap::<String, String>::new();
+    let default_system = settings.llm_advice_system_prompt.trim()
+        == crate::template::DEFAULT_LLM_SYSTEM_PROMPT.trim();
     let mut requests = Vec::new();
     for input in inputs {
         let mut context = serde_json::to_value(&input.input.sanitized_context)
@@ -180,22 +183,38 @@ fn batch_prompt(
                 metadata.insert("execution_source_ref".into(), serde_json::Value::String(id));
             }
         }
-        let mut guidance = render_llm_advice_template(
-            &settings.llm_advice_template,
-            &input.input.sanitized_context,
-            input.policy_mode,
-            &settings.locale,
-        )?;
-        append_context_guidance(
-            &mut guidance,
-            &input.input.sanitized_context,
-            &settings.locale,
-        );
+        // The built-in batch instructions contain the default template and execution
+        // guidance once. Preserve custom templates verbatim after rendering; identical
+        // guidance can share bytes, never request identity or authorization.
+        let mut guidance = if settings.llm_advice_template.trim()
+            == crate::template::DEFAULT_LLM_ADVICE_TEMPLATE.trim()
+        {
+            String::new()
+        } else {
+            render_llm_advice_template(
+                &settings.llm_advice_template,
+                &input.input.sanitized_context,
+                input.policy_mode,
+                &settings.locale,
+            )?
+        };
+        if !default_system {
+            append_context_guidance(
+                &mut guidance,
+                &input.input.sanitized_context,
+                &settings.locale,
+            );
+        }
+        let guidance_ref = (!guidance.is_empty()).then(|| {
+            let id = format!("sha256:{:x}", Sha256::digest(guidance.as_bytes()));
+            shared_guidance.insert(id.clone(), guidance);
+            id
+        });
         requests.push(serde_json::json!({
             "request_id": input.request_id,
             "enabled_outcomes": input.input.decision_policy.allowed_values(),
             "policy_mode": input.policy_mode,
-            "guidance": guidance,
+            "guidance_ref": guidance_ref,
             "context": context,
         }));
     }
@@ -221,7 +240,8 @@ fn batch_prompt(
         "{}\n\nBATCH REVIEW CONTRACT (replaces the single-request output and audit-turn format):\n\
          Review each supplied request independently, including every credential's own data flow and policy. \
          Shared source bytes are deduplicated, not shared authorization. Resolve every content_ref and \
-         execution_source_ref through shared_sources before reviewing. metadata is local catalog policy; \
+         execution_source_ref through shared_sources, and each non-null guidance_ref through shared_guidance \
+         before reviewing. metadata is local catalog policy; \
          reason, requested_by and best_effort nodes are requester claims; os_probe nodes are OS observations; \
          only admitted controlled_execution nodes and execution_* metadata are daemon-collected. \
          A result for one request never covers \
@@ -245,8 +265,8 @@ fn batch_prompt(
          or annotations inside decision; evidence belongs in its sibling evidence array. For argv-only evidence, \
          explain it in the surface summary. There is no mandatory second audit turn. Reasons use locale {}.\n\
          Request evidence:\n{}\n\nResult schema:\n{}",
-        settings.llm_advice_system_prompt, settings.locale,
-        serde_json::json!({"requests":requests,"shared_sources":shared_sources}),
+        if default_system { include_str!("review_batch_prompt.md") } else { &settings.llm_advice_system_prompt }, settings.locale,
+        serde_json::json!({"requests":requests,"shared_sources":shared_sources,"shared_guidance":shared_guidance}),
         serde_json::to_string(&schema).expect("schema serializes")
     ))
 }
@@ -296,10 +316,40 @@ fn response_for_entry(
         ProviderError::InvalidResponse("batch entry omitted exposure_report".into())
     })?;
     validate_staged_decision_report(&report)?;
+    // Delivery to the declared consumer is a daemon-known exposure, even when
+    // there is no further subprocess. Never let a model's zero erase that fact.
+    // Higher exposure and uncertainty remain untouched.
+    let metadata = &request.sanitized_context.request_metadata;
+    let admitted = matches!(
+        metadata.get("execution_admission").map(String::as_str),
+        Some("daemon_command_v1" | "daemon_python_file_v1")
+    );
+    let delivered = matches!(
+        metadata
+            .get("execution_credential_transport")
+            .map(String::as_str),
+        Some("env" | "stdin")
+    );
+    let mut delivery_floor_applied = false;
+    if admitted && delivered {
+        for surface in &mut report.surfaces {
+            if surface.surface == CredentialExposureSurface::ProcessPropagation
+                && surface.actual_level == 0
+            {
+                surface.actual_level = 1;
+                surface.evidence_state = crate::ExposureEvidenceState::Observed;
+                surface.summary.push_str(" [Daemon evidence: the admitted plan delivers this credential to the declared consumer; process exposure is at least level 1.]");
+                delivery_floor_applied = true;
+            }
+        }
+    }
     for citation in &entry.evidence {
         add_citation(request, &mut report, citation)?;
     }
     let mut trace = result.trace.clone();
+    if delivery_floor_applied {
+        trace.audit_events.push(serde_json::json!({"type":"daemon_exposure_floor","surface":"process_propagation","actual_level":1,"evidence_state":"observed"}));
+    }
     trace.rendered_prompt = Some(prompt.into());
     trace.output_format = Some("request_keyed_batch_json".into());
     let complete_nodes =
@@ -453,6 +503,9 @@ mod tests {
         context
             .metadata
             .insert("execution_credential_env".into(), format!("TOKEN_{id}"));
+        context
+            .metadata
+            .insert("execution_credential_transport".into(), "env".into());
         context.metadata.insert("execution_sources".into(), serde_json::json!([{
             "node_index":0,"source_id":format!("source:{id}"),"content":"consume(token)\n","binding":"frozen"
         }]).to_string());
@@ -540,10 +593,40 @@ mod tests {
                 payload["shared_sources"][source["content_ref"].as_str().unwrap()],
                 "consume(token)\n"
             );
-            assert!(entry["guidance"]
-                .as_str()
+            assert!(entry["guidance_ref"].is_null());
+        }
+        assert!(prompt.contains("same-account mutation race"));
+        assert!(!prompt.contains("Audit phase (the next turn"));
+    }
+
+    #[test]
+    fn custom_instructions_are_preserved_and_only_identical_guidance_is_shared() {
+        let inputs = [input("a", 1), input("b", 0)];
+        let settings = PlanktonSettings {
+            llm_advice_system_prompt: "Custom policy: inspect deployment boundaries.".into(),
+            llm_advice_template: "Custom template: resource={{ context.resource }}".into(),
+            ..Default::default()
+        };
+        let prompt = batch_prompt(&settings, &inputs).unwrap();
+        assert!(prompt.starts_with(&settings.llm_advice_system_prompt));
+        let payload: serde_json::Value = serde_json::from_str(
+            prompt
+                .split("Request evidence:\n")
+                .nth(1)
                 .unwrap()
-                .contains("remaining same-account mutation race"));
+                .split("\n\nResult schema:")
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        for (i, input) in inputs.iter().enumerate() {
+            let reference = payload["requests"][i]["guidance_ref"].as_str().unwrap();
+            let guidance = payload["shared_guidance"][reference].as_str().unwrap();
+            assert!(guidance.contains(&format!(
+                "resource={}",
+                input.input.sanitized_context.resource
+            )));
+            assert!(guidance.contains("remaining same-account mutation race"));
         }
     }
 
@@ -576,6 +659,60 @@ mod tests {
                 &input.input.sanitized_context,
             );
             assert_ne!(outcome.auto_disposition, crate::AutomaticDisposition::Allow);
+        }
+    }
+
+    #[test]
+    fn admitted_delivery_floor_does_not_erase_higher_or_unknown_exposure() {
+        let input = input("a", 0);
+        for (level, state) in [
+            (0, crate::ExposureEvidenceState::NotObserved),
+            (2, crate::ExposureEvidenceState::Observed),
+            (2, crate::ExposureEvidenceState::Unknown),
+        ] {
+            let mut entry = complete_entry("a");
+            let surface = entry
+                .decision
+                .exposure_report
+                .as_mut()
+                .unwrap()
+                .surfaces
+                .iter_mut()
+                .find(|s| s.surface == CredentialExposureSurface::ProcessPropagation)
+                .unwrap();
+            surface.actual_level = level;
+            surface.evidence_state = state;
+            let response =
+                response_for_entry(&provider_request(&input), &entry, &result(), "prompt").unwrap();
+            let exposure = response
+                .exposure_report
+                .as_ref()
+                .unwrap()
+                .surfaces
+                .iter()
+                .find(|s| s.surface == CredentialExposureSurface::ProcessPropagation)
+                .unwrap();
+            assert_eq!(exposure.actual_level, level.max(1));
+            assert_eq!(
+                exposure.evidence_state,
+                if level == 0 {
+                    crate::ExposureEvidenceState::Observed
+                } else {
+                    state
+                }
+            );
+            let suggestion =
+                suggestion_from_provider_response(&input.input, ACP_PROVIDER_KIND, response);
+            assert_ne!(
+                crate::evaluate_automatic_disposition(
+                    Some(ACP_PROVIDER_KIND),
+                    Some(&input.input),
+                    Some(&suggestion),
+                    &input.input.sanitized_context
+                )
+                .auto_disposition,
+                crate::AutomaticDisposition::Allow
+            );
         }
     }
 

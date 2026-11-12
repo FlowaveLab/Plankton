@@ -92,7 +92,7 @@ def wait_group(args, root, cases):
         case['timed_out'] = True
         case['process'].terminate()
         case['process'].wait(timeout=5)
-    # Single-request reviews still have an asynchronous audit; include its real cost.
+    # Include any outstanding detail work so regressions cannot hide its cost.
     audit_deadline = time.monotonic() + 135
     while time.monotonic() < audit_deadline:
         suggestions = [json.loads(row['llm_suggestion_json']) for case in cases for row in rows(root, case) if row['llm_suggestion_json']]
@@ -173,6 +173,8 @@ def batch_assertions(report):
         checks['future_call_requires_new_review'] = bool(after) and before.isdisjoint(after)
     if 'single' in cases:
         checks['single_audit_completed'] = bool(cases['single']['records']) and all(row['detail_state'] == 'complete' for row in cases['single']['records'])
+        ids = {record['session_id'] for record in cases['single']['records']}
+        checks['single_one_model_turn'] = len(ids) == 1 and None not in ids and sessions[next(iter(ids))].get('prompt_turns') == 1
     return checks
 
 

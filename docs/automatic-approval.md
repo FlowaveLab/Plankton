@@ -6,7 +6,23 @@ Queued evaluations wait for a fixed one-second collection window starting at the
 
 An ACP batch uses one model turn containing every collected request and a result keyed by exact request ID. Identical captured source bodies are transmitted once by SHA-256 reference, retaining each request's source identity and binding metadata. Missing, duplicate or unknown IDs invalidate the whole batch. Invalid evidence or a disabled outcome invalidates the affected entry. Each accepted entry still passes the existing local uncertainty and exposure-policy guards, and concurrent human decisions retain precedence. Concise citations are returned with the decision; the host resolves exact quotes from the captured bytes. Missing detailed node annotations are marked partial; no mandatory second audit turn runs for a batch. A batch is not a grant covering a command's future requests.
 
-Single-request and non-ACP evaluations retain the two-phase behavior below.
+Admitted ACP single-credential requests use the same evidence-bearing batch format
+with one entry. They do not automatically start another audit turn. Legacy
+single requests (which still discover literal resource selectors) and non-ACP
+evaluations retain the two-phase behavior below.
+
+For ACP, direct final JSON is the default result channel. The agent may instead
+write a result file using its normal tools and return
+`{"result_file":"/absolute/path"}`. The referenced file is authoritative; missing,
+malformed, oversized or symlink results fail closed. Returning JSON directly
+does not require creating a file, reading it back, or sending an acknowledgement. Tools and file workflows remain
+available without extra user configuration. Text before a tool call stays in the
+audit and is not concatenated into the final JSON. Prompt completion waits for all
+of that session's preceding notifications to be processed, including when other
+sessions share the connection. There is no heuristic search for JSON inside prose.
+Daemon-observed credential delivery enforces process exposure of at least level 1;
+higher exposure and unknown evidence are never downgraded. Default review rules are sent once; custom system/template instructions are
+preserved, with identical rendered guidance shared by explicit reference.
 
 The decision turn performs any investigation needed for approval, then returns a compact JSON decision. The daemon applies local validation and policy routing as soon as `DecisionReady` arrives. It does not wait for node explanations, evidence highlighting, audit validation, or audit repairs.
 
